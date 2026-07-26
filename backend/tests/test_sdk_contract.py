@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 from decimal import Decimal
 from importlib.metadata import version
@@ -30,17 +31,21 @@ def test_official_sdk_version_and_public_contract() -> None:
 
 
 def test_official_sdk_secure_contract_used_by_executor() -> None:
-    assert {"token_id", "price", "size", "side", "post_only"} <= _keyword_names(
+    assert {"token_id", "price", "size", "side", "post_only", "expiration"} <= _keyword_names(
         SecureClient, "create_limit_order"
     )
     assert {"signed_order"} <= _keyword_names(SecureClient, "post_order")
     assert {"asset_type", "token_id"} <= _keyword_names(SecureClient, "get_balance_allowance")
+    assert hasattr(SecureClient, "setup_trading_approvals")
+    assert not inspect.iscoroutinefunction(SecureClient.setup_trading_approvals)
     assert hasattr(SecureClient, "cancel_all")
     assert hasattr(SecureClient, "wait_for_order_fill_settlement")
     assert {"order_id", "trade_ids", "transactions_hashes"} <= set(AcceptedOrder.model_fields)
 
 
 def test_official_sdk_secure_contract_used_by_reconciler() -> None:
+    assert inspect.iscoroutinefunction(AsyncSecureClient.create)
+    assert inspect.iscoroutinefunction(AsyncSecureClient.setup_trading_approvals)
     assert {"after"} <= _keyword_names(AsyncSecureClient, "list_account_trades")
     assert {
         "activity_types",
@@ -74,6 +79,92 @@ def test_official_sdk_secure_contract_used_by_reconciler() -> None:
     assert {"id", "condition_id", "token_id", "size_matched", "status"} <= set(
         OpenOrder.model_fields
     )
+
+
+async def test_reconciler_awaits_async_secure_client_factory(monkeypatch) -> None:
+    from polybot.reconcile import OrderReconciler
+    from polybot.stores.memory import MemoryStore
+
+    class FakeAsyncClient:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    created = FakeAsyncClient()
+    calls: list[dict[str, str | None]] = []
+
+    async def create(**kwargs):
+        calls.append(kwargs)
+        return created
+
+    monkeypatch.setattr(AsyncSecureClient, "create", staticmethod(create))
+    reconciler = OrderReconciler(
+        private_key="private",
+        wallet=None,
+        account_id="account",
+        store=MemoryStore(),
+    )
+
+    assert reconciler.client is None
+    first, second = await asyncio.gather(
+        reconciler._ensure_client(),
+        reconciler._ensure_client(),
+    )
+    assert first is created
+    assert second is created
+    assert calls == [{"private_key": "private", "wallet": None}]
+    await reconciler.close()
+    assert created.closed
+
+
+async def test_reconciler_closes_client_created_during_concurrent_close(
+    monkeypatch,
+) -> None:
+    from polybot.reconcile import OrderReconciler
+    from polybot.stores.memory import MemoryStore
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class FakeAsyncClient:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    created = FakeAsyncClient()
+
+    async def create(**kwargs):
+        started.set()
+        await release.wait()
+        return created
+
+    monkeypatch.setattr(AsyncSecureClient, "create", staticmethod(create))
+    reconciler = OrderReconciler(
+        private_key="private",
+        wallet=None,
+        account_id="account",
+        store=MemoryStore(),
+    )
+    initialize = asyncio.create_task(reconciler._ensure_client())
+    await started.wait()
+    close = asyncio.create_task(reconciler.close())
+    release.set()
+
+    try:
+        await initialize
+    except RuntimeError as exc:
+        assert "closed during" in str(exc)
+    else:
+        raise AssertionError("client initialized after reconciler close")
+    await close
+    await reconciler.close()
+
+    assert created.close_calls == 1
+    assert reconciler.client is None
 
 
 def test_official_sdk_accepted_order_aliases_preserve_pending_trade_ids() -> None:

@@ -180,6 +180,15 @@ class PolymarketBroker:
         control = await self.store.get_runtime_control(intent.account_id)
         if not control.is_live_armed or control.mode is not self.settings.mode:
             return self._rejected(intent, "short-lived runtime arm is absent or mismatched")
+        assert control.armed_until is not None
+        arm_seconds_remaining = (control.armed_until - datetime.now(UTC)).total_seconds()
+        if arm_seconds_remaining < 210:
+            return self._rejected(
+                intent,
+                "runtime arm has less than 3.5 minutes remaining for a safe GTD order",
+            )
+        order_expires_at = control.armed_until
+        order_expiration = int(order_expires_at.timestamp())
         control_version = control.version
         if self._lease_guard is None:
             return self._rejected(intent, "live submission is restricted to the leased worker")
@@ -210,7 +219,7 @@ class PolymarketBroker:
         if Decimal(balance.balance) < required:
             return self._rejected(intent, "insufficient exchange balance before signing")
         allowances = [Decimal(value) for value in balance.allowances.values()]
-        if not allowances or max(allowances) < required:
+        if not allowances or min(allowances) < required:
             return self._rejected(intent, "insufficient exchange allowance before signing")
         if self._book_is_stale(book):
             return self._rejected(intent, "order book became stale before signing")
@@ -223,6 +232,7 @@ class PolymarketBroker:
                 size=intent.size,
                 side=intent.side.value,
                 post_only=intent.post_only,
+                expiration=order_expiration,
             )
         except Exception as exc:
             return ExecutionResult(
@@ -267,6 +277,8 @@ class PolymarketBroker:
                 payload_ciphertext=ciphertext,
                 key_version=self.settings.payload_key_version,
                 fencing_token=fencing_token,
+                order_type="GTD",
+                expires_at=order_expires_at,
             )
         except Exception as exc:
             return ExecutionResult(
@@ -350,7 +362,11 @@ class PolymarketBroker:
 
         response_ok = bool(getattr(response, "ok", False))
         order_id = str(getattr(response, "order_id", "")) or None
-        response_trace = self._response_trace(response)
+        response_trace = {
+            **self._response_trace(response),
+            "order_type": "GTD",
+            "expires_at": order_expires_at.isoformat(),
+        }
         runtime_changed_during_post = False
         if response_ok:
             try:
@@ -477,6 +493,9 @@ class PolymarketBroker:
             # resolved to zero in the durable daily-equity risk state.
             await self.portfolio_state()
         return redeemed
+
+    async def close(self) -> None:
+        await asyncio.to_thread(self.client.close)
 
     @staticmethod
     def _rejected(intent: TradeIntent, message: str) -> ExecutionResult:

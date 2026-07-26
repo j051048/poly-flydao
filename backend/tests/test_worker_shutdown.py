@@ -6,7 +6,7 @@ from datetime import timedelta
 
 from polybot.config import TradingMode
 from polybot.models import RuntimeControl, utc_now
-from polybot.worker import _shutdown_live_safely
+from polybot.worker import _shutdown_live_safely, _wait_for_store_startup
 
 
 class ShutdownStore:
@@ -94,6 +94,25 @@ class ShutdownBroker:
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
+
+
+async def test_store_startup_preflight_is_bounded() -> None:
+    class Store:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def health(self) -> bool:
+            self.calls += 1
+            return False
+
+    store = Store()
+    assert not await _wait_for_store_startup(
+        store,  # type: ignore[arg-type]
+        logging.getLogger("test.worker.startup"),
+        attempts=3,
+        retry_delay_seconds=0,
+    )
+    assert store.calls == 3
 
 
 async def test_shutdown_disarms_then_retries_cancel_before_releasing_lease() -> None:

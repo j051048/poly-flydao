@@ -1,18 +1,18 @@
 # 交付验证记录
 
-验证日期：2026-07-26。
+验证日期：2026-07-27。
 
 ## 已通过
 
 | 检查 | 结果 |
 |---|---|
-| Python lint | `ruff check .` 通过 |
-| Python 测试 | `114 passed` |
+| Python lint | 在 `backend` 工作目录执行 `ruff check .` 通过 |
+| Python 测试 | `129 passed` |
 | Web 生产构建 | Next.js `next build` 通过 |
 | Python 生产依赖审计 | `pip-audit`：`No known vulnerabilities found` |
 | Web 生产依赖审计 | `npm audit --audit-level=high`：0 个漏洞 |
 | Python 分发制品 | wheel 与 sdist 构建成功 |
-| 制品内容 | wheel 包含 GDELT Context collector、内置 Public Suffix 去重、429/网络故障退避、异步 trade ID 对账和最新风控代码 |
+| 制品内容 | wheel 包含 GDELT Context collector、Public Suffix 去重、异步 SDK client 初始化、wallet bootstrap、trade ID 对账、数据库时钟 arm expiry CAS 和交易所侧 GTD 到期保护 |
 | Polymarket 公共 API | 官方 SDK 0.2.0 成功读取当前市场与 outcome order book；当前 keyset 服务实测必须按数值 JSON 字段 `liquidityNum` 排序 |
 | Polymarket SDK contract | 下单、异步成交 ID、余额、订单/成交/activity/仓位与 WS 方法形状测试通过 |
 | Paper 端到端 | 实时公开行情扫描 3 个高流动性市场，生成 3 个 mock forecast，因无正净价值候选而 0 intent/0 order |
@@ -22,8 +22,8 @@
 生成的 Python 制品：
 
 ```text
-dist/polybot-0.1.0-py3-none-any.whl
-dist/polybot-0.1.0.tar.gz
+backend/dist/polybot-0.1.0-py3-none-any.whl
+backend/dist/polybot-0.1.0.tar.gz
 ```
 
 唯一测试告警来自 Starlette 对旧 `httpx` TestClient 兼容层的弃用提示，不影响运行时网络客户端，也没有测试失败。

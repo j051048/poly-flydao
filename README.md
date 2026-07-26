@@ -31,6 +31,17 @@ Polybot 是一套面向 Polymarket CLOB V2 的 AI 辅助自动交易工程：市
 
 完整边界见 [架构说明](docs/ARCHITECTURE.md)。
 
+## 仓库布局
+
+```text
+backend/    Zeabur API + worker、Python 源码、测试、Supabase migrations
+apps/web/   Vercel 控制台
+docs/       架构、验证、安全与部署说明
+.github/    CI、Dependabot 与协作模板
+```
+
+Zeabur 的 API 和 worker 服务都应把 Root Directory 设为 `backend`；Vercel 的 Root Directory 保持 `apps/web`。后端目录只有一份源码和锁文件，不需要在仓库根目录保留代理副本。
+
 ## 数据与执行流
 
 ```text
@@ -64,17 +75,19 @@ AI 只产生结构化概率和论据。它拿不到钱包、签名器、Supabase
 需要 Python 3.11–3.14 和 [uv](https://docs.astral.sh/uv/)。
 
 ```powershell
+Set-Location backend
 Copy-Item .env.example .env
 uv sync --frozen --extra dev --no-editable
 uv run --no-editable polybot config-check
 uv run --no-editable uvicorn polybot.api:app --reload
 ```
 
-这里显式使用 `--no-editable`，以避免 Windows + Python 3.11 在中文项目路径下误读 editable `.pth`；修改源码后重新执行一次 sync。
+这里显式使用 `--no-editable`，以避免 Windows + Python 3.11 在中文项目路径下误读 editable `.pth`；修改源码后用 `uv sync --frozen --extra dev --no-editable --reinstall-package polybot` 刷新已安装包。
 
 另一个终端运行 paper worker：
 
 ```powershell
+Set-Location backend
 uv run --no-editable python -m polybot.worker
 ```
 
@@ -115,12 +128,15 @@ POLYBOT_CRITIC_MODEL=<gateway-model-name>
 首次真实钱包初始化可生成系统内部 secret，并让官方 SDK 自动派生/部署 Deposit Wallet：
 
 ```powershell
+Set-Location backend
 uv run --no-editable polybot generate-secrets
 $env:POLYMARKET_PRIVATE_KEY="<dedicated-wallet-private-key>"
 uv run --no-editable polybot wallet-info
+# 向上一条命令输出的 trading_wallet 转入唯一一笔启动资金后：
+uv run --no-editable polybot wallet-bootstrap --confirm-standard-allowances
 ```
 
-把 Polygon pUSD 转到 `wallet-info` 输出的 `trading_wallet`。`POLYMARKET_DEPOSIT_WALLET` 现在只是可选覆盖值；留空时由官方 SDK 从 signer 自动派生。
+`wallet-info` 会让官方 SDK 派生凭据，并在需要时部署 Deposit Wallet，因此不是纯离线命令。把 Polygon pUSD 转到它输出的 `trading_wallet`，再显式运行一次 `wallet-bootstrap` 建立标准交易授权；该操作可能提交并等待链上/relayer 交易。`POLYMARKET_DEPOSIT_WALLET` 只是可选覆盖值，留空时由 SDK 从 signer 自动派生。两条命令都不会输出私钥或 CLOB 凭据。
 
 ## API 与 signer worker 分离
 
@@ -201,6 +217,7 @@ POLYBOT_AUTO_REDEEM_RESOLVED=false
 ## 回测
 
 ```powershell
+Set-Location backend
 uv run --no-editable polybot backtest --input examples/backtest_sample.jsonl
 ```
 

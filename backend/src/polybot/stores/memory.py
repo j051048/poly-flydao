@@ -92,6 +92,8 @@ class MemoryStore:
         payload_ciphertext: bytes,
         key_version: int,
         fencing_token: int,
+        order_type: str = "GTC",
+        expires_at: datetime | None = None,
     ) -> None:
         existing = self.signed_orders.get(intent.intent_hash)
         if existing is not None and existing[0] != signed_order_hash:
@@ -102,6 +104,8 @@ class MemoryStore:
             key_version,
             intent.account_id,
             fencing_token,
+            order_type,
+            expires_at,
         )
         self.unresolved_live_orders.add(intent.intent_hash)
 
@@ -177,7 +181,25 @@ class MemoryStore:
                     kill_switch=True,
                 ),
             )
-            if current.version != expected_version or current.cancellation_pending:
+            now = utc_now()
+            eligible_disarmed = bool(
+                not current.armed
+                and not current.accept_new_intents
+                and current.kill_switch
+                and current.armed_until is None
+            )
+            eligible_renewal = bool(
+                current.armed
+                and current.is_live_armed
+                and current.mode is TradingMode(mode)
+            )
+            if (
+                current.version != expected_version
+                or current.cancellation_pending
+                or armed_until <= now
+                or armed_until > now + timedelta(minutes=15)
+                or not (eligible_disarmed or eligible_renewal)
+            ):
                 return None
             control = RuntimeControl(
                 account_id=account_id,
@@ -190,6 +212,36 @@ class MemoryStore:
             )
             self.controls[account_id] = control
             return control
+
+    async def expire_runtime_control(
+        self,
+        account_id: str,
+        mode: str,
+        expected_version: int,
+    ) -> RuntimeControl | None:
+        async with self._lock:
+            current = self.controls.get(account_id)
+            if (
+                current is None
+                or current.version != expected_version
+                or current.mode is not TradingMode(mode)
+                or not current.armed
+                or current.armed_until is None
+                or current.armed_until > utc_now()
+            ):
+                return None
+            expired = RuntimeControl(
+                account_id=account_id,
+                mode=TradingMode(mode),
+                armed=False,
+                accept_new_intents=False,
+                armed_until=None,
+                kill_switch=True,
+                cancellation_pending=True,
+                version=current.version + 1,
+            )
+            self.controls[account_id] = expired
+            return expired
 
     async def disarm_runtime_control(self, account_id: str, mode: str) -> RuntimeControl:
         async with self._lock:

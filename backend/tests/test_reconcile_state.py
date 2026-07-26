@@ -3,7 +3,7 @@ from typing import Any
 
 import pytest
 
-from polybot.models import Side, UserTradeUpdate, utc_now
+from polybot.models import ExecutionResult, ExecutionStatus, Side, UserTradeUpdate, utc_now
 from polybot.stores.ledger import IncompleteFillLedgerError
 from polybot.stores.supabase_store import (
     SupabaseStore,
@@ -137,8 +137,10 @@ class FakeQuery:
         self.conflict: str | None = None
         self.filters: list[tuple[str, str, Any]] = []
         self.row_limit: int | None = None
+        self.selected_columns = "*"
 
     def select(self, columns: str):
+        self.selected_columns = columns
         return self
 
     def update(self, payload: dict[str, Any]):
@@ -178,6 +180,11 @@ class FakeQuery:
             selected = [dict(row) for row in rows if self._matches(row)]
             if self.row_limit is not None:
                 selected = selected[: self.row_limit]
+            if self.selected_columns != "*":
+                columns = [column.strip() for column in self.selected_columns.split(",")]
+                selected = [
+                    {column: row[column] for column in columns if column in row} for row in selected
+                ]
             return FakeResponse(selected)
         if self.operation == "update":
             updated = []
@@ -210,6 +217,64 @@ class FakeSupabaseClient:
 
     def table(self, name: str):
         return FakeQuery(self.tables, name)
+
+
+async def test_save_execution_never_downgrades_a_persisted_gtd_order() -> None:
+    expires_at = "2026-07-01T00:05:00+00:00"
+    tables = {
+        "order_intents": [
+            {
+                "id": "intent-1",
+                "account_id": "account",
+                "intent_hash": "intent-hash",
+                "mode": "canary",
+                "token_id": "yes-token",
+                "side": "BUY",
+                "price": "0.4",
+                "size": "2",
+                "status": "signed",
+            }
+        ],
+        "orders": [
+            {
+                "id": "db-order",
+                "account_id": "account",
+                "order_intent_id": "intent-1",
+                "client_order_id": "intent-hash",
+                "clob_order_id": None,
+                "status": "submitting",
+                "original_size": "2",
+                "filled_size": "0",
+                "remaining_size": "2",
+                "average_fill_price": None,
+                "attempt_count": 1,
+                "last_error_detail": None,
+                "response_payload": {"signed_order_hash": "signed-hash"},
+                "submitted_at": None,
+                "order_type": "GTD",
+                "expires_at": expires_at,
+            }
+        ],
+    }
+    store = SupabaseStore(
+        "https://example.supabase.co",
+        "service-role",
+        account_id="account",
+        client=FakeSupabaseClient(tables),
+    )
+
+    await store.save_execution(
+        ExecutionResult(
+            intent_hash="intent-hash",
+            status=ExecutionStatus.ERROR,
+            message="ambiguous post result",
+            raw={},
+        ),
+        "account",
+    )
+
+    assert tables["orders"][0]["order_type"] == "GTD"
+    assert tables["orders"][0]["expires_at"] == expires_at
 
 
 async def test_supabase_reconcile_trade_keeps_partial_and_terminal_states_monotonic() -> None:

@@ -30,6 +30,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "pip-audit>=2.9,<3",
   "pytest>=8.3,<10",
   "pytest-asyncio>=0.25,<2",
   "pytest-cov>=6,<8",
@@ -51,8 +52,6 @@ exclude = [
   "/.test-tmp",
   "/.uv-cache",
   "/.venv",
-  "/apps/web/.next",
-  "/apps/web/node_modules",
   "/build",
   "/dist",
   "**/__pycache__",

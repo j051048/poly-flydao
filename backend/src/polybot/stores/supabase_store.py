@@ -104,6 +104,20 @@ def _merge_execution_order_payload(
         int(incoming.get("attempt_count") or 0),
     )
     payload["submitted_at"] = existing.get("submitted_at") or incoming.get("submitted_at")
+    existing_order_type = str(existing.get("order_type") or "").upper()
+    incoming_order_type = str(incoming.get("order_type") or "").upper()
+    # A signed GTD order is immutable exchange-side. Later execution retries
+    # can have an empty response payload (notably an ambiguous POST), so they
+    # must never erase the durable expiry or downgrade the row to GTC.
+    if existing_order_type == "GTD":
+        payload["order_type"] = "GTD"
+        payload["expires_at"] = existing.get("expires_at") or incoming.get("expires_at")
+    elif incoming_order_type == "GTD":
+        payload["order_type"] = "GTD"
+        payload["expires_at"] = incoming.get("expires_at") or existing.get("expires_at")
+    else:
+        payload["order_type"] = existing.get("order_type") or incoming.get("order_type")
+        payload["expires_at"] = existing.get("expires_at") or incoming.get("expires_at")
     payload["response_payload"] = {
         **(existing.get("response_payload") or {}),
         **(incoming.get("response_payload") or {}),
@@ -213,13 +227,54 @@ class SupabaseStore:
         self._token_outcomes: dict[str, str] = {}
         self._intents: dict[str, TradeIntent] = {}
         self._fill_ledger_cache: tuple[str, float, FillLedgerSnapshot] | None = None
+        self._preflight_complete = False
 
     async def _execute(self, builder: Any) -> Any:
         return await asyncio.to_thread(builder.execute)
 
     async def health(self) -> bool:
         try:
-            await self._execute(self.client.table("runtime_controls").select("account_id").limit(1))
+            await self._execute(
+                self.client.table("runtime_controls")
+                .select("account_id")
+                .eq("account_id", self.account_id)
+                .limit(1)
+            )
+            if not self._preflight_complete:
+                user_response = await asyncio.to_thread(
+                    self.client.auth.admin.get_user_by_id,
+                    self.account_id,
+                )
+                user = getattr(user_response, "user", None)
+                if user is None or str(getattr(user, "id", "")) != self.account_id:
+                    return False
+                # Validate every incremental migration by selecting one column
+                # introduced by it. Empty tables are valid; missing schema is not.
+                for table, column in (
+                    ("account_risk_state", "risk_day"),
+                    ("account_activities", "activity_key"),
+                    ("orders", "open_snapshot_miss_count,expires_at"),
+                ):
+                    await self._execute(
+                        self.client.table(table)
+                        .select(column)
+                        .eq("account_id", self.account_id)
+                        .limit(1)
+                    )
+                # A no-match CAS is read-like but proves migration 0005 and its
+                # service-role grant are available. The orders select above also
+                # proves the 0006 GTD expiry column.
+                await self._execute(
+                    self.client.rpc(
+                        "expire_runtime_control",
+                        {
+                            "p_account_id": self.account_id,
+                            "p_mode": "canary",
+                            "p_expected_version": 0,
+                        },
+                    )
+                )
+                self._preflight_complete = True
         except Exception:
             return False
         return True
@@ -438,7 +493,23 @@ class SupabaseStore:
         payload_ciphertext: bytes,
         key_version: int,
         fencing_token: int,
+        order_type: str = "GTC",
+        expires_at: datetime | None = None,
     ) -> None:
+        normalized_order_type = order_type.upper()
+        if normalized_order_type == "GTD" and expires_at is None:
+            raise ValueError("GTD signed orders require an exchange expiry")
+        await self._execute(
+            self.client.table("order_intents")
+            .update(
+                {
+                    "order_type": normalized_order_type,
+                    "expires_at": expires_at.isoformat() if expires_at else None,
+                }
+            )
+            .eq("id", str(intent.id))
+            .eq("account_id", intent.account_id)
+        )
         payload = {
             "account_id": intent.account_id,
             "order_intent_id": str(intent.id),
@@ -450,7 +521,8 @@ class SupabaseStore:
             "environment": intent.mode.value,
             "outcome_token_id": intent.token_id,
             "side": intent.side.value,
-            "order_type": "GTC",
+            "order_type": normalized_order_type,
+            "expires_at": expires_at.isoformat() if expires_at else None,
             "limit_price": str(intent.price),
             "original_size": str(intent.size),
             "filled_size": "0",
@@ -538,6 +610,8 @@ class SupabaseStore:
             "error": "failed",
         }
         filled = min(result.filled_size, size)
+        execution_order_type = str(result.raw.get("order_type") or "GTC").upper()
+        execution_expires_at = result.raw.get("expires_at")
         payload = {
             "account_id": account_id,
             "order_intent_id": intent_id,
@@ -546,7 +620,8 @@ class SupabaseStore:
             "environment": mode,
             "outcome_token_id": token_id,
             "side": side,
-            "order_type": "GTC",
+            "order_type": execution_order_type,
+            "expires_at": execution_expires_at,
             "limit_price": str(price),
             "original_size": str(size),
             "filled_size": str(filled),
@@ -572,7 +647,7 @@ class SupabaseStore:
             .select(
                 "id,status,clob_order_id,original_size,filled_size,remaining_size,"
                 "average_fill_price,attempt_count,last_error_detail,response_payload,"
-                "submitted_at"
+                "submitted_at,order_type,expires_at"
             )
             .eq("account_id", account_id)
             .eq("client_order_id", result.intent_hash)
@@ -636,6 +711,28 @@ class SupabaseStore:
                     "p_account_id": account_id,
                     "p_mode": mode,
                     "p_armed_until": armed_until.isoformat(),
+                    "p_expected_version": expected_version,
+                },
+            )
+        )
+        rows = response.data or []
+        if not rows:
+            return None
+        row = rows[0] if isinstance(rows, list) else rows
+        return RuntimeControl.model_validate(row)
+
+    async def expire_runtime_control(
+        self,
+        account_id: str,
+        mode: str,
+        expected_version: int,
+    ) -> RuntimeControl | None:
+        response = await self._execute(
+            self.client.rpc(
+                "expire_runtime_control",
+                {
+                    "p_account_id": account_id,
+                    "p_mode": mode,
                     "p_expected_version": expected_version,
                 },
             )

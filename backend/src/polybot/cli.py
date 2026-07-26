@@ -4,14 +4,46 @@ import argparse
 import asyncio
 import json
 import secrets
+import time
 from pathlib import Path
 
 from cryptography.fernet import Fernet
+from pydantic import AliasChoices, Field, SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from polybot.backtest import load_jsonl, report_json, run_backtest
-from polybot.config import BETA_SDK_ACK_TEXT, LIVE_ACK_TEXT, TradingMode, get_settings
+from polybot.config import (
+    BETA_SDK_ACK_TEXT,
+    DEDICATED_WALLET_ACK_TEXT,
+    LIVE_ACK_TEXT,
+    TradingMode,
+    get_settings,
+)
 from polybot.research import inspect_nautilus_runtime
 from polybot.runtime import build_runtime
+
+
+class WalletBootstrapSettings(BaseSettings):
+    """Minimal wallet-only settings, independent of real-money runtime gates."""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        extra="ignore",
+        case_sensitive=False,
+        populate_by_name=True,
+    )
+
+    private_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("POLYMARKET_PRIVATE_KEY", "POLYBOT_PRIVATE_KEY"),
+    )
+    deposit_wallet: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "POLYMARKET_DEPOSIT_WALLET",
+            "POLYBOT_POLYMARKET_DEPOSIT_WALLET",
+        ),
+    )
 
 
 def parser() -> argparse.ArgumentParser:
@@ -25,6 +57,16 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser(
         "wallet-info",
         help="derive/deploy the SDK Deposit Wallet and print its funding address",
+    )
+    wallet_bootstrap = commands.add_parser(
+        "wallet-bootstrap",
+        help="perform the explicit one-time on-chain trading approval setup",
+    )
+    wallet_bootstrap.add_argument(
+        "--confirm-standard-allowances",
+        action="store_true",
+        required=True,
+        help="confirm that the SDK may submit the standard approval transactions",
     )
     commands.add_parser("cycle", help="run exactly one gated scan cycle")
     commands.add_parser("research-runtime", help="inspect the optional Nautilus runtime")
@@ -43,21 +85,40 @@ def main() -> None:
                     f"POLYBOT_ADMIN_TOKEN={secrets.token_urlsafe(48)}",
                     f"POLYBOT_LIVE_ACK={LIVE_ACK_TEXT}",
                     f"POLYBOT_BETA_SDK_ACK={BETA_SDK_ACK_TEXT}",
+                    f"POLYBOT_DEDICATED_WALLET_ACK={DEDICATED_WALLET_ACK_TEXT}",
                 ]
             )
         )
         return
-    settings = get_settings()
-    if args.command == "wallet-info":
-        if settings.polymarket_private_key is None:
+    if args.command in {"wallet-info", "wallet-bootstrap"}:
+        wallet_settings = WalletBootstrapSettings()
+        if wallet_settings.private_key is None:
             raise SystemExit("POLYMARKET_PRIVATE_KEY is required")
         from polymarket import SecureClient
 
         client = SecureClient.create(
-            private_key=settings.polymarket_private_key.get_secret_value(),
-            wallet=settings.polymarket_deposit_wallet,
+            private_key=wallet_settings.private_key.get_secret_value(),
+            wallet=wallet_settings.deposit_wallet,
         )
         try:
+            if args.command == "wallet-bootstrap":
+                client.setup_trading_approvals()
+            collateral = None
+            for attempt in range(3):
+                collateral = client.get_balance_allowance(asset_type="COLLATERAL")
+                allowances_ready = bool(collateral.allowances) and all(
+                    int(value) > 0 for value in collateral.allowances.values()
+                )
+                if args.command == "wallet-info" or allowances_ready:
+                    break
+                if attempt < 2:
+                    time.sleep(1)
+            assert collateral is not None
+            if args.command == "wallet-bootstrap" and not allowances_ready:
+                raise RuntimeError(
+                    "approval transactions completed, but the CLOB allowance cache "
+                    "did not become ready; wait briefly and rerun wallet-info"
+                )
             print(
                 json.dumps(
                     {
@@ -66,6 +127,14 @@ def main() -> None:
                         "wallet_type": str(client.wallet_type),
                         "chain_id": client.environment.chain_id,
                         "collateral_token": client.environment.collateral_token,
+                        "collateral_balance_base_units": str(collateral.balance),
+                        "collateral_allowances": {
+                            str(spender): str(value)
+                            for spender, value in collateral.allowances.items()
+                        },
+                        "trading_approvals": (
+                            "ready" if args.command == "wallet-bootstrap" else "not_checked"
+                        ),
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -74,6 +143,7 @@ def main() -> None:
         finally:
             client.close()
         return
+    settings = get_settings()
     if args.command == "config-check":
         print(
             json.dumps(

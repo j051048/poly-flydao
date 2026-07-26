@@ -43,15 +43,17 @@ class AllowedChecker:
 class FakeSecureClient:
     def __init__(self) -> None:
         self.calls = 0
+        self.order_kwargs: list[dict[str, object]] = []
 
     def create_limit_order(self, **kwargs):
+        self.order_kwargs.append(kwargs)
         return SimpleNamespace(
             builder="0x00",
-            expiration=0,
+            expiration=kwargs.get("expiration", 0),
             maker="0x01",
             maker_amount=1,
             metadata="0x",
-            order_type="GTC",
+            order_type="GTD" if kwargs.get("expiration") else "GTC",
             post_only=False,
             salt=1,
             side="BUY",
@@ -143,7 +145,7 @@ async def test_live_broker_requires_short_lived_arm(yes_book) -> None:
             mode=TradingMode.CANARY,
             armed=True,
             accept_new_intents=True,
-            armed_until=utc_now() + timedelta(minutes=2),
+            armed_until=utc_now() + timedelta(minutes=5),
             kill_switch=False,
         )
     )
@@ -165,6 +167,49 @@ async def test_live_broker_requires_short_lived_arm(yes_book) -> None:
     assert intent.intent_hash in store.signed_orders
     assert accepted.raw["trade_ids"] == ["trade-1"]
     assert accepted.raw["transaction_hashes"] == ["0xtx"]
+    assert accepted.raw["order_type"] == "GTD"
+    assert client.order_kwargs[0]["expiration"] > int(utc_now().timestamp()) + 180
+
+
+async def test_live_broker_refuses_order_when_gtd_expiry_is_too_close(yes_book) -> None:
+    settings = live_settings()
+    store = MemoryStore()
+    client = FakeSecureClient()
+    broker = PolymarketBroker(settings, store, client=client, geoblock=AllowedChecker())
+    await store.set_runtime_control(
+        RuntimeControl(
+            account_id=settings.account_id,
+            mode=TradingMode.CANARY,
+            armed=True,
+            accept_new_intents=True,
+            armed_until=utc_now() + timedelta(minutes=3),
+            kill_switch=False,
+        )
+    )
+    intent = TradeIntent(
+        intent_hash="a" * 64,
+        account_id=settings.account_id,
+        run_id="r1",
+        mode=TradingMode.CANARY,
+        market_id="m1",
+        event_id="e1",
+        bucket="test",
+        token_id="yes-1",
+        outcome=Outcome.YES,
+        side=Side.BUY,
+        price=Decimal("0.41"),
+        size=Decimal("2"),
+        notional_usd=Decimal("0.82"),
+        edge_after_costs=Decimal("0.10"),
+        forecast_id=None,
+        strategy="test",
+    )
+
+    result = await broker.submit(intent, yes_book)
+
+    assert result.status is ExecutionStatus.REJECTED
+    assert "3.5 minutes" in result.message
+    assert client.order_kwargs == []
 
 
 async def test_live_broker_rejects_stale_book_before_signing(yes_book) -> None:
@@ -281,7 +326,7 @@ async def test_ambiguous_post_remains_durably_blocking(yes_book) -> None:
             mode=TradingMode.CANARY,
             armed=True,
             accept_new_intents=True,
-            armed_until=utc_now() + timedelta(minutes=2),
+            armed_until=utc_now() + timedelta(minutes=5),
             kill_switch=False,
         )
     )
@@ -347,7 +392,7 @@ async def test_control_change_during_post_forces_verified_cancellation(yes_book)
             mode=TradingMode.CANARY,
             armed=True,
             accept_new_intents=True,
-            armed_until=utc_now() + timedelta(minutes=2),
+            armed_until=utc_now() + timedelta(minutes=5),
             kill_switch=False,
         )
     )

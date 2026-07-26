@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 
 from polybot.ai.base import EvidenceCollector, ForecastProvider
@@ -37,6 +38,11 @@ class Runtime:
     async def close(self) -> None:
         if self.reconciler is not None:
             await self.reconciler.close()
+        close_broker = getattr(self.broker, "close", None)
+        if close_broker is not None:
+            result = close_broker()
+            if inspect.isawaitable(result):
+                await result
         await self.market_data.close()
 
 

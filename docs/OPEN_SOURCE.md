@@ -17,11 +17,11 @@
 | 7 | [PrefectHQ/prefect](https://github.com/PrefectHQ/prefect) | `prefect==3.7.8` | Apache-2.0 | 单个 `retries=0` 的周期 flow | 有限接线，仅 paper/shadow 离线入口 |
 | 8 | [john-kurkowski/tldextract](https://github.com/john-kurkowski/tldextract) | `>=5.3,<6` | BSD-3-Clause | 使用内置 Public Suffix List 归一化可注册发布域名；关闭运行时 PSL 下载 | 核心 evidence gate 已接线 |
 
-核心依赖在 `pyproject.toml` 中精确固定，并由 `uv.lock` 记录解析版本与哈希。NautilusTrader 是例外：它是范围约束的 optional dependency，不进入默认生产镜像。
+核心依赖在 `backend/pyproject.toml` 中精确固定，并由 `backend/uv.lock` 记录解析版本与哈希。NautilusTrader 是例外：它是范围约束的 optional dependency，不进入默认生产镜像。
 
 ## NautilusTrader 的 Python 版本分支
 
-当前 `uv.lock` 对 `research` extra 的解析是：
+当前 `backend/uv.lock` 对 `research` extra 的解析是：
 
 | Python | 锁定版本 |
 |---|---|
@@ -41,7 +41,7 @@
 - `brokers/polymarket.py` 使用 `SecureClient` 创建、签名、提交、取消订单和可选赎回；
 - `reconcile.py` 使用 `AsyncSecureClient` 订阅 user WebSocket，并读取完整 trades、lifecycle activity 和 `size_threshold=0` positions；
 - live broker 查询真实 balance、allowance、open orders 和 positions；fills + REDEEM activity 重建成本，持久化 UTC 日初权益覆盖结算归零；
-- `wallet-info` 依赖官方 SDK 自动派生/部署默认 Deposit Wallet；
+- `wallet-info` 依赖官方 SDK 自动派生/部署默认 Deposit Wallet；显式一次性的 `wallet-bootstrap` 调用 SDK `setup_trading_approvals()` 并检查 CLOB allowance；
 - 所有真实资金写路径只使用这一官方 SDK，没有第二套 CLOB signer；
 - 0.2.0 的异步成交响应 `trade_ids` 和当前可用的 transaction hashes 会进入订单响应审计，最终成交状态仍由 user WebSocket 和 REST 对账确认。
 
@@ -210,7 +210,7 @@ NautilusTrader → 仅 research optional dependency，尚未连接数据流
 - 保留上游仓库链接、版本和许可证记录；
 - LiteLLM 只使用 core MIT 范围；
 - Nautilus 保持 optional、独立、可替换，不进入默认 signer 镜像；
-- 依赖升级先更新 `uv.lock`，再运行单元测试、SDK shape tests、paper/shadow 和小额 canary；
+- 依赖升级先更新 `backend/uv.lock`，再运行单元测试、SDK shape tests、paper/shadow 和小额 canary；
 - `0.x` Polymarket SDK 和任何签名/订单 schema 变化都按 breaking change 处理；
 - 许可证记录不是 SBOM。仓库当前没有自动生成 SBOM 或完整 `THIRD_PARTY_NOTICES`，正式分发前仍需补齐。
 

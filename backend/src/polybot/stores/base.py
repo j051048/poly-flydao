@@ -54,6 +54,8 @@ class StateStore(Protocol):
         payload_ciphertext: bytes,
         key_version: int,
         fencing_token: int,
+        order_type: str = "GTC",
+        expires_at: datetime | None = None,
     ) -> None: ...
 
     async def mark_order_submitting(
@@ -71,6 +73,13 @@ class StateStore(Protocol):
         account_id: str,
         mode: str,
         armed_until: datetime,
+        expected_version: int,
+    ) -> RuntimeControl | None: ...
+
+    async def expire_runtime_control(
+        self,
+        account_id: str,
+        mode: str,
         expected_version: int,
     ) -> RuntimeControl | None: ...
 

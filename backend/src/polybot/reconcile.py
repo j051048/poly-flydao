@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import logging
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -19,6 +20,8 @@ from polybot.models import (
 from polybot.stores.base import StateStore
 from polybot.stores.ledger import IncompleteFillLedgerError
 
+logger = logging.getLogger(__name__)
+
 
 class OrderReconciler:
     """Authenticated user WebSocket plus periodic REST repair for orders, fills and positions."""
@@ -34,11 +37,10 @@ class OrderReconciler:
         client: Any | None = None,
         market_data: MarketData | None = None,
     ):
-        if client is None:
-            from polymarket import AsyncSecureClient
-
-            client = AsyncSecureClient.create(private_key=private_key, wallet=wallet)
         self.client = client
+        self._private_key = private_key
+        self._wallet = wallet
+        self._client_lock = asyncio.Lock()
         self.account_id = account_id
         self.store = store
         self.interval_seconds = interval_seconds
@@ -60,10 +62,11 @@ class OrderReconciler:
         try:
             while not self._closed:
                 try:
+                    client = await self._ensure_client()
                     await self.reconcile_rest()
                     from polymarket.streams import UserSpec
 
-                    self._handle = await self.client.subscribe(UserSpec(markets=None))
+                    self._handle = await client.subscribe(UserSpec(markets=None))
                     self.healthy.set()
                     backoff = 1.0
                     async for event in self._handle:
@@ -74,6 +77,9 @@ class OrderReconciler:
                     raise
                 except Exception:
                     self.healthy.clear()
+                    if self._closed:
+                        break
+                    logger.exception("authenticated Polymarket reconciliation failed")
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 30)
                 finally:
@@ -97,10 +103,36 @@ class OrderReconciler:
                     self.healthy.set()
             except Exception:
                 self.healthy.clear()
+                if not self._closed:
+                    logger.exception("periodic Polymarket REST reconciliation failed")
 
     async def reconcile_rest(self) -> None:
+        await self._ensure_client()
         async with self._reconcile_lock:
             await self._reconcile_rest_once()
+
+    async def _ensure_client(self) -> Any:
+        """Create the async SDK client inside an event loop and await its factory."""
+
+        if self._closed:
+            raise RuntimeError("reconciler is closed")
+        if self.client is not None:
+            return self.client
+        async with self._client_lock:
+            if self._closed:
+                raise RuntimeError("reconciler is closed")
+            if self.client is None:
+                from polymarket import AsyncSecureClient
+
+                created = await AsyncSecureClient.create(
+                    private_key=self._private_key,
+                    wallet=self._wallet,
+                )
+                if self._closed:
+                    await created.close()
+                    raise RuntimeError("reconciler closed during client initialization")
+                self.client = created
+        return self.client
 
     async def _reconcile_rest_once(self) -> None:
         order_count = 0
@@ -438,7 +470,11 @@ class OrderReconciler:
     async def close(self) -> None:
         self._closed = True
         self.healthy.clear()
-        if self._handle is not None:
+        handle, self._handle = self._handle, None
+        if handle is not None:
             with contextlib.suppress(Exception):
-                await self._handle.close()
-        await self.client.close()
+                await handle.close()
+        async with self._client_lock:
+            client, self.client = self.client, None
+        if client is not None:
+            await client.close()

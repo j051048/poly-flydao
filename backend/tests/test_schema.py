@@ -73,3 +73,31 @@ def test_upgrade_migration_adds_durable_order_absence_evidence() -> None:
     assert "add column if not exists open_snapshot_missing_since" in sql
     assert "orders_open_snapshot_miss_count_nonnegative" in sql
     assert "orders_account_missing_reconcile_idx" in sql
+
+
+def test_upgrade_migration_makes_arm_expiry_atomic() -> None:
+    sql = (
+        Path("supabase/migrations/0005_runtime_control_expiry.sql")
+        .read_text(encoding="utf-8")
+        .lower()
+    )
+    assert "create or replace function public.expire_runtime_control" in sql
+    assert "control.armed_until <= now()" in sql
+    assert "control.version = p_expected_version" in sql
+    assert "cancellation_pending = true" in sql
+    assert "p_armed_until <= now()" in sql
+    assert "control.armed_until > now()" in sql
+    assert "grant execute on function public.expire_runtime_control" in sql
+
+
+def test_upgrade_migration_adds_exchange_side_order_expiry() -> None:
+    sql = (
+        Path("supabase/migrations/0006_order_expiry.sql")
+        .read_text(encoding="utf-8")
+        .lower()
+    )
+    assert "add column if not exists expires_at" in sql
+    assert "orders_gtd_has_expiry" in sql
+    assert "order_type <> 'gtd' or expires_at is not null" in sql
+    assert "orders_account_expiry_idx" in sql
+    assert "grant select (expires_at) on public.orders to authenticated" in sql
