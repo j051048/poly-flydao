@@ -1,0 +1,12 @@
+{
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "deploy": {
+    "env": {
+      "PORT": "8080",
+      "SERVICE_ROLE": "api",
+      "WEB_CONCURRENCY": "1"
+    }
+  }
+}

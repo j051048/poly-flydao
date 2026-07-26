@@ -1,0 +1,444 @@
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import hashlib
+from datetime import UTC, datetime
+from decimal import Decimal
+from typing import Any
+
+from polybot.market import MarketData
+from polybot.models import (
+    AccountActivityUpdate,
+    AccountPositionUpdate,
+    Outcome,
+    UserOrderUpdate,
+    UserTradeUpdate,
+    utc_now,
+)
+from polybot.stores.base import StateStore
+from polybot.stores.ledger import IncompleteFillLedgerError
+
+
+class OrderReconciler:
+    """Authenticated user WebSocket plus periodic REST repair for orders, fills and positions."""
+
+    def __init__(
+        self,
+        *,
+        private_key: str,
+        wallet: str | None,
+        account_id: str,
+        store: StateStore,
+        interval_seconds: int = 30,
+        client: Any | None = None,
+        market_data: MarketData | None = None,
+    ):
+        if client is None:
+            from polymarket import AsyncSecureClient
+
+            client = AsyncSecureClient.create(private_key=private_key, wallet=wallet)
+        self.client = client
+        self.account_id = account_id
+        self.store = store
+        self.interval_seconds = interval_seconds
+        self.market_data = market_data
+        self._known_position_conditions: set[str] = set()
+        self.healthy = asyncio.Event()
+        self._reconcile_lock = asyncio.Lock()
+        self._closed = False
+        self._handle: Any | None = None
+        # Every cold start replays the authenticated CLOB history from epoch 0.
+        # A one-day lookback can invent a profitable cost basis for an old
+        # wallet, so startup cost is preferred over an unprovable ledger.
+        self._trade_after = "0"
+        self._activity_start = 1
+
+    async def run(self) -> None:
+        periodic = asyncio.create_task(self._periodic_rest(), name="polymarket-rest-reconcile")
+        backoff = 1.0
+        try:
+            while not self._closed:
+                try:
+                    await self.reconcile_rest()
+                    from polymarket.streams import UserSpec
+
+                    self._handle = await self.client.subscribe(UserSpec(markets=None))
+                    self.healthy.set()
+                    backoff = 1.0
+                    async for event in self._handle:
+                        if self._closed:
+                            break
+                        await self._apply_user_event(event)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    self.healthy.clear()
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 30)
+                finally:
+                    self.healthy.clear()
+                    handle, self._handle = self._handle, None
+                    if handle is not None:
+                        with contextlib.suppress(Exception):
+                            await handle.close()
+        finally:
+            self.healthy.clear()
+            periodic.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await periodic
+
+    async def _periodic_rest(self) -> None:
+        while not self._closed:
+            await asyncio.sleep(self.interval_seconds)
+            try:
+                await self.reconcile_rest()
+                if self._handle is not None:
+                    self.healthy.set()
+            except Exception:
+                self.healthy.clear()
+
+    async def reconcile_rest(self) -> None:
+        async with self._reconcile_lock:
+            await self._reconcile_rest_once()
+
+    async def _reconcile_rest_once(self) -> None:
+        order_count = 0
+        open_order_ids: set[str] = set()
+        async for order in self.client.list_open_orders().iter_items():
+            await self.store.reconcile_order(self._order_update(order), self.account_id)
+            open_order_ids.add(str(order.id))
+            order_count += 1
+            if order_count >= 2000:
+                raise RuntimeError("open-order reconciliation safety limit exceeded")
+        missing_orders = await self.store.reconcile_open_order_snapshot(
+            open_order_ids, self.account_id
+        )
+        confirmed_absent_order_ids: set[str] = set()
+        for target in missing_orders:
+            try:
+                order = await self.client.get_order(order_id=target.clob_order_id)
+            except Exception as exc:
+                if not self._is_not_found(exc):
+                    raise
+                confirmed_absent_order_ids.add(target.clob_order_id)
+            else:
+                await self.store.reconcile_order(self._order_update(order), self.account_id)
+                open_order_ids.add(target.clob_order_id)
+
+        trade_count = 0
+        latest_trade_epoch = int(self._trade_after)
+        # A confirmed disappearance is repaired against the complete trade
+        # history before it can become a cancellation terminal. This avoids
+        # missing an eventually-consistent fill whose matched_at predates the
+        # rolling cursor.
+        trade_after = "0" if confirmed_absent_order_ids else self._trade_after
+        seen_trade_ids: set[str] = set()
+        async for trade in self.client.list_account_trades(after=trade_after).iter_items():
+            for update in await self._account_trade_updates(trade):
+                await self.store.reconcile_trade(update, self.account_id)
+            seen_trade_ids.add(str(trade.id))
+            matched_at = getattr(trade, "matched_at", None)
+            if matched_at is not None:
+                latest_trade_epoch = max(latest_trade_epoch, int(matched_at.timestamp()))
+            trade_count += 1
+            if trade_count >= 100_000:
+                raise RuntimeError("trade reconciliation safety limit exceeded")
+
+        # AcceptedOrder.trade_ids and non-terminal durable fills are independent
+        # of the rolling matched-at cursor. Poll them explicitly until the SDK
+        # reports CONFIRMED or FAILED.
+        pending_trade_ids = await self.store.pending_trade_ids(self.account_id)
+        if len(pending_trade_ids) > 10_000:
+            raise RuntimeError("pending-trade reconciliation safety limit exceeded")
+        for trade_id in sorted(pending_trade_ids.difference(seen_trade_ids)):
+            async for trade in self.client.list_account_trades(id=trade_id).iter_items():
+                if str(trade.id) != trade_id:
+                    continue
+                for update in await self._account_trade_updates(trade):
+                    await self.store.reconcile_trade(update, self.account_id)
+                seen_trade_ids.add(trade_id)
+                trade_count += 1
+                if trade_count >= 100_000:
+                    raise RuntimeError("trade reconciliation safety limit exceeded")
+
+        # Only a 404 from get_order plus the complete trade repair above counts
+        # as one absence confirmation. The store requires two confirmations
+        # (or an explicit cancel_pending state) before terminal cancellation.
+        await self.store.confirm_orders_absent(
+            confirmed_absent_order_ids,
+            self.account_id,
+        )
+        next_trade_after = str(max(0, latest_trade_epoch - 60))
+
+        activity_count = 0
+        latest_activity_epoch = self._activity_start
+        async for activity in self.client.list_activity(
+            activity_types=["SPLIT", "MERGE", "REDEEM", "CONVERSION"],
+            start=self._activity_start,
+            sort_by="TIMESTAMP",
+            sort_direction="ASC",
+            page_size=100,
+        ).iter_items():
+            update = self._activity_update(activity)
+            await self.store.reconcile_account_activity(update, self.account_id)
+            latest_activity_epoch = max(latest_activity_epoch, int(update.occurred_at.timestamp()))
+            activity_count += 1
+            if activity_count >= 4500:
+                raise RuntimeError("account activity reconciliation safety limit exceeded")
+        next_activity_start = max(1, latest_activity_epoch - 60)
+
+        raw_positions: list[tuple[Any, str, str, Decimal, Decimal, Decimal]] = []
+        async for position in self.client.list_positions(size_threshold=0).iter_items():
+            condition_id = self._required_position_identifier(position, "condition_id")
+            token_id = self._required_position_identifier(position, "token_id")
+            size = self._required_position_decimal(position, "size")
+            initial = self._required_position_decimal(position, "initial_value")
+            current = self._required_position_decimal(position, "current_value")
+            if size < 0 or initial < 0 or current < 0:
+                raise IncompleteFillLedgerError(
+                    f"position {token_id} contains a negative required value"
+                )
+            raw_positions.append((position, condition_id, token_id, size, initial, current))
+
+        position_keys = {
+            (condition_id, token_id) for _, condition_id, token_id, _, _, _ in raw_positions
+        }
+        outcome_map = await self.store.position_outcomes(position_keys)
+        missing_keys = position_keys.difference(outcome_map)
+        if missing_keys and self.market_data is not None:
+            for condition_id in dict.fromkeys(key[0] for key in sorted(missing_keys)):
+                market = await self.market_data.get_market_by_condition(condition_id)
+                resolved_condition = str(market.condition_id or market.id)
+                if resolved_condition != condition_id:
+                    raise IncompleteFillLedgerError(
+                        "position market lookup returned a different condition"
+                    )
+                await self.store.save_market(market)
+                outcome_map[(condition_id, market.yes_token_id)] = Outcome.YES
+                outcome_map[(condition_id, market.no_token_id)] = Outcome.NO
+                self._known_position_conditions.add(condition_id)
+        missing_keys = position_keys.difference(outcome_map)
+        if missing_keys:
+            condition_id, token_id = sorted(missing_keys)[0]
+            raise IncompleteFillLedgerError(
+                "position token is not mapped by its durable market definition "
+                f"({condition_id}:{token_id})"
+            )
+
+        positions: list[AccountPositionUpdate] = []
+        for position, condition_id, token_id, size, initial, current in raw_positions:
+            positions.append(
+                AccountPositionUpdate(
+                    condition_id=condition_id,
+                    token_id=token_id,
+                    outcome=outcome_map[(condition_id, token_id)],
+                    size=size,
+                    average_entry_price=Decimal(str(position.avg_price))
+                    if position.avg_price is not None
+                    else None,
+                    cost_basis_usd=initial,
+                    realized_pnl_usd=Decimal(str(position.realized_pnl or 0)),
+                    mark_price=Decimal(str(position.cur_price))
+                    if position.cur_price is not None
+                    else None,
+                    unrealized_pnl_usd=current - initial,
+                )
+            )
+
+        utc_midnight = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        ledger = await self.store.fill_ledger_snapshot(self.account_id, utc_midnight)
+        live_quantities = {
+            position.token_id: position.size
+            for position in positions
+            if position.size > 0 and position.condition_id not in ledger.redeemed_condition_ids
+        }
+        tolerance = Decimal("0.000001")
+        for token_id in set(live_quantities).union(ledger.token_quantities):
+            live_size = live_quantities.get(token_id, Decimal("0"))
+            ledger_size = ledger.token_quantities.get(token_id, Decimal("0"))
+            if abs(live_size - ledger_size) > tolerance:
+                raise IncompleteFillLedgerError(
+                    "live position does not match the complete durable fill ledger "
+                    f"for token {token_id}"
+                )
+        await self.store.reconcile_positions(positions, self.account_id)
+        # Advance only after orders, fills, positions, and the independent
+        # quantity check all succeed. Failures force the next pass to replay the
+        # same complete window.
+        self._trade_after = next_trade_after
+        self._activity_start = next_activity_start
+
+    async def _apply_user_event(self, event: Any) -> None:
+        if event.type == "order":
+            await self.store.reconcile_order(self._order_update(event.payload), self.account_id)
+        elif event.type == "trade":
+            for update in await self._account_trade_updates(event.payload):
+                await self.store.reconcile_trade(update, self.account_id)
+
+    @staticmethod
+    def _order_update(value: Any) -> UserOrderUpdate:
+        return UserOrderUpdate(
+            clob_order_id=str(value.id),
+            condition_id=str(getattr(value, "condition_id", None) or value.market),
+            token_id=str(value.token_id),
+            side=value.side,
+            price=value.price,
+            original_size=value.original_size,
+            size_matched=value.size_matched,
+            status=str(value.status or "LIVE").upper(),
+            order_type=str(value.order_type or "GTC").upper(),
+            outcome=getattr(value, "outcome", None),
+            event_type=str(getattr(value, "order_event_type", "RECONCILE")),
+            occurred_at=getattr(value, "timestamp", None) or utc_now(),
+            raw=value.model_dump(mode="json") if hasattr(value, "model_dump") else {},
+        )
+
+    @staticmethod
+    def _trade_update(value: Any) -> UserTradeUpdate:
+        return OrderReconciler._trade_updates(value)[0]
+
+    @staticmethod
+    def _trade_updates(value: Any) -> list[UserTradeUpdate]:
+        raw = value.model_dump(mode="json") if hasattr(value, "model_dump") else {}
+        trader_side = getattr(value, "trader_side", None)
+        trader_side_text = str(trader_side or "").upper()
+        common = {
+            "clob_trade_id": str(value.id),
+            "condition_id": str(getattr(value, "condition_id", None) or value.market),
+            "trader_side": trader_side,
+            "status": str(value.status).upper(),
+            "transaction_hash": getattr(value, "transaction_hash", None),
+            "matched_at": (
+                getattr(value, "matched_at", None) or getattr(value, "timestamp", None) or utc_now()
+            ),
+            "updated_at": getattr(value, "updated_at", None) or utc_now(),
+            "raw": raw,
+        }
+        maker_updates = [
+            UserTradeUpdate(
+                **common,
+                candidate_order_ids=[str(maker.order_id)],
+                token_id=str(maker.token_id),
+                side=maker.side,
+                price=maker.price,
+                size=maker.matched_amount,
+                outcome=getattr(maker, "outcome", None),
+                fee_rate_bps=Decimal(
+                    str(
+                        getattr(maker, "fee_rate_bps", None)
+                        or getattr(value, "fee_rate_bps", 0)
+                        or 0
+                    )
+                ),
+            )
+            for maker in (getattr(value, "maker_orders", None) or ())
+            if getattr(maker, "order_id", None)
+        ]
+        taker_order_id = getattr(value, "taker_order_id", None)
+        taker_updates = (
+            [
+                UserTradeUpdate(
+                    **common,
+                    candidate_order_ids=[str(taker_order_id)],
+                    token_id=str(value.token_id),
+                    side=value.side,
+                    price=value.price,
+                    size=value.size,
+                    outcome=getattr(value, "outcome", None),
+                    fee_rate_bps=Decimal(str(getattr(value, "fee_rate_bps", 0) or 0)),
+                )
+            ]
+            if taker_order_id
+            else []
+        )
+        if trader_side_text == "MAKER":
+            return maker_updates
+        if trader_side_text == "TAKER":
+            return taker_updates
+        # UserTradePayload.trader_side is optional on the WebSocket. Do not
+        # guess: produce both economic perspectives and let the durable order
+        # ledger select the account-owned one(s).
+        return taker_updates + maker_updates
+
+    async def _account_trade_updates(self, value: Any) -> list[UserTradeUpdate]:
+        updates = self._trade_updates(value)
+        candidates = {
+            order_id for update in updates for order_id in update.candidate_order_ids if order_id
+        }
+        durable = await self.store.durable_order_ids(candidates, self.account_id)
+        account_updates = [
+            update
+            for update in updates
+            if any(order_id in durable for order_id in update.candidate_order_ids)
+        ]
+        if not str(getattr(value, "trader_side", None) or "").strip():
+            taker_order_id = str(getattr(value, "taker_order_id", "") or "")
+            durable_taker = taker_order_id in durable
+            durable_makers = durable.difference({taker_order_id})
+            if durable_taker and durable_makers:
+                raise IncompleteFillLedgerError(
+                    "trade without trader_side maps to both taker and maker durable orders"
+                )
+        if account_updates:
+            return account_updates
+        raise IncompleteFillLedgerError(
+            "account trade does not map to a durable bot order; dedicated-wallet "
+            "ledger integrity cannot be proven"
+        )
+
+    @staticmethod
+    def _is_not_found(exc: Exception) -> bool:
+        return int(getattr(exc, "status", 0) or 0) == 404
+
+    @staticmethod
+    def _required_position_identifier(value: Any, field: str) -> str:
+        raw = getattr(value, field, None)
+        if raw is None or not str(raw).strip():
+            raise IncompleteFillLedgerError(f"position is missing required {field}")
+        return str(raw)
+
+    @staticmethod
+    def _required_position_decimal(value: Any, field: str) -> Decimal:
+        raw = getattr(value, field, None)
+        if raw is None:
+            raise IncompleteFillLedgerError(f"position is missing required {field}")
+        try:
+            parsed = Decimal(str(raw))
+        except Exception as exc:
+            raise IncompleteFillLedgerError(f"position contains invalid required {field}") from exc
+        if not parsed.is_finite():
+            raise IncompleteFillLedgerError(f"position contains invalid required {field}")
+        return parsed
+
+    @staticmethod
+    def _activity_update(value: Any) -> AccountActivityUpdate:
+        raw = value.model_dump(mode="json") if hasattr(value, "model_dump") else {}
+        activity_type = str(getattr(value, "type", "") or raw.get("type", "")).upper()
+        condition_id = getattr(value, "condition_id", None) or raw.get("conditionId")
+        transaction_hash = getattr(value, "transaction_hash", None) or raw.get("transactionHash")
+        occurred_at = getattr(value, "timestamp", None) or utc_now()
+        amount = Decimal(str(getattr(value, "amount", None) or raw.get("amount", 0) or 0))
+        digest = hashlib.sha256(
+            (
+                f"{activity_type}:{transaction_hash or ''}:{condition_id or ''}:"
+                f"{amount}:{occurred_at.isoformat()}"
+            ).encode()
+        ).hexdigest()
+        return AccountActivityUpdate(
+            activity_key=digest,
+            activity_type=activity_type,
+            condition_id=str(condition_id) if condition_id is not None else None,
+            amount_usd=amount,
+            transaction_hash=str(transaction_hash) if transaction_hash else None,
+            occurred_at=occurred_at,
+            raw=raw,
+        )
+
+    async def close(self) -> None:
+        self._closed = True
+        self.healthy.clear()
+        if self._handle is not None:
+            with contextlib.suppress(Exception):
+                await self._handle.close()
+        await self.client.close()

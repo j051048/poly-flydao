@@ -1,0 +1,76 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "polybot"
+version = "0.1.0"
+description = "Evidence-driven, risk-gated Polymarket automation for CLOB V2"
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+license = { text = "MIT" }
+authors = [{ name = "Polybot contributors" }]
+dependencies = [
+  "attrs>=25,<27",
+  "cryptography>=46,<50",
+  "fastapi>=0.135,<0.140",
+  "httpx>=0.28,<1",
+  "idna>=3.10,<4",
+  "langgraph==1.2.9",
+  "litellm==1.93.0",
+  "openai==2.46.0",
+  "polymarket-client==0.2.0",
+  "prefect==3.7.8",
+  "pydantic>=2.12,<3",
+  "pydantic-settings>=2.10,<3",
+  "supabase==2.31.0",
+  "tldextract>=5.3,<6",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<10",
+  "pytest-asyncio>=0.25,<2",
+  "pytest-cov>=6,<8",
+  "ruff>=0.11,<1",
+]
+# Kept out of the live image: this LGPL component is an isolated research/replay tool.
+research = ["nautilus_trader>=1.220,<2"]
+
+[project.scripts]
+polybot = "polybot.cli:main"
+
+[tool.hatch.build]
+exclude = [
+  "/.agents",
+  "/.audit-*",
+  "/.codex",
+  "/.pytest*",
+  "/.ruff_cache",
+  "/.test-tmp",
+  "/.uv-cache",
+  "/.venv",
+  "/apps/web/.next",
+  "/apps/web/node_modules",
+  "/build",
+  "/dist",
+  "**/__pycache__",
+  "**/*.pyc",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/polybot"]
+
+[tool.pytest.ini_options]
+addopts = "-q --strict-markers"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC"]
