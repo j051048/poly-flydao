@@ -452,12 +452,8 @@ export default function HomePage() {
   return (
     <main className="page-shell">
       <header className="topbar">
-        <div className="brand-block">
-          <div className="brand-mark" aria-hidden="true">PM</div>
-          <div>
-            <p className="eyebrow">POLYMARKET · AI EXECUTION</p>
-            <h1>Polybot 控制台</h1>
-          </div>
+        <div>
+          <h1 style={{ fontSize: "24px", margin: 0 }}>控制台总览</h1>
         </div>
         <div className="api-address" title={API_BASE_URL}>
           <span className={"status-dot " + health.phase} />
