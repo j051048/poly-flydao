@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import Link from "next/link";
+import { supabase } from "../../lib/supabase";
 
 export default function RegisterPage() {
   const [formData, setFormData] = useState({
@@ -9,15 +10,36 @@ export default function RegisterPage() {
     email: "",
     password: "",
   });
+  const [loading, setLoading] = useState(false);
+  const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const { name, value } = e.target;
     setFormData((prev) => ({ ...prev, [name]: value }));
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    alert("注册功能暂未开放。这是一个前端演示页面。");
+    setLoading(true);
+    setMessage(null);
+
+    const { data, error } = await supabase.auth.signUp({
+      email: formData.email,
+      password: formData.password,
+      options: {
+        data: {
+          username: formData.username,
+        },
+      },
+    });
+
+    setLoading(false);
+
+    if (error) {
+      setMessage({ type: "error", text: error.message });
+    } else {
+      setMessage({ type: "success", text: "注册成功！请检查您的邮箱进行验证（如果后台开启了邮箱验证）。" });
+    }
   };
 
   return (
@@ -77,13 +99,20 @@ export default function RegisterPage() {
             </div>
           </div>
 
+          {message && (
+            <div className={`notice ${message.type === "success" ? "success" : "error"}`}>
+              {message.text}
+            </div>
+          )}
+
           <div style={{ marginTop: "12px" }}>
             <button
               className="primary-button"
               type="submit"
+              disabled={loading}
               style={{ width: "100%", justifyContent: "center", padding: "14px" }}
             >
-              创建账号
+              {loading ? "注册中..." : "创建账号"}
             </button>
           </div>
         </form>
