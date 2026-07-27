@@ -3131,7 +3131,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.11,<1" },
     { name = "supabase", specifier = "==2.31.0" },
     { name = "tldextract", specifier = ">=5.3,<6" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.35,<1" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.51.0,<1" },
 ]
 provides-extras = ["dev", "research"]
 
