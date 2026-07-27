@@ -8,7 +8,7 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 
 from polybot.config import TradingMode, get_settings
 from polybot.models import utc_now
@@ -107,7 +107,37 @@ async def get_status(rt: RuntimeDep) -> dict[str, object]:
 
 
 @app.post("/v1/cycles/run", dependencies=[Depends(require_admin)])
-async def run_cycle(rt: RuntimeDep) -> dict[str, object]:
+async def run_cycle(
+    rt: RuntimeDep,
+    x_evm_key: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None),
+    x_base_url: str | None = Header(default=None),
+    x_forecast_model: str | None = Header(default=None),
+) -> dict[str, object]:
+    custom_overrides = {}
+    if x_evm_key:
+        custom_overrides["polymarket_private_key"] = SecretStr(x_evm_key)
+    if x_api_key:
+        # Depending on the active ai_provider, override the corresponding key
+        if rt.settings.ai_provider == "openai":
+            custom_overrides["openai_api_key"] = SecretStr(x_api_key)
+        elif rt.settings.ai_provider == "litellm":
+            custom_overrides["litellm_api_key"] = SecretStr(x_api_key)
+    if x_base_url:
+        custom_overrides["litellm_base_url"] = x_base_url
+    if x_forecast_model:
+        custom_overrides["forecast_model"] = x_forecast_model
+
+    if custom_overrides:
+        from polybot.runtime import build_runtime
+        new_settings = rt.settings.model_copy(update=custom_overrides)
+        transient_rt = build_runtime(new_settings)
+        try:
+            report = await transient_rt.engine.run_cycle()
+            return report.model_dump(mode="json")
+        finally:
+            await transient_rt.close()
+
     if rt.settings.mode in {TradingMode.CANARY, TradingMode.LIVE}:
         raise HTTPException(
             status.HTTP_409_CONFLICT,

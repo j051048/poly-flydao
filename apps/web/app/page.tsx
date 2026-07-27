@@ -203,6 +203,21 @@ async function requestApi(
     Accept: "application/json",
   };
 
+  if (typeof window !== "undefined") {
+    try {
+      const saved = localStorage.getItem("polybot_settings");
+      if (saved) {
+        const settings = JSON.parse(saved);
+        if (settings.evmKey) headers["X-EVM-Key"] = settings.evmKey;
+        if (settings.apiKey) headers["X-API-Key"] = settings.apiKey;
+        if (settings.baseUrl) headers["X-Base-URL"] = settings.baseUrl;
+        if (settings.selectedModel) headers["X-Forecast-Model"] = settings.selectedModel;
+      }
+    } catch (e) {
+      console.warn("Failed to read polybot_settings from local storage", e);
+    }
+  }
+
   if (options.token) headers.Authorization = "Bearer " + options.token;
   if (options.body) headers["Content-Type"] = "application/json";
 
