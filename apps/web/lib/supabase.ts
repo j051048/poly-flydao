@@ -1,6 +1,6 @@
-import { createClient } from "@supabase/supabase-js";
-
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || "";
-const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "";
-
-export const supabase = createClient(supabaseUrl, supabaseAnonKey);
+// Compatibility exports for older imports. New code should import from
+// `lib/supabase/browser` or `lib/supabase/server` explicitly.
+export {
+  getSupabaseBrowserClient,
+  isSupabaseBrowserConfigured,
+} from "./supabase/browser";

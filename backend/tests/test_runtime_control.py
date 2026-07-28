@@ -2,13 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
-from types import SimpleNamespace
 
-import pytest
-from fastapi import HTTPException
-
-from polybot.api import ArmRequest, arm
 from polybot.config import TradingMode
+from polybot.jobs import InMemoryJobRepository
 from polybot.models import utc_now
 from polybot.stores.memory import MemoryStore
 from polybot.worker import RuntimeControlWatchState, _enforce_runtime_control_once
@@ -137,46 +133,36 @@ async def test_cancellation_acknowledgement_waits_for_inflight_orders() -> None:
     assert (await store.get_runtime_control(account_id)).cancellation_pending
 
 
-async def test_arm_endpoint_returns_conflict_when_cas_is_stale() -> None:
-    class StaleArmStore(MemoryStore):
-        async def arm_runtime_control(self, *args, **kwargs):
-            return None
-
+async def test_tenant_arm_repository_rejects_stale_version() -> None:
     account_id = "33333333-3333-3333-3333-333333333333"
-    runtime = SimpleNamespace(
-        store=StaleArmStore(),
-        settings=SimpleNamespace(
-            account_id=account_id,
-            mode=TradingMode.CANARY,
-            uses_supabase=True,
-        ),
+    repository = InMemoryJobRepository()
+    repository.live_ready_accounts.add(account_id)
+    initial = await repository.get_runtime_control(account_id)
+    saved = await repository.arm(
+        account_id=account_id,
+        mode=TradingMode.CANARY,
+        armed_until=utc_now() + timedelta(minutes=5),
+        expected_version=initial.version + 1,
     )
-
-    with pytest.raises(HTTPException) as raised:
-        await arm(ArmRequest(mode=TradingMode.CANARY, minutes=5), runtime)
-
-    assert raised.value.status_code == 409
-    assert "changed concurrently" in str(raised.value.detail)
+    assert saved is None
 
 
-async def test_arm_endpoint_rejects_pending_cancellation() -> None:
+async def test_tenant_arm_repository_rejects_pending_cancellation() -> None:
     account_id = "44444444-4444-4444-4444-444444444444"
-    store = MemoryStore()
-    await store.disarm_runtime_control(account_id, TradingMode.CANARY)
-    runtime = SimpleNamespace(
-        store=store,
-        settings=SimpleNamespace(
-            account_id=account_id,
-            mode=TradingMode.CANARY,
-            uses_supabase=True,
-        ),
+    repository = InMemoryJobRepository()
+    repository.live_ready_accounts.add(account_id)
+    pending = await repository.disarm(
+        account_id=account_id,
+        mode=TradingMode.CANARY,
     )
-
-    with pytest.raises(HTTPException) as raised:
-        await arm(ArmRequest(mode=TradingMode.CANARY, minutes=5), runtime)
-
-    assert raised.value.status_code == 409
-    assert "zero open orders" in str(raised.value.detail)
+    assert pending.cancellation_pending
+    saved = await repository.arm(
+        account_id=account_id,
+        mode=TradingMode.CANARY,
+        armed_until=utc_now() + timedelta(minutes=5),
+        expected_version=pending.version,
+    )
+    assert saved is None
 
 
 async def test_expired_arm_is_durably_disarmed_and_gtc_orders_are_cancelled() -> None:

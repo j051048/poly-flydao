@@ -35,6 +35,9 @@ def test_official_sdk_secure_contract_used_by_executor() -> None:
         SecureClient, "create_limit_order"
     )
     assert {"signed_order"} <= _keyword_names(SecureClient, "post_order")
+    assert {"signed_orders"} <= _keyword_names(SecureClient, "post_orders")
+    assert {"order_id"} <= _keyword_names(SecureClient, "cancel_order")
+    assert {"order_ids"} <= _keyword_names(SecureClient, "cancel_orders")
     assert {"asset_type", "token_id"} <= _keyword_names(SecureClient, "get_balance_allowance")
     assert hasattr(SecureClient, "setup_trading_approvals")
     assert not inspect.iscoroutinefunction(SecureClient.setup_trading_approvals)

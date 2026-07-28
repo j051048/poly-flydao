@@ -140,6 +140,7 @@ class PolymarketMarketData:
         resolution = _get(raw, "resolution", default={})
         events = _get(raw, "events", default=[]) or []
         first_event = events[0] if events else None
+        raw_tags = _get(raw, "tags", default=[]) or []
         raw_market_id = _get(raw, "id", default=_get(raw, "condition_id"))
         yes_token_id = _get(yes, "token_id")
         no_token_id = _get(no, "token_id")
@@ -151,17 +152,28 @@ class PolymarketMarketData:
             id=market_id,
             condition_id=_get(raw, "condition_id"),
             event_id=(
-                str(_get(raw, "event_id", default=_get(first_event, "id")))
-                if _get(raw, "event_id", default=_get(first_event, "id")) is not None
+                str(_get(raw, "event_id") or _get(first_event, "id"))
+                if (_get(raw, "event_id") or _get(first_event, "id")) is not None
                 else None
             ),
+            slug=_get(raw, "slug"),
+            event_slug=_get(first_event, "slug") or _get(raw, "event_slug"),
             question=str(_get(raw, "question", default=_get(raw, "title", default=""))),
             description=description,
             category=str(_get(raw, "category", default="other") or "other"),
+            tags=tuple(
+                str(value)
+                for tag in raw_tags
+                if (value := (_get(tag, "label") or _get(tag, "slug"))) is not None
+            ),
             resolution_rules=str(_get(raw, "rules", default=description)),
-            resolution_source=_get(resolution, "source"),
+            resolution_source=(
+                _get(resolution, "source") or _get(raw, "resolution_source")
+            ),
             yes_token_id=str(yes_token_id),
             no_token_id=str(no_token_id),
+            yes_label=str(_get(yes, "label", default="Yes") or "Yes"),
+            no_label=str(_get(no, "label", default="No") or "No"),
             active=bool(_get(state, "active", default=True)),
             closed=bool(_get(state, "closed", default=False)),
             accepting_orders=bool(_get(state, "accepting_orders", default=True)),
@@ -173,7 +185,10 @@ class PolymarketMarketData:
             fees_enabled=bool(_get(trading, "fees_enabled", default=False)),
             fee_rate=_decimal(_get(fee, "rate")),
             fee_exponent=_decimal(_get(fee, "exponent"), "1"),
-            end_at=_datetime(_get(state, "end_date", default=_get(raw, "end_date"))),
+            fee_taker_only=bool(_get(fee, "taker_only", default=True)),
+            maker_rebate_rate=_decimal(_get(fee, "rebate_rate")),
+            start_at=_datetime(_get(state, "start_date") or _get(raw, "start_date")),
+            end_at=_datetime(_get(state, "end_date") or _get(raw, "end_date")),
             updated_at=utc_now(),
         )
 

@@ -14,3 +14,7 @@ def test_backtest_reports_calibration_and_drawdown(settings) -> None:
     assert report.log_loss >= 0
     assert 0 <= report.max_drawdown <= 1
     assert "not a profit guarantee" in report.warning
+    assert report.engine == "legacy_snapshot_v1"
+    assert report.event_level is False
+    assert report.live_gate_eligible is False
+    assert "cannot be used as a live gate" in report.warning

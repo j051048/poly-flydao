@@ -19,8 +19,10 @@ from polybot.config import (
     TradingMode,
     get_settings,
 )
+from polybot.credentials import generate_rsa_credential_keypair
 from polybot.research import inspect_nautilus_runtime
 from polybot.runtime import build_runtime
+from polybot.simulation.l2_replay import L2ReplayScenario
 
 
 class WalletBootstrapSettings(BaseSettings):
@@ -72,16 +74,27 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("research-runtime", help="inspect the optional Nautilus runtime")
     backtest = commands.add_parser("backtest", help="replay timestamped JSONL opportunities")
     backtest.add_argument("--input", type=Path, required=True)
+    pair_replay = commands.add_parser(
+        "pair-replay",
+        help="run the P2 event-level L2 maker replay (research only)",
+    )
+    pair_replay.add_argument("--input", type=Path, required=True)
     return root
 
 
 def main() -> None:
     args = parser().parse_args()
     if args.command == "generate-secrets":
+        credential_public_key, credential_private_key = generate_rsa_credential_keypair()
+        public_env = credential_public_key.rstrip().replace("\n", "\\n")
+        private_env = credential_private_key.rstrip().replace("\n", "\\n")
         print(
             "\n".join(
                 [
                     f"POLYBOT_SIGNED_PAYLOAD_KEY={Fernet.generate_key().decode()}",
+                    f"POLYBOT_CREDENTIAL_PUBLIC_KEY_PEM={public_env}",
+                    f"POLYBOT_CREDENTIAL_PRIVATE_KEY_PEM={private_env}",
+                    f"POLYBOT_CREDENTIAL_FINGERPRINT_KEY={secrets.token_urlsafe(32)}",
                     f"POLYBOT_ADMIN_TOKEN={secrets.token_urlsafe(48)}",
                     f"POLYBOT_LIVE_ACK={LIVE_ACK_TEXT}",
                     f"POLYBOT_BETA_SDK_ACK={BETA_SDK_ACK_TEXT}",
@@ -160,6 +173,26 @@ def main() -> None:
         return
     if args.command == "backtest":
         print(report_json(run_backtest(load_jsonl(args.input), settings)))
+        return
+    if args.command == "pair-replay":
+        scenario = L2ReplayScenario.model_validate_json(
+            args.input.read_text(encoding="utf-8")
+        )
+        result = scenario.replay()
+        print(
+            json.dumps(
+                {
+                    **result.model_dump(mode="json"),
+                    "live_gate_eligible": result.live_gate_eligible,
+                    "warning": (
+                        "research evidence only; this result is not a profitability "
+                        "guarantee or live-execution authorization"
+                    ),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return
     if args.command == "research-runtime":
         print(inspect_nautilus_runtime().model_dump_json(indent=2))

@@ -5,6 +5,7 @@ import math
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -42,6 +43,9 @@ class BacktestTrade(BaseModel):
 
 
 class BacktestReport(BaseModel):
+    engine: Literal["legacy_snapshot_v1"] = "legacy_snapshot_v1"
+    event_level: Literal[False] = False
+    live_gate_eligible: Literal[False] = False
     rows: int
     trades: int
     wins: int
@@ -55,8 +59,8 @@ class BacktestReport(BaseModel):
     log_loss: Decimal
     trades_detail: list[BacktestTrade]
     warning: str = (
-        "Historical results are not a profit guarantee; use unseen walk-forward data and "
-        "real depth."
+        "Historical results are not a profit guarantee. This legacy snapshot backtest "
+        "cannot be used as a live gate; use unseen walk-forward event-level L2 replay."
     )
 
 

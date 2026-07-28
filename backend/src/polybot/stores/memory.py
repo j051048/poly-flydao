@@ -110,7 +110,12 @@ class MemoryStore:
         self.unresolved_live_orders.add(intent.intent_hash)
 
     async def mark_order_submitting(
-        self, intent_hash: str, account_id: str, fencing_token: int
+        self,
+        intent_hash: str,
+        account_id: str,
+        fencing_token: int,
+        *,
+        control_version: int | None = None,
     ) -> None:
         async with self._lock:
             signed = self.signed_orders.get(intent_hash)
@@ -125,6 +130,12 @@ class MemoryStore:
                 or lease.expires_at <= utc_now()
             ):
                 raise RuntimeError("worker lease expired before submission transition")
+            control = self.controls.get(account_id)
+            if (
+                control_version is not None
+                and (control is None or control.version != control_version)
+            ):
+                raise RuntimeError("runtime control changed before submission transition")
             self.unresolved_live_orders.add(intent_hash)
 
     async def save_execution(self, result: ExecutionResult, account_id: str) -> None:

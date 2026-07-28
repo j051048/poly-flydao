@@ -1,0 +1,34 @@
+{
+  "complete_depth": false,
+  "verified_exchange_sequence": false,
+  "events": [
+    {
+      "event_type": "book",
+      "occurred_at": "2026-01-01T00:00:00Z",
+      "sequence": 1,
+      "bids": [{"price": "0.44", "size": "5"}],
+      "asks": [{"price": "0.46", "size": "5"}]
+    },
+    {
+      "event_type": "trade",
+      "occurred_at": "2026-01-01T00:00:01Z",
+      "sequence": 2,
+      "aggressor_side": "SELL",
+      "price": "0.44",
+      "size": "8"
+    }
+  ],
+  "orders": [
+    {
+      "order_id": "yes-maker",
+      "side": "BUY",
+      "price": "0.44",
+      "size": "2",
+      "submitted_at": "2026-01-01T00:00:00Z",
+      "submit_latency": "PT0S",
+      "cancel_latency": "PT0.1S",
+      "post_only": true
+    }
+  ],
+  "cancellations": []
+}

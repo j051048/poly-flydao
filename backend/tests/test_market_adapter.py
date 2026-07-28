@@ -27,6 +27,7 @@ class _RecordingClient:
 def test_official_sdk_shape_maps_to_domain_model() -> None:
     raw = SimpleNamespace(
         id=123,
+        slug="bitcoin-up-or-down",
         condition_id="condition",
         question="Question?",
         description="Description",
@@ -37,12 +38,14 @@ def test_official_sdk_shape_maps_to_domain_model() -> None:
             closed=False,
             accepting_orders=True,
             neg_risk=False,
+            start_date="2026-11-30T23:45:00Z",
             end_date="2026-12-01T00:00:00Z",
         ),
         outcomes=SimpleNamespace(
-            yes=SimpleNamespace(token_id="yes"),
-            no=SimpleNamespace(token_id="no"),
+            yes=SimpleNamespace(token_id="yes", label="Up"),
+            no=SimpleNamespace(token_id="no", label="Down"),
         ),
+        tags=(SimpleNamespace(label="Bitcoin", slug="bitcoin"),),
         metrics=SimpleNamespace(liquidity=Decimal("1000"), volume_24hr=Decimal("200")),
         trading=SimpleNamespace(
             minimum_order_size=Decimal("5"),
@@ -56,6 +59,12 @@ def test_official_sdk_shape_maps_to_domain_model() -> None:
     assert market.id == "123"
     assert market.event_id == "456"
     assert market.yes_token_id == "yes"
+    assert market.slug == "bitcoin-up-or-down"
+    assert market.yes_label == "Up"
+    assert market.no_label == "Down"
+    assert market.tags == ("Bitcoin",)
+    assert market.start_at is not None
+    assert market.resolution_source == "official source"
     assert market.fee_exponent == Decimal("2")
 
 

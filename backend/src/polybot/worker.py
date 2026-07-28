@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import socket
@@ -12,9 +11,10 @@ from uuid import uuid4
 
 from polybot.brokers.base import Broker
 from polybot.brokers.polymarket import PolymarketBroker
-from polybot.config import TradingMode
+from polybot.config import TradingMode, get_settings
 from polybot.engine import LiveSafetyLatchError
 from polybot.runtime import build_runtime
+from polybot.security_logging import configure_secure_logging, safe_json
 from polybot.stores.base import StateStore
 
 
@@ -288,12 +288,17 @@ async def _shutdown_live_safely(
 
 
 async def run_worker() -> None:
-    runtime = build_runtime()
-    settings = runtime.settings
+    settings = get_settings()
     if settings.component == "api":
-        await runtime.close()
         raise RuntimeError("POLYBOT_COMPONENT=api cannot run the signer worker")
-    logging.basicConfig(level=settings.log_level)
+    configure_secure_logging(settings.log_level)
+    if settings.worker_execution_model == "tenant_queue":
+        from polybot.tenant_execution import run_tenant_queue_worker
+
+        await run_tenant_queue_worker(settings)
+        return
+
+    runtime = build_runtime(settings)
     logger = logging.getLogger("polybot.worker")
     if not await _wait_for_store_startup(runtime.store, logger):
         await runtime.close()
@@ -443,7 +448,7 @@ async def run_worker() -> None:
                         await cancel_all_or_alert("state store unhealthy")
                 else:
                     report = await runtime.engine.run_cycle()
-                    logger.info(json.dumps(report.model_dump(mode="json"), ensure_ascii=False))
+                    logger.info(safe_json(report.model_dump(mode="json")))
                     safety_latched = any(
                         reason.startswith("live_stop_latched:") for reason in report.skipped
                     )

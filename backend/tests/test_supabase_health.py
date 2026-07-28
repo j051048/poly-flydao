@@ -3,7 +3,9 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
-from polybot.stores.supabase_store import SupabaseStore
+import pytest
+
+from polybot.stores.supabase_store import SupabaseStore, TenantScopeError
 
 
 class Query:
@@ -47,7 +49,10 @@ class FakeClient:
         return Query(self, name)
 
     def rpc(self, name: str, params: dict[str, Any]) -> Query:
-        assert params["p_expected_version"] == 0
+        if name == "expire_runtime_control":
+            assert params["p_expected_version"] == 0
+        elif name == "mark_tenant_order_submitting":
+            assert params["p_mode"] == "paper"
         return Query(self, f"rpc:{name}")
 
 
@@ -67,7 +72,11 @@ async def test_supabase_health_preflights_account_migrations_and_expiry_rpc_once
     assert ("account_risk_state", "risk_day") in client.executions
     assert ("account_activities", "activity_key") in client.executions
     assert ("orders", "open_snapshot_miss_count,expires_at") in client.executions
+    assert ("cycle_jobs", "risk_policy_version") in client.executions
+    assert ("order_groups", "execution_enabled") in client.executions
+    assert ("pair_inventory_events", "clob_trade_id") in client.executions
     assert ("rpc:expire_runtime_control", "") in client.executions
+    assert ("rpc:mark_tenant_order_submitting", "") in client.executions
 
 
 async def test_supabase_health_rejects_a_different_auth_user() -> None:
@@ -81,3 +90,20 @@ async def test_supabase_health_rejects_a_different_auth_user() -> None:
     )
 
     assert not await store.health()
+
+
+async def test_service_role_store_rejects_cross_account_calls_before_querying() -> None:
+    account_id = "44444444-4444-4444-4444-444444444444"
+    client = FakeClient(account_id)
+    store = SupabaseStore(
+        "https://example.supabase.co",
+        "service-role",
+        account_id=account_id,
+        client=client,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(TenantScopeError, match="cross-account access denied"):
+        await store.get_runtime_control("55555555-5555-5555-5555-555555555555")
+    with pytest.raises(AttributeError):
+        store.account_id = "55555555-5555-5555-5555-555555555555"  # type: ignore[misc]
+    assert client.executions == []

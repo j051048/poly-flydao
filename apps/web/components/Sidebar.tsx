@@ -1,17 +1,47 @@
 "use client";
 
+import type { User } from "@supabase/supabase-js";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useEffect, useState } from "react";
+
+import { getSupabaseBrowserClient } from "../lib/supabase/browser";
+
+const NAV_ITEMS = [
+  { name: "控制台", path: "/" },
+  { name: "个人资产", path: "/assets" },
+  { name: "凭证与钱包", path: "/settings" },
+];
 
 export default function Sidebar() {
   const pathname = usePathname();
+  const [user, setUser] = useState<User | null>(null);
+  const isAuthPage =
+    pathname === "/login" ||
+    pathname === "/register" ||
+    pathname.startsWith("/auth/");
 
-  const navItems = [
-    { name: "控制台", path: "/" },
-    { name: "个人资产", path: "/assets" },
-    { name: "系统配置", path: "/settings" },
-    { name: "注册账号", path: "/register" },
-  ];
+  useEffect(() => {
+    const supabase = getSupabaseBrowserClient();
+    if (!supabase) return;
+
+    let mounted = true;
+    void supabase.auth.getSession().then(({ data }) => {
+      if (mounted) setUser(data.session?.user ?? null);
+    });
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (mounted) setUser(session?.user ?? null);
+    });
+
+    return () => {
+      mounted = false;
+      subscription.unsubscribe();
+    };
+  }, []);
+
+  if (isAuthPage) return null;
 
   return (
     <aside className="global-sidebar">
@@ -22,24 +52,33 @@ export default function Sidebar() {
           <h1>Polybot</h1>
         </div>
       </div>
-      <nav className="sidebar-nav">
-        {navItems.map((item) => {
-          const isActive = pathname === item.path;
-          return (
-            <Link
-              key={item.path}
-              href={item.path}
-              className={`nav-link ${isActive ? "active" : ""}`}
-            >
-              {item.name}
-            </Link>
-          );
-        })}
+
+      <nav className="sidebar-nav" aria-label="主导航">
+        {NAV_ITEMS.map((item) => (
+          <Link
+            key={item.path}
+            href={item.path}
+            className={`nav-link ${pathname === item.path ? "active" : ""}`}
+          >
+            {item.name}
+          </Link>
+        ))}
       </nav>
+
       <div className="sidebar-footer">
-        <p className="muted" style={{ fontSize: "12px", textAlign: "center" }}>
-          Poly-Flydao v1.0
-        </p>
+        {user ? (
+          <>
+            <p className="session-email" title={user.email}>
+              {user.email}
+            </p>
+            <form action="/auth/logout" method="post">
+              <button className="text-button" type="submit">退出登录</button>
+            </form>
+          </>
+        ) : (
+          <Link className="nav-link" href="/login">登录账户</Link>
+        )}
+        <p className="muted">Poly-Flydao secure beta</p>
       </div>
     </aside>
   );
