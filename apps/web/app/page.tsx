@@ -1,30 +1,23 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-const API_BASE_URL = (
-  process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8080"
-).replace(/\/+$/, "");
-
-const ENDPOINTS = {
-  health: "/health",
-  status: "/v1/status",
-  cycle: "/v1/cycles/run",
-  arm: "/v1/control/arm",
-  disarm: "/v1/control/disarm",
-} as const;
+import {
+  API_BASE_URL,
+  apiRequest,
+  readableApiError,
+} from "../lib/api";
 
 type JsonRecord = Record<string, unknown>;
 type BusyAction = "cycle" | "arm" | "disarm" | null;
 type HealthPhase = "loading" | "online" | "degraded" | "offline";
-type NoticeTone = "success" | "error" | "info";
+type Notice = { tone: "success" | "error" | "info"; text: string };
 type LiveMode = "canary" | "live";
 
 interface HealthView {
   phase: HealthPhase;
   store?: string;
   mode?: string;
-  realMoney?: boolean;
   checkedAt?: number;
 }
 
@@ -39,46 +32,23 @@ interface ControlView {
   updatedAt?: string;
 }
 
-interface RiskLimitView {
-  key: string;
-  label: string;
-  value: string;
-}
-
 interface StatusView {
   configuredMode?: string;
   aiProvider?: string;
   forecastModel?: string;
   control: ControlView;
-  riskLimits: RiskLimitView[];
+  riskLimits: Array<{ key: string; label: string; value: string }>;
+  latestJob?: JobView;
   fetchedAt: number;
 }
 
-interface CycleView {
-  runId?: string;
+interface JobView {
+  id?: string;
+  status?: string;
   mode?: string;
   marketsScanned?: number;
-  forecastsCreated?: number;
-  candidatesCreated?: number;
-  intentsApproved?: number;
   executions?: number;
-  skipped?: number;
-  completedAt?: string;
-}
-
-interface Notice {
-  tone: NoticeTone;
-  text: string;
-}
-
-class ApiError extends Error {
-  status: number;
-
-  constructor(status: number, message: string) {
-    super(message);
-    this.name = "ApiError";
-    this.status = status;
-  }
+  message?: string;
 }
 
 const RISK_LIMITS = [
@@ -91,10 +61,10 @@ const RISK_LIMITS = [
   { key: "max_drawdown_pct", label: "最大回撤熔断", format: "percent" },
 ] as const;
 
-function asRecord(value: unknown): JsonRecord | undefined {
+function asRecord(value: unknown): JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as JsonRecord)
-    : undefined;
+    : {};
 }
 
 function asString(value: unknown): string | undefined {
@@ -102,41 +72,45 @@ function asString(value: unknown): string | undefined {
 }
 
 function asNumber(value: unknown): number | undefined {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value.trim() !== "") {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : undefined;
-  }
-  return undefined;
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
 }
 
 function asBoolean(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
 
-function formatRiskValue(value: unknown, format: "percent" | "usd"): string {
+function formatRisk(value: unknown, format: "percent" | "usd"): string {
   const numeric = asNumber(value);
   if (numeric === undefined) return "未返回";
-  if (format === "percent") {
-    return new Intl.NumberFormat("zh-CN", {
-      style: "percent",
-      minimumFractionDigits: 0,
-      maximumFractionDigits: 2,
-    }).format(numeric);
-  }
-  return new Intl.NumberFormat("en-US", {
-    style: "currency",
-    currency: "USD",
-    minimumFractionDigits: 0,
+  return new Intl.NumberFormat(format === "usd" ? "en-US" : "zh-CN", {
+    style: format === "usd" ? "currency" : "percent",
+    ...(format === "usd" ? { currency: "USD" } : {}),
     maximumFractionDigits: 2,
   }).format(numeric);
 }
 
-function parseStatus(payload: unknown): StatusView {
-  const root = asRecord(payload) || {};
-  const control = asRecord(root.control) || {};
-  const risk = asRecord(root.risk_limits) || {};
+function parseJob(payload: unknown): JobView {
+  const root = asRecord(payload);
+  const job = asRecord(root.job);
+  const source = Object.keys(job).length ? job : root;
+  const executions = Array.isArray(source.executions)
+    ? source.executions.length
+    : asNumber(source.executions ?? source.execution_count);
+  return {
+    id: asString(source.job_id ?? source.id ?? source.run_id),
+    status: asString(source.status) ?? (source.completed_at ? "completed" : undefined),
+    mode: asString(source.mode),
+    marketsScanned: asNumber(source.markets_scanned),
+    executions,
+    message: asString(source.message ?? source.error_code),
+  };
+}
 
+function parseStatus(payload: unknown): StatusView {
+  const root = asRecord(payload);
+  const control = asRecord(root.control);
+  const risk = asRecord(root.risk_limits ?? root.risk_policy);
   return {
     configuredMode: asString(root.mode),
     aiProvider: asString(root.ai_provider),
@@ -154,111 +128,24 @@ function parseStatus(payload: unknown): StatusView {
     riskLimits: RISK_LIMITS.map((definition) => ({
       key: definition.key,
       label: definition.label,
-      value: formatRiskValue(risk[definition.key], definition.format),
+      value: formatRisk(risk[definition.key], definition.format),
     })),
+    latestJob: root.latest_job ? parseJob(root.latest_job) : undefined,
     fetchedAt: Date.now(),
   };
 }
 
-function parseCycle(payload: unknown): CycleView {
-  const root = asRecord(payload) || {};
-  const executions = Array.isArray(root.executions)
-    ? root.executions.length
-    : asNumber(root.executions);
-  const skippedRecord = asRecord(root.skipped);
-  const skipped = skippedRecord
-    ? Object.values(skippedRecord).reduce<number>((total, value) => {
-        return total + (asNumber(value) || 0);
-      }, 0)
-    : asNumber(root.skipped);
-
-  return {
-    runId: asString(root.run_id),
-    mode: asString(root.mode),
-    marketsScanned: asNumber(root.markets_scanned),
-    forecastsCreated: asNumber(root.forecasts_created),
-    candidatesCreated: asNumber(root.candidates_created),
-    intentsApproved: asNumber(root.intents_approved),
-    executions,
-    skipped,
-    completedAt: asString(root.completed_at),
-  };
-}
-
-function httpErrorMessage(status: number): string {
-  if (status === 401) return "管理员令牌无效，请重新输入。";
-  if (status === 409) return "当前运行模式或持久化控制状态不允许此操作。";
-  if (status === 503) return "API 未启用管理员操作，或依赖服务暂不可用。";
-  if (status >= 500) return "API 内部错误，请先保持停用并检查 Zeabur 日志。";
-  return "请求被 API 拒绝（HTTP " + status + "）。";
-}
-
-async function requestApi(
-  path: string,
-  options: { method?: "GET" | "POST"; token?: string; body?: JsonRecord } = {},
-): Promise<unknown> {
-  const controller = new AbortController();
-  const timeout = globalThis.setTimeout(() => controller.abort(), 12_000);
-  const headers: Record<string, string> = {
-    Accept: "application/json",
-  };
-
-  if (typeof window !== "undefined") {
-    try {
-      const saved = localStorage.getItem("polybot_settings");
-      if (saved) {
-        const settings = JSON.parse(saved);
-        if (settings.evmKey) headers["X-EVM-Key"] = settings.evmKey;
-        if (settings.apiKey) headers["X-API-Key"] = settings.apiKey;
-        if (settings.baseUrl) headers["X-Base-URL"] = settings.baseUrl;
-        if (settings.selectedModel) headers["X-Forecast-Model"] = settings.selectedModel;
-      }
-    } catch (e) {
-      console.warn("Failed to read polybot_settings from local storage", e);
-    }
-  }
-
-  if (options.token) headers.Authorization = "Bearer " + options.token;
-  if (options.body) headers["Content-Type"] = "application/json";
-
-  try {
-    const response = await fetch(API_BASE_URL + path, {
-      method: options.method || "GET",
-      headers,
-      body: options.body ? JSON.stringify(options.body) : undefined,
-      cache: "no-store",
-      credentials: "omit",
-      referrerPolicy: "no-referrer",
-      signal: controller.signal,
-    });
-    const contentType = response.headers.get("content-type") || "";
-    const payload = contentType.includes("application/json")
-      ? await response.json()
-      : undefined;
-
-    if (!response.ok) throw new ApiError(response.status, httpErrorMessage(response.status));
-    return payload;
-  } finally {
-    globalThis.clearTimeout(timeout);
-  }
-}
-
-function readableError(error: unknown): string {
-  if (error instanceof ApiError) return error.message;
-  if (error instanceof DOMException && error.name === "AbortError") {
-    return "API 请求超时，请检查服务与网络。";
-  }
-  return "无法连接控制 API；请检查地址、HTTPS 与 CORS 白名单。";
-}
-
 function modeLabel(mode?: string): string {
-  const labels: Record<string, string> = {
-    paper: "模拟盘",
-    shadow: "影子模式",
-    canary: "金丝雀实盘",
-    live: "受控实盘",
-  };
-  return mode ? labels[mode] || mode : "未知";
+  return (
+    {
+      paper: "模拟盘",
+      shadow: "影子模式",
+      canary: "金丝雀实盘",
+      live: "受控实盘",
+    }[mode ?? ""] ??
+    mode ??
+    "未知"
+  );
 }
 
 function formatDate(value?: string | number): string {
@@ -276,73 +163,52 @@ function formatDate(value?: string | number): string {
 }
 
 function countdownLabel(armedUntil: string | undefined, now: number): string {
-  if (!armedUntil || now === 0) return "无有效窗口";
+  if (!armedUntil || !now) return "无有效窗口";
   const remaining = new Date(armedUntil).getTime() - now;
   if (!Number.isFinite(remaining) || remaining <= 0) return "窗口已过期";
-  const totalSeconds = Math.ceil(remaining / 1000);
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  return minutes + " 分 " + String(seconds).padStart(2, "0") + " 秒";
-}
-
-function Metric({ label, value }: { label: string; value: string | number | undefined }) {
-  return (
-    <div className="metric">
-      <dt>{label}</dt>
-      <dd>{value ?? "—"}</dd>
-    </div>
-  );
+  const seconds = Math.ceil(remaining / 1000);
+  return `${Math.floor(seconds / 60)} 分 ${String(seconds % 60).padStart(2, "0")} 秒`;
 }
 
 export default function HomePage() {
   const [health, setHealth] = useState<HealthView>({ phase: "loading" });
   const [status, setStatus] = useState<StatusView | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
-  const [adminToken, setAdminToken] = useState("");
-  const [armMinutes, setArmMinutes] = useState(5);
-  const [riskConfirmed, setRiskConfirmed] = useState(false);
   const [busy, setBusy] = useState<BusyAction>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
-  const [lastCycle, setLastCycle] = useState<CycleView | null>(null);
+  const [lastJob, setLastJob] = useState<JobView | null>(null);
+  const [armMinutes, setArmMinutes] = useState(5);
+  const [riskConfirmed, setRiskConfirmed] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [now, setNow] = useState(0);
+  const cycleIdempotencyKey = useRef<string | null>(null);
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
-    const token = adminToken.trim();
-    const healthPromise = requestApi(ENDPOINTS.health)
-      .then((payload) => {
-        const root = asRecord(payload) || {};
-        const ok = root.ok === true;
+    const healthPromise = apiRequest<unknown>("/health", { authenticated: false })
+      .then(({ data }) => {
+        const root = asRecord(data);
         setHealth({
-          phase: ok ? "online" : "degraded",
-          store: asString(root.store),
+          phase: root.ok === true ? "online" : "degraded",
+          store: asString(root.store ?? root.control_plane),
           mode: asString(root.mode),
-          realMoney: asBoolean(root.real_money),
           checkedAt: Date.now(),
         });
       })
-      .catch(() => {
-        setHealth({ phase: "offline", checkedAt: Date.now() });
-      });
+      .catch(() => setHealth({ phase: "offline", checkedAt: Date.now() }));
 
-    const statusPromise = token
-      ? requestApi(ENDPOINTS.status, { token })
-          .then((payload) => {
-            setStatus(parseStatus(payload));
-            setStatusError(null);
-          })
-          .catch((error: unknown) => {
-            setStatusError(readableError(error));
-          })
-      : Promise.resolve().then(() => {
-          setStatus(null);
-          setStatusError("输入管理员令牌后读取受保护的控制状态。");
-        });
+    const statusPromise = apiRequest<unknown>("/v1/status")
+      .then(({ data }) => {
+        const parsed = parseStatus(data);
+        setStatus(parsed);
+        if (parsed.latestJob) setLastJob(parsed.latestJob);
+        setStatusError(null);
+      })
+      .catch((error) => setStatusError(readableApiError(error)));
 
     await Promise.allSettled([healthPromise, statusPromise]);
     setRefreshing(false);
-  }, [adminToken]);
+  }, []);
 
   useEffect(() => {
     void refresh();
@@ -355,103 +221,170 @@ export default function HomePage() {
     };
   }, [refresh]);
 
-  const configuredMode = status?.configuredMode || health.mode;
+  useEffect(() => {
+    const jobId = lastJob?.id;
+    const jobStatus = lastJob?.status?.toLowerCase();
+    if (
+      !jobId ||
+      (jobStatus &&
+        !["queued", "pending", "claimed", "running", "retry"].includes(jobStatus))
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const result = await apiRequest<unknown>(
+          `/v1/jobs/${encodeURIComponent(jobId)}`,
+        );
+        if (cancelled) return;
+        const updated = parseJob(result.data);
+        setLastJob(updated);
+        if (
+          updated.status &&
+          ["completed", "succeeded"].includes(updated.status)
+        ) {
+          setNotice({
+            tone: "success",
+            text: `任务已完成：扫描 ${updated.marketsScanned ?? 0} 个市场，执行 ${updated.executions ?? 0} 笔。`,
+          });
+        } else if (
+          updated.status &&
+          ["failed", "cancelled", "dead"].includes(updated.status)
+        ) {
+          setNotice({
+            tone: "error",
+            text: updated.message ?? `任务以 ${updated.status} 状态结束。`,
+          });
+        }
+      } catch {
+        // The regular 20-second status refresh remains available. A transient
+        // polling failure must not convert a successfully queued job to failed.
+      }
+    };
+
+    const timer = globalThis.setInterval(() => void poll(), 3_000);
+    void poll();
+    return () => {
+      cancelled = true;
+      globalThis.clearInterval(timer);
+    };
+  }, [lastJob?.id, lastJob?.status]);
+
+  const configuredMode = status?.configuredMode ?? health.mode;
   const armableMode: LiveMode | null =
-    configuredMode === "canary" || configuredMode === "live" ? configuredMode : null;
-  const tokenReady = adminToken.trim().length > 0;
+    configuredMode === "canary" || configuredMode === "live"
+      ? configuredMode
+      : null;
   const control = status?.control;
-  const armedUntilMs = control?.armedUntil ? new Date(control.armedUntil).getTime() : 0;
+  const armedUntilMs = control?.armedUntil
+    ? new Date(control.armedUntil).getTime()
+    : 0;
   const effectivelyArmed = Boolean(
     control?.armed &&
       !control.killSwitch &&
       armedUntilMs > now &&
       (control.mode === "canary" || control.mode === "live"),
   );
-  const apiUsesSafeTransport = useMemo(() => {
-    return (
+  const apiUsesSafeTransport = useMemo(
+    () =>
       API_BASE_URL.startsWith("https://") ||
       API_BASE_URL.startsWith("http://localhost") ||
-      API_BASE_URL.startsWith("http://127.0.0.1")
-    );
-  }, []);
+      API_BASE_URL.startsWith("http://127.0.0.1"),
+    [],
+  );
 
   async function runCycle() {
-    if (!tokenReady) {
-      setNotice({ tone: "error", text: "请先输入管理员令牌。" });
-      return;
-    }
     if (
       effectivelyArmed &&
-      !window.confirm("当前实盘窗口处于解锁状态；运行周期可能提交真实资金订单。确认继续？")
+      !window.confirm("当前实盘窗口已解锁，本任务可能提交真实资金订单。确认继续？")
     ) {
       return;
     }
     setBusy("cycle");
-    setNotice({ tone: "info", text: "正在执行单个扫描周期…" });
+    setNotice({ tone: "info", text: "正在创建租户隔离的运行任务…" });
     try {
-      const payload = await requestApi(ENDPOINTS.cycle, {
+      cycleIdempotencyKey.current ??= crypto.randomUUID();
+      const result = await apiRequest<unknown>("/v1/jobs/cycles", {
         method: "POST",
-        token: adminToken.trim(),
+        body: { mode: configuredMode ?? "paper" },
+        idempotencyKey: cycleIdempotencyKey.current,
+        timeoutMs: 30_000,
       });
-      const cycle = parseCycle(payload);
-      setLastCycle(cycle);
+      cycleIdempotencyKey.current = null;
+      const job = parseJob(result.data);
+      setLastJob(job);
       setNotice({
         tone: "success",
-        text: "周期已完成：扫描 " + (cycle.marketsScanned ?? 0) + " 个市场，执行 " + (cycle.executions ?? 0) + " 笔。",
+        text:
+          result.status === 202
+            ? `任务已进入队列${job.id ? `（${job.id}）` : ""}，worker 将异步执行。`
+            : `周期已完成：扫描 ${job.marketsScanned ?? 0} 个市场，执行 ${job.executions ?? 0} 笔。`,
       });
       await refresh();
     } catch (error) {
-      setNotice({ tone: "error", text: readableError(error) });
+      setNotice({ tone: "error", text: readableApiError(error) });
     } finally {
       setBusy(null);
     }
   }
 
   async function armTrading() {
-    if (!tokenReady || !armableMode || !riskConfirmed) return;
-    const confirmed = window.confirm(
-      "确认将 " + modeLabel(armableMode) + " 解锁 " + armMinutes + " 分钟？到期后应自动拒绝新交易。",
-    );
-    if (!confirmed) return;
-
+    if (!armableMode || !riskConfirmed || !control?.version) return;
+    if (
+      !window.confirm(
+        `确认将${modeLabel(armableMode)}解锁 ${armMinutes} 分钟？`,
+      )
+    ) {
+      return;
+    }
     setBusy("arm");
-    setNotice({ tone: "info", text: "正在申请短时实盘窗口…" });
     try {
-      await requestApi(ENDPOINTS.arm, {
+      await apiRequest("/v1/control/arm", {
         method: "POST",
-        token: adminToken.trim(),
-        body: { mode: armableMode, minutes: armMinutes },
+        body: {
+          mode: armableMode,
+          minutes: armMinutes,
+          expected_version: control.version,
+        },
+        idempotencyKey: crypto.randomUUID(),
       });
       setRiskConfirmed(false);
       setNotice({
         tone: "success",
-        text: modeLabel(armableMode) + " 已短时解锁 " + armMinutes + " 分钟。",
+        text: `${modeLabel(armableMode)}已短时解锁 ${armMinutes} 分钟。`,
       });
       await refresh();
     } catch (error) {
-      setNotice({ tone: "error", text: readableError(error) });
+      setNotice({ tone: "error", text: readableApiError(error) });
     } finally {
       setBusy(null);
     }
   }
 
   async function disarmTrading() {
-    if (!tokenReady) {
-      setNotice({ tone: "error", text: "请先输入管理员令牌。" });
-      return;
-    }
     setBusy("disarm");
-    setNotice({ tone: "info", text: "正在停用交易并撤销挂单…" });
+    setNotice({ tone: "info", text: "正在打开 kill switch 并请求撤销挂单…" });
     try {
-      await requestApi(ENDPOINTS.disarm, {
+      const result = await apiRequest<unknown>("/v1/control/disarm", {
         method: "POST",
-        token: adminToken.trim(),
+        body: {},
+        idempotencyKey: crypto.randomUUID(),
       });
       setRiskConfirmed(false);
-      setNotice({ tone: "success", text: "交易已停用，kill switch 已打开，并已请求撤销挂单。" });
+      const response = asRecord(result.data);
+      const pending =
+        result.status === 202 || response.cancellation_pending === true;
+      setNotice({
+        tone: pending ? "info" : "success",
+        text: pending
+          ? "交易已停用，撤单任务正在 worker 中处理。请等待开放订单归零。"
+          : "交易已停用，kill switch 已打开且挂单已撤销。",
+      });
       await refresh();
     } catch (error) {
-      setNotice({ tone: "error", text: readableError(error) });
+      setNotice({ tone: "error", text: readableApiError(error) });
     } finally {
       setBusy(null);
     }
@@ -468,27 +401,29 @@ export default function HomePage() {
     <main className="page-shell">
       <header className="topbar">
         <div>
-          <h1 style={{ fontSize: "24px", margin: 0 }}>控制台总览</h1>
+          <p className="eyebrow">TENANT CONTROL PLANE</p>
+          <h1>控制台总览</h1>
         </div>
         <div className="api-address" title={API_BASE_URL}>
-          <span className={"status-dot " + health.phase} />
+          <span className={`status-dot ${health.phase}`} />
           <span>{API_BASE_URL}</span>
         </div>
       </header>
 
-      <section className="safety-banner" aria-label="安全边界">
-        <div className="shield" aria-hidden="true">◆</div>
+      <section className="safety-banner">
+        <span className="shield" aria-hidden="true">◆</span>
         <div>
-          <strong>私钥隔离边界</strong>
+          <strong>当前 Supabase 会话就是租户身份</strong>
           <p>
-            本页永不请求、显示或保存钱包私钥、助记词及 CLOB 凭据。管理员令牌只保存在当前页面内存，刷新或关闭页面即清除。
+            本页仅发送 JWT、任务参数和幂等键，不读取或转发 AI Key、EVM
+            私钥、助记词及 CLOB 凭证。
           </p>
         </div>
       </section>
 
       {!apiUsesSafeTransport && (
         <div className="transport-warning" role="alert">
-          当前 API 地址不是 HTTPS。除本机开发外，请先改用 Zeabur HTTPS 域名，再输入管理员令牌。
+          非本机 API 必须使用 HTTPS；当前地址已阻止敏感控制操作。
         </div>
       )}
 
@@ -496,50 +431,59 @@ export default function HomePage() {
         <article className="summary-card">
           <div className="card-heading">
             <span>API / 数据库</span>
-            <span className={"pill " + health.phase}>{healthText}</span>
+            <span className={`pill ${health.phase}`}>{healthText}</span>
           </div>
-          <div className="primary-value">{health.store === "healthy" ? "连接正常" : health.phase === "online" ? "API 正常" : healthText}</div>
+          <div className="primary-value">
+            {health.store === "healthy" ? "连接正常" : healthText}
+          </div>
           <p className="muted">最近检查 {formatDate(health.checkedAt)}</p>
         </article>
 
         <article className="summary-card">
           <div className="card-heading">
             <span>运行模式</span>
-            <span className={"mode-chip mode-" + (configuredMode || "unknown")}>
-              {String(configuredMode || "UNKNOWN").toUpperCase()}
+            <span className={`mode-chip mode-${configuredMode ?? "unknown"}`}>
+              {(configuredMode ?? "UNKNOWN").toUpperCase()}
             </span>
           </div>
           <div className="primary-value">{modeLabel(configuredMode)}</div>
           <p className="muted">
-            {status?.aiProvider || "AI 未知"} / {status?.forecastModel || "模型未返回"}
+            {status?.aiProvider ?? "AI 未配置"} / {status?.forecastModel ?? "模型未返回"}
           </p>
         </article>
 
-        <article className={"summary-card gate-card " + (effectivelyArmed ? "danger" : "safe")}>
+        <article className={`summary-card ${effectivelyArmed ? "danger" : "safe"}`}>
           <div className="card-heading">
             <span>交易闸门</span>
-            <span className={"pill " + (effectivelyArmed ? "armed" : "disarmed")}>
+            <span className={`pill ${effectivelyArmed ? "armed" : "disarmed"}`}>
               {effectivelyArmed ? "已解锁" : "已锁定"}
             </span>
           </div>
           <div className="primary-value">
-            {effectivelyArmed ? countdownLabel(control?.armedUntil, now) : "不会提交新实盘订单"}
+            {effectivelyArmed
+              ? countdownLabel(control?.armedUntil, now)
+              : "不会提交新实盘订单"}
           </div>
           <p className="muted">
-            Kill switch：{control?.killSwitch === false ? "关闭" : "开启或未知"} · 控制版本 {control?.version ?? "—"}
+            Kill switch：{control?.killSwitch === false ? "关闭" : "开启或未知"}
           </p>
         </article>
 
         <article className="summary-card">
           <div className="card-heading">
             <span>状态同步</span>
-            <button className="text-button" type="button" onClick={() => void refresh()} disabled={refreshing}>
+            <button
+              className="text-button"
+              type="button"
+              onClick={() => void refresh()}
+              disabled={refreshing}
+            >
               {refreshing ? "刷新中…" : "立即刷新"}
             </button>
           </div>
           <div className="primary-value">{statusError ? "读取失败" : "每 20 秒"}</div>
           <p className={statusError ? "error-text" : "muted"}>
-            {statusError || "最近同步 " + formatDate(status?.fetchedAt)}
+            {statusError ?? `最近同步 ${formatDate(status?.fetchedAt)}`}
           </p>
         </article>
       </section>
@@ -548,62 +492,32 @@ export default function HomePage() {
         <section className="panel controls-panel">
           <div className="section-heading">
             <div>
-              <p className="eyebrow">MANUAL CONTROL</p>
-              <h2>人工控制</h2>
+              <p className="eyebrow">CONTROL ACTIONS</p>
+              <h2>租户操作</h2>
             </div>
-            <span className="read-only-chip">默认只读</span>
+            <span className="read-only-chip">JWT 已绑定</span>
           </div>
-
-          <label className="field-label" htmlFor="admin-token">管理员令牌</label>
-          <div className="token-row">
-            <input
-              id="admin-token"
-              type="password"
-              value={adminToken}
-              onChange={(event) => setAdminToken(event.target.value)}
-              placeholder="仅在执行操作前输入"
-              autoComplete="off"
-              autoCapitalize="off"
-              spellCheck={false}
-            />
-            <button
-              className="secondary-button"
-              type="button"
-              onClick={() => {
-                setAdminToken("");
-                setRiskConfirmed(false);
-                setNotice({ tone: "info", text: "页面内存中的管理员令牌已清除。" });
-              }}
-              disabled={!adminToken || busy !== null}
-            >
-              清除
-            </button>
-          </div>
-          <p className="field-help">不写入 LocalStorage、Cookie、URL、日志或 Vercel 环境变量。</p>
 
           <div className="action-stack">
             <article className="action-card">
               <div>
-                <h3>执行一个周期</h3>
-                <p>立即扫描市场、生成预测、过风险闸门，并按当前模式处理执行。</p>
+                <h3>创建运行任务</h3>
+                <p>API 只入队；隔离 worker 获取租户租约后才加载密钥并执行。</p>
               </div>
               <button
                 className="primary-button"
                 type="button"
                 onClick={() => void runCycle()}
-                disabled={!tokenReady || busy !== null || !apiUsesSafeTransport}
+                disabled={busy !== null || !apiUsesSafeTransport}
               >
-                {busy === "cycle" ? "执行中…" : "运行周期"}
+                {busy === "cycle" ? "创建中…" : "运行周期"}
               </button>
             </article>
 
             <article className="action-card arm-action">
               <div className="action-copy">
                 <h3>短时解锁</h3>
-                <p>
-                  仅 canary/live 可用；最长 15 分钟。当前目标：
-                  <strong>{armableMode ? modeLabel(armableMode) : "当前模式不可解锁"}</strong>
-                </p>
+                <p>仅 canary/live 可用；到期后服务端自动拒绝新交易。</p>
               </div>
               <div className="arm-settings">
                 <label htmlFor="arm-minutes">窗口</label>
@@ -613,11 +527,9 @@ export default function HomePage() {
                   onChange={(event) => setArmMinutes(Number(event.target.value))}
                   disabled={busy !== null}
                 >
-                  <option value={1}>1 分钟</option>
-                  <option value={3}>3 分钟</option>
-                  <option value={5}>5 分钟</option>
-                  <option value={10}>10 分钟</option>
-                  <option value={15}>15 分钟</option>
+                  {[1, 3, 5, 10, 15].map((minutes) => (
+                    <option key={minutes} value={minutes}>{minutes} 分钟</option>
+                  ))}
                 </select>
               </div>
               <label className="confirm-row">
@@ -633,7 +545,13 @@ export default function HomePage() {
                 className="warning-button"
                 type="button"
                 onClick={() => void armTrading()}
-                disabled={!tokenReady || !armableMode || !riskConfirmed || busy !== null || !apiUsesSafeTransport}
+                disabled={
+                  !armableMode ||
+                  !riskConfirmed ||
+                  !control?.version ||
+                  busy !== null ||
+                  !apiUsesSafeTransport
+                }
               >
                 {busy === "arm" ? "解锁中…" : "短时解锁交易"}
               </button>
@@ -642,21 +560,21 @@ export default function HomePage() {
             <article className="action-card stop-action">
               <div>
                 <h3>立即停用</h3>
-                <p>打开 kill switch、清除解锁窗口，并请求撤销当前挂单。</p>
+                <p>先持久化 kill switch，再由持有租约的 worker 异步撤单。</p>
               </div>
               <button
                 className="danger-button"
                 type="button"
                 onClick={() => void disarmTrading()}
-                disabled={!tokenReady || busy !== null || !apiUsesSafeTransport}
+                disabled={busy !== null || !apiUsesSafeTransport}
               >
                 {busy === "disarm" ? "停用中…" : "停用并撤单"}
               </button>
             </article>
           </div>
 
-          <div className="notice-slot" aria-live="polite" aria-atomic="true">
-            {notice && <div className={"notice " + notice.tone}>{notice.text}</div>}
+          <div className="notice-slot" aria-live="polite">
+            {notice && <div className={`notice ${notice.tone}`}>{notice.text}</div>}
           </div>
         </section>
 
@@ -667,44 +585,42 @@ export default function HomePage() {
                 <p className="eyebrow">RISK LIMITS</p>
                 <h2>风险上限</h2>
               </div>
-              <span className="version-label">API 实时值</span>
+              <span className="version-label">服务端值</span>
             </div>
             <dl className="risk-list">
-              {(status?.riskLimits || RISK_LIMITS.map((item) => ({ key: item.key, label: item.label, value: "等待 API" }))).map((limit) => (
+              {(status?.riskLimits ??
+                RISK_LIMITS.map((item) => ({
+                  key: item.key,
+                  label: item.label,
+                  value: "等待 API",
+                }))).map((limit) => (
                 <div className="risk-row" key={limit.key}>
                   <dt>{limit.label}</dt>
                   <dd>{limit.value}</dd>
                 </div>
               ))}
             </dl>
-            <p className="panel-note">这些值来自 Zeabur API；前端不允许修改风险配置。</p>
           </section>
 
-          <section className="panel cycle-panel">
+          <section className="panel">
             <div className="section-heading compact">
               <div>
-                <p className="eyebrow">LAST MANUAL CYCLE</p>
-                <h2>最近手动周期</h2>
+                <p className="eyebrow">LATEST JOB</p>
+                <h2>最近任务</h2>
               </div>
-              {lastCycle?.mode && <span className="mode-chip">{lastCycle.mode.toUpperCase()}</span>}
+              {lastJob?.status && <span className="pill">{lastJob.status}</span>}
             </div>
-            {lastCycle ? (
-              <>
-                <p className="run-id" title={lastCycle.runId}>{lastCycle.runId || "无运行 ID"}</p>
-                <dl className="metrics-grid">
-                  <Metric label="扫描" value={lastCycle.marketsScanned} />
-                  <Metric label="预测" value={lastCycle.forecastsCreated} />
-                  <Metric label="候选" value={lastCycle.candidatesCreated} />
-                  <Metric label="批准" value={lastCycle.intentsApproved} />
-                  <Metric label="执行" value={lastCycle.executions} />
-                  <Metric label="跳过" value={lastCycle.skipped} />
-                </dl>
-                <p className="panel-note">完成于 {formatDate(lastCycle.completedAt)}</p>
-              </>
+            {lastJob ? (
+              <dl className="detail-list">
+                <div><dt>任务 ID</dt><dd title={lastJob.id}>{lastJob.id ?? "—"}</dd></div>
+                <div><dt>模式</dt><dd>{modeLabel(lastJob.mode)}</dd></div>
+                <div><dt>扫描市场</dt><dd>{lastJob.marketsScanned ?? "等待 worker"}</dd></div>
+                <div><dt>执行订单</dt><dd>{lastJob.executions ?? "等待 worker"}</dd></div>
+              </dl>
             ) : (
               <div className="empty-state">
                 <span aria-hidden="true">◎</span>
-                <p>本页面尚未触发周期。</p>
+                <p>暂无运行任务。</p>
               </div>
             )}
           </section>
@@ -717,21 +633,16 @@ export default function HomePage() {
               </div>
             </div>
             <dl className="detail-list">
-              <div><dt>账户</dt><dd title={control?.accountId}>{control?.accountId || "—"}</dd></div>
+              <div><dt>账户</dt><dd title={control?.accountId}>{control?.accountId ?? "来自 JWT"}</dd></div>
               <div><dt>控制模式</dt><dd>{modeLabel(control?.mode)}</dd></div>
               <div><dt>解锁到期</dt><dd>{formatDate(control?.armedUntil)}</dd></div>
-              <div><dt>接受新意图</dt><dd>{control?.acceptNewIntents === undefined ? "未返回" : control.acceptNewIntents ? "是" : "否"}</dd></div>
+              <div><dt>接受新意图</dt><dd>{control?.acceptNewIntents === true ? "是" : "否或未知"}</dd></div>
+              <div><dt>控制版本</dt><dd>{control?.version ?? "—"}</dd></div>
               <div><dt>更新时间</dt><dd>{formatDate(control?.updatedAt)}</dd></div>
             </dl>
           </section>
         </aside>
       </div>
-
-      <footer>
-        <span>控制面与签名器隔离</span>
-        <span>·</span>
-        <span>所有实盘操作仍受服务端模式、时限、风险闸门与地理限制约束</span>
-      </footer>
     </main>
   );
 }

@@ -111,9 +111,13 @@ def _evidence_collector(
     raise ValueError(f"unsupported evidence provider: {name}")
 
 
-def build_runtime(settings: Settings | None = None) -> Runtime:
+def build_runtime(
+    settings: Settings | None = None,
+    *,
+    store_override: StateStore | None = None,
+) -> Runtime:
     settings = settings or get_settings()
-    store = _store(settings)
+    store = store_override or _store(settings)
     provider, collector = _ai(settings)
     graph = ForecastGraph(
         provider,

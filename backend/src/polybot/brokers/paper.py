@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from decimal import Decimal
 
 from polybot.models import (
@@ -161,6 +162,19 @@ class PaperBroker:
         # There are no resting paper orders; this keeps kill-switch handling uniform.
         return True
 
+    async def submit_batch(
+        self,
+        submissions: Sequence[tuple[TradeIntent, OrderBookSnapshot]],
+    ) -> list[ExecutionResult]:
+        # Sequential fills make the non-atomic semantics explicit in research.
+        return [await self.submit(intent, book) for intent, book in submissions]
+
+    async def cancel_order(self, order_id: str, reason: str) -> bool:
+        return True
+
+    async def cancel_orders(self, order_ids: Sequence[str], reason: str) -> bool:
+        return True
+
     async def redeem_resolved(self) -> int:
         return 0
 
@@ -180,6 +194,18 @@ class ShadowBroker:
         )
 
     async def cancel_all(self, reason: str) -> bool:
+        return True
+
+    async def submit_batch(
+        self,
+        submissions: Sequence[tuple[TradeIntent, OrderBookSnapshot]],
+    ) -> list[ExecutionResult]:
+        return [await self.submit(intent, book) for intent, book in submissions]
+
+    async def cancel_order(self, order_id: str, reason: str) -> bool:
+        return True
+
+    async def cancel_orders(self, order_ids: Sequence[str], reason: str) -> bool:
         return True
 
     async def redeem_resolved(self) -> int:
@@ -204,6 +230,18 @@ class ControlPlaneBroker:
 
     async def cancel_all(self, reason: str) -> bool:
         # The durable kill switch is watched by the leased signer worker.
+        return False
+
+    async def submit_batch(
+        self,
+        submissions: Sequence[tuple[TradeIntent, OrderBookSnapshot]],
+    ) -> list[ExecutionResult]:
+        return [await self.submit(intent, book) for intent, book in submissions]
+
+    async def cancel_order(self, order_id: str, reason: str) -> bool:
+        return False
+
+    async def cancel_orders(self, order_ids: Sequence[str], reason: str) -> bool:
         return False
 
     async def redeem_resolved(self) -> int:

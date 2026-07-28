@@ -4,6 +4,8 @@ import asyncio
 import contextlib
 import hashlib
 import logging
+from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -22,6 +24,8 @@ from polybot.stores.ledger import IncompleteFillLedgerError
 
 logger = logging.getLogger(__name__)
 
+FillCallback = Callable[[UserTradeUpdate], Awaitable[None]]
+
 
 class OrderReconciler:
     """Authenticated user WebSocket plus periodic REST repair for orders, fills and positions."""
@@ -36,6 +40,7 @@ class OrderReconciler:
         interval_seconds: int = 30,
         client: Any | None = None,
         market_data: MarketData | None = None,
+        fill_callback: FillCallback | None = None,
     ):
         self.client = client
         self._private_key = private_key
@@ -45,9 +50,12 @@ class OrderReconciler:
         self.store = store
         self.interval_seconds = interval_seconds
         self.market_data = market_data
+        self.fill_callback = fill_callback
         self._known_position_conditions: set[str] = set()
         self.healthy = asyncio.Event()
         self._reconcile_lock = asyncio.Lock()
+        self._fill_callback_lock = asyncio.Lock()
+        self._notified_clob_trade_ids: OrderedDict[str, None] = OrderedDict()
         self._closed = False
         self._handle: Any | None = None
         # Every cold start replays the authenticated CLOB history from epoch 0.
@@ -168,7 +176,7 @@ class OrderReconciler:
         seen_trade_ids: set[str] = set()
         async for trade in self.client.list_account_trades(after=trade_after).iter_items():
             for update in await self._account_trade_updates(trade):
-                await self.store.reconcile_trade(update, self.account_id)
+                await self._reconcile_trade_and_notify(update)
             seen_trade_ids.add(str(trade.id))
             matched_at = getattr(trade, "matched_at", None)
             if matched_at is not None:
@@ -188,7 +196,7 @@ class OrderReconciler:
                 if str(trade.id) != trade_id:
                     continue
                 for update in await self._account_trade_updates(trade):
-                    await self.store.reconcile_trade(update, self.account_id)
+                    await self._reconcile_trade_and_notify(update)
                 seen_trade_ids.add(trade_id)
                 trade_count += 1
                 if trade_count >= 100_000:
@@ -306,7 +314,28 @@ class OrderReconciler:
             await self.store.reconcile_order(self._order_update(event.payload), self.account_id)
         elif event.type == "trade":
             for update in await self._account_trade_updates(event.payload):
-                await self.store.reconcile_trade(update, self.account_id)
+                await self._reconcile_trade_and_notify(update)
+
+    async def _reconcile_trade_and_notify(self, update: UserTradeUpdate) -> None:
+        """Persist the canonical fill before notifying an optional P2 consumer.
+
+        REST and WebSocket delivery overlap by design. The bounded process-local
+        cache avoids duplicate callback work, while the pair store's unique
+        ``(account_id, clob_trade_id)`` event is the durable restart boundary.
+        A failed callback is deliberately not marked as delivered, so the next
+        reconciliation replay retries it after the core fill ledger is safe.
+        """
+
+        await self.store.reconcile_trade(update, self.account_id)
+        if self.fill_callback is None:
+            return
+        async with self._fill_callback_lock:
+            if update.clob_trade_id in self._notified_clob_trade_ids:
+                return
+            await self.fill_callback(update)
+            self._notified_clob_trade_ids[update.clob_trade_id] = None
+            if len(self._notified_clob_trade_ids) > 100_000:
+                self._notified_clob_trade_ids.popitem(last=False)
 
     @staticmethod
     def _order_update(value: Any) -> UserOrderUpdate:

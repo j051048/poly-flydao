@@ -36,13 +36,18 @@ class MarketSpec(BaseModel):
     id: str = Field(min_length=1)
     condition_id: str | None = None
     event_id: str | None = None
+    slug: str | None = None
+    event_slug: str | None = None
     question: str = Field(min_length=1)
     description: str = ""
     category: str = "other"
+    tags: tuple[str, ...] = ()
     resolution_rules: str = ""
     resolution_source: str | None = None
     yes_token_id: str = Field(min_length=1)
     no_token_id: str = Field(min_length=1)
+    yes_label: str = Field(default="Yes", min_length=1)
+    no_label: str = Field(default="No", min_length=1)
     active: bool = True
     closed: bool = False
     accepting_orders: bool = True
@@ -54,6 +59,9 @@ class MarketSpec(BaseModel):
     fees_enabled: bool = False
     fee_rate: Decimal = Field(default=Decimal("0"), ge=0)
     fee_exponent: Decimal = Field(default=Decimal("1"), gt=0)
+    fee_taker_only: bool = True
+    maker_rebate_rate: Decimal = Field(default=Decimal("0"), ge=0)
+    start_at: datetime | None = None
     end_at: datetime | None = None
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -63,6 +71,10 @@ class MarketSpec(BaseModel):
             raise ValueError("fee-enabled market is missing a positive fee rate")
         if self.yes_token_id == self.no_token_id:
             raise ValueError("YES and NO token ids must differ")
+        if self.yes_label.casefold() == self.no_label.casefold():
+            raise ValueError("binary outcome labels must differ")
+        if self.start_at and self.end_at and self.start_at >= self.end_at:
+            raise ValueError("market start_at must precede end_at")
         return self
 
 
@@ -279,6 +291,182 @@ class TradeIntent(BaseModel):
             strategy=candidate.strategy,
             post_only=post_only,
         )
+
+
+class LiquidityRole(StrEnum):
+    MAKER = "maker"
+    TAKER = "taker"
+
+
+class OrderLegPurpose(StrEnum):
+    PAIR_ENTRY = "pair_entry"
+    IMBALANCE_HEDGE = "imbalance_hedge"
+    DIRECTIONAL_OVERLAY = "directional_overlay"
+
+
+class OrderLegStatus(StrEnum):
+    PLANNED = "planned"
+    SUBMITTING = "submitting"
+    OPEN = "open"
+    PARTIALLY_FILLED = "partially_filled"
+    FILLED = "filled"
+    CANCEL_PENDING = "cancel_pending"
+    CANCELLED = "cancelled"
+    REJECTED = "rejected"
+    FAILED = "failed"
+
+
+class OrderGroupStatus(StrEnum):
+    PLANNED = "planned"
+    SUBMITTING = "submitting"
+    WORKING = "working"
+    IMBALANCED = "imbalanced"
+    CANCELLING = "cancelling"
+    HEDGING = "hedging"
+    PAIRED = "paired"
+    CANCELLED = "cancelled"
+    FROZEN = "frozen"
+    FAILED = "failed"
+
+
+TERMINAL_ORDER_LEG_STATUSES = frozenset(
+    {
+        OrderLegStatus.FILLED,
+        OrderLegStatus.CANCELLED,
+        OrderLegStatus.REJECTED,
+        OrderLegStatus.FAILED,
+    }
+)
+
+
+class OrderLeg(BaseModel):
+    """Durable leg state for a non-atomic pair order group."""
+
+    id: UUID = Field(default_factory=uuid4)
+    group_id: UUID
+    outcome: Outcome
+    token_id: str = Field(min_length=1)
+    side: Side = Side.BUY
+    purpose: OrderLegPurpose = OrderLegPurpose.PAIR_ENTRY
+    liquidity_role: LiquidityRole = LiquidityRole.MAKER
+    post_only: bool = True
+    price: Decimal = Field(gt=0, lt=1)
+    size: Decimal = Field(gt=0)
+    filled_size: Decimal = Field(default=Decimal("0"), ge=0)
+    average_fill_price: Decimal | None = Field(default=None, gt=0, lt=1)
+    fee_paid_usd: Decimal = Field(default=Decimal("0"), ge=0)
+    status: OrderLegStatus = OrderLegStatus.PLANNED
+    clob_order_id: str | None = None
+    deadline_at: datetime
+    version: int = Field(default=1, ge=1)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+    @model_validator(mode="after")
+    def validate_execution_shape(self) -> OrderLeg:
+        if self.filled_size > self.size:
+            raise ValueError("filled_size cannot exceed order leg size")
+        if self.filled_size > 0 and self.average_fill_price is None:
+            raise ValueError("filled legs require an average fill price")
+        if self.filled_size == 0 and self.average_fill_price is not None:
+            raise ValueError("unfilled legs cannot have an average fill price")
+        if self.liquidity_role is LiquidityRole.MAKER and not self.post_only:
+            raise ValueError("maker legs must be post-only")
+        if self.liquidity_role is LiquidityRole.TAKER and self.post_only:
+            raise ValueError("taker legs cannot be post-only")
+        if self.status is OrderLegStatus.FILLED and self.filled_size != self.size:
+            raise ValueError("filled status requires the full leg size")
+        if self.status in {OrderLegStatus.OPEN, OrderLegStatus.PARTIALLY_FILLED}:
+            if not self.clob_order_id:
+                raise ValueError("working order legs require a CLOB order id")
+        return self
+
+    @property
+    def remaining_size(self) -> Decimal:
+        return max(Decimal("0"), self.size - self.filled_size)
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in TERMINAL_ORDER_LEG_STATUSES
+
+
+class OrderGroup(BaseModel):
+    """Durable group state; two CLOB orders are never assumed to be atomic."""
+
+    id: UUID = Field(default_factory=uuid4)
+    account_id: str = Field(min_length=1)
+    trading_wallet_id: str | None = None
+    market_id: str = Field(min_length=1)
+    condition_id: str | None = None
+    strategy: str = "pair_accumulator_v1"
+    target_pair_size: Decimal = Field(gt=0)
+    paired_size: Decimal = Field(default=Decimal("0"), ge=0)
+    directional_yes_size: Decimal = Field(default=Decimal("0"), ge=0)
+    directional_no_size: Decimal = Field(default=Decimal("0"), ge=0)
+    expected_net_edge_usd: Decimal
+    leg_deadline_at: datetime
+    status: OrderGroupStatus = OrderGroupStatus.PLANNED
+    research_only: bool = True
+    version: int = Field(default=1, ge=1)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+    @model_validator(mode="after")
+    def validate_inventory_shape(self) -> OrderGroup:
+        if self.directional_yes_size > 0 and self.directional_no_size > 0:
+            raise ValueError("directional inventory cannot point both YES and NO")
+        if self.paired_size > self.target_pair_size:
+            raise ValueError("paired_size cannot exceed target_pair_size")
+        return self
+
+
+class OrderPlan(BaseModel):
+    """Research plan produced before any durable or exchange-side mutation."""
+
+    group: OrderGroup
+    legs: tuple[OrderLeg, OrderLeg]
+    base_cost_usd: Decimal = Field(ge=0)
+    maker_fee_usd: Decimal = Field(default=Decimal("0"), ge=0)
+    taker_hedge_fee_buffer_usd: Decimal = Field(default=Decimal("0"), ge=0)
+    leg_risk_buffer_usd: Decimal = Field(default=Decimal("0"), ge=0)
+    capital_cost_usd: Decimal = Field(default=Decimal("0"), ge=0)
+    expected_payout_usd: Decimal = Field(gt=0)
+    enabled: bool = False
+    research_only: bool = True
+    created_at: datetime = Field(default_factory=utc_now)
+
+    @model_validator(mode="after")
+    def validate_pair_plan(self) -> OrderPlan:
+        first, second = self.legs
+        if first.group_id != self.group.id or second.group_id != self.group.id:
+            raise ValueError("all order legs must belong to the plan's group")
+        if {first.outcome, second.outcome} != {Outcome.YES, Outcome.NO}:
+            raise ValueError("a pair entry plan requires one YES and one NO leg")
+        if first.size != second.size or first.size != self.group.target_pair_size:
+            raise ValueError("pair entry legs must use identical share sizes")
+        if first.purpose is not OrderLegPurpose.PAIR_ENTRY:
+            raise ValueError("initial pair legs must use pair_entry purpose")
+        if second.purpose is not OrderLegPurpose.PAIR_ENTRY:
+            raise ValueError("initial pair legs must use pair_entry purpose")
+        if self.group.research_only != self.research_only:
+            raise ValueError("plan and group research_only flags must agree")
+        return self
+
+    @property
+    def net_edge_usd(self) -> Decimal:
+        return (
+            self.expected_payout_usd
+            - self.base_cost_usd
+            - self.maker_fee_usd
+            - self.taker_hedge_fee_buffer_usd
+            - self.leg_risk_buffer_usd
+            - self.capital_cost_usd
+        )
+
+    @property
+    def live_eligible(self) -> bool:
+        # P2 remains intentionally disconnected from the production engine.
+        return self.enabled and not self.research_only
 
 
 class RiskDecision(BaseModel):

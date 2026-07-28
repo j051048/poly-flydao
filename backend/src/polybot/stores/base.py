@@ -59,7 +59,12 @@ class StateStore(Protocol):
     ) -> None: ...
 
     async def mark_order_submitting(
-        self, intent_hash: str, account_id: str, fencing_token: int
+        self,
+        intent_hash: str,
+        account_id: str,
+        fencing_token: int,
+        *,
+        control_version: int | None = None,
     ) -> None: ...
 
     async def save_execution(self, result: ExecutionResult, account_id: str) -> None: ...

@@ -3,13 +3,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import attrs
-from cryptography.fernet import Fernet
 
 from polybot.config import Settings, TradingMode
 from polybot.geoblock import GeoblockChecker
@@ -23,6 +22,7 @@ from polybot.models import (
     TradeIntent,
 )
 from polybot.stores.base import StateStore
+from polybot.tenant_crypto import EncryptionContext, TenantAeadCipher
 
 
 class PolymarketBroker:
@@ -41,7 +41,7 @@ class PolymarketBroker:
         self.settings = settings
         self.store = store
         self.geoblock = geoblock or GeoblockChecker(settings.geoblock_url)
-        self.cipher = Fernet(settings.signed_payload_key.get_secret_value().encode())
+        self.cipher = TenantAeadCipher(settings.signed_payload_key.get_secret_value())
         if client is None:
             from polymarket import SecureClient
 
@@ -56,6 +56,70 @@ class PolymarketBroker:
         """Install the worker-only durable lease guard; API/CLI runtimes stay inert."""
 
         self._lease_guard = guard
+
+    async def ensure_trading_approvals(self) -> None:
+        """Initialize standard allowances only after the imported wallet is funded.
+
+        Wallet import first derives the deposit address so the user can fund it.
+        The live worker performs the explicitly-authorized, idempotent approval
+        setup later, while all live execution fences and the arm are current.
+        """
+
+        if self._lease_guard is None:
+            raise RuntimeError("approval setup requires a healthy leased worker")
+        initial_fencing_token = await self._lease_guard()
+        if initial_fencing_token is None:
+            raise RuntimeError("approval setup requires a healthy leased worker")
+        control = await self.store.get_runtime_control(self.settings.account_id)
+        if not control.is_live_armed or control.mode is not self.settings.mode:
+            raise RuntimeError("approval setup requires an active runtime arm")
+        balance = await asyncio.to_thread(
+            self.client.get_balance_allowance,
+            asset_type="COLLATERAL",
+        )
+        collateral = Decimal(str(balance.balance))
+        if collateral <= 0:
+            raise RuntimeError(
+                "wallet is active but has no collateral; fund its deposit address first"
+            )
+        allowances = [Decimal(str(value)) for value in balance.allowances.values()]
+        if allowances and min(allowances) > 0:
+            return
+
+        control_version = control.version
+        fresh_fencing_token = await self._lease_guard()
+        fresh_control = await self.store.get_runtime_control(self.settings.account_id)
+        if (
+            fresh_fencing_token != initial_fencing_token
+            or not fresh_control.is_live_armed
+            or fresh_control.mode is not self.settings.mode
+            or fresh_control.version != control_version
+        ):
+            raise RuntimeError("execution authority changed before approval setup")
+        eligibility = await self.geoblock.check()
+        if not eligibility.allowed:
+            raise RuntimeError(
+                f"approval setup blocked by official geoblock: {eligibility.reason}"
+            )
+        await asyncio.to_thread(self.client.setup_trading_approvals)
+        if self._lease_guard is None or await self._lease_guard() is None:
+            raise RuntimeError("execution fence changed during approval setup")
+        current_control = await self.store.get_runtime_control(self.settings.account_id)
+        if (
+            not current_control.is_live_armed
+            or current_control.mode is not self.settings.mode
+            or current_control.version != control_version
+        ):
+            raise RuntimeError("runtime control changed during approval setup")
+        verified = await asyncio.to_thread(
+            self.client.get_balance_allowance,
+            asset_type="COLLATERAL",
+        )
+        verified_allowances = [
+            Decimal(str(value)) for value in verified.allowances.values()
+        ]
+        if not verified_allowances or min(verified_allowances) <= 0:
+            raise RuntimeError("Polymarket trading approvals could not be verified")
 
     async def portfolio_state(self) -> PortfolioState:
         now = datetime.now(UTC)
@@ -200,7 +264,11 @@ class PolymarketBroker:
             return self._rejected(intent, eligibility.reason)
         if intent.notional_usd > self.settings.max_order_usd:
             return self._rejected(intent, "executor order cap exceeded")
-        if intent.side is Side.BUY:
+        if intent.post_only:
+            maker_error = self._validate_post_only_submission(intent, book)
+            if maker_error:
+                return self._rejected(intent, maker_error)
+        elif intent.side is Side.BUY:
             if book.best_ask is None or intent.price < book.best_ask:
                 return self._rejected(intent, "book moved outside the signed buy price cap")
         elif book.best_bid is None or intent.price > book.best_bid:
@@ -241,35 +309,9 @@ class PolymarketBroker:
                 message=f"order preparation/signing failed: {type(exc).__name__}",
             )
 
-        if attrs.has(type(signed_order)):
-            payload = attrs.asdict(signed_order)
-        else:
-            payload = {
-                name: getattr(signed_order, name)
-                for name in (
-                    "builder",
-                    "expiration",
-                    "maker",
-                    "maker_amount",
-                    "metadata",
-                    "order_type",
-                    "post_only",
-                    "salt",
-                    "side",
-                    "signature",
-                    "signature_type",
-                    "signer",
-                    "taker_amount",
-                    "timestamp",
-                    "token_id",
-                )
-                if hasattr(signed_order, name)
-            }
-        serialized = json.dumps(
-            payload, sort_keys=True, separators=(",", ":"), default=str
-        ).encode()
+        serialized = self._serialize_signed_order(signed_order)
         signed_order_hash = hashlib.sha256(serialized).hexdigest()
-        ciphertext = self.cipher.encrypt(serialized)
+        ciphertext = self._encrypt_signed_order(intent, serialized)
         try:
             await self.store.prepare_signed_order(
                 intent,
@@ -308,7 +350,10 @@ class PolymarketBroker:
 
         try:
             await self.store.mark_order_submitting(
-                intent.intent_hash, intent.account_id, fencing_token
+                intent.intent_hash,
+                intent.account_id,
+                fencing_token,
+                control_version=control_version,
             )
         except Exception as exc:
             return ExecutionResult(
@@ -440,6 +485,316 @@ class PolymarketBroker:
             )
         return result
 
+    async def submit_batch(
+        self,
+        submissions: Sequence[tuple[TradeIntent, OrderBookSnapshot]],
+    ) -> list[ExecutionResult]:
+        """Post independently signed maker legs through the SDK batch endpoint.
+
+        The CLOB batch endpoint is a transport optimization, not a transaction:
+        each response is evaluated independently and mixed accept/reject batches
+        trigger targeted cancellation of accepted legs. Fills racing that
+        cancellation still require user-stream reconciliation.
+        """
+
+        items = list(submissions)
+        if not items:
+            return []
+        if len(items) == 1:
+            intent, book = items[0]
+            return [await self.submit(intent, book)]
+        if len(items) > 15:
+            return self._batch_rejected(items, "batch exceeds the conservative 15-order cap")
+
+        intents = [intent for intent, _ in items]
+        account_ids = {intent.account_id for intent in intents}
+        if account_ids != {self.settings.account_id}:
+            return self._batch_rejected(items, "batch account identity mismatch")
+        if len({intent.intent_hash for intent in intents}) != len(intents):
+            return self._batch_rejected(items, "batch contains duplicate intent hashes")
+        if not all(intent.post_only for intent in intents):
+            return self._batch_rejected(
+                items,
+                "multi-order submission is restricted to post-only maker legs",
+            )
+        for intent, book in items:
+            message = self._validate_post_only_submission(intent, book)
+            if message:
+                return self._batch_rejected(items, message)
+        if await self.store.has_unresolved_live_orders(self.settings.account_id):
+            return self._batch_rejected(items, "another durable live order is unresolved")
+
+        control = await self.store.get_runtime_control(self.settings.account_id)
+        if not control.is_live_armed or control.mode is not self.settings.mode:
+            return self._batch_rejected(items, "short-lived runtime arm is absent or mismatched")
+        assert control.armed_until is not None
+        if (control.armed_until - datetime.now(UTC)).total_seconds() < 210:
+            return self._batch_rejected(
+                items,
+                "runtime arm has less than 3.5 minutes remaining for safe GTD orders",
+            )
+        if self._lease_guard is None:
+            return self._batch_rejected(
+                items,
+                "live batch submission is restricted to the leased worker",
+            )
+        fencing_token = await self._lease_guard()
+        if fencing_token is None:
+            return self._batch_rejected(
+                items,
+                "durable worker lease or reconciliation is unhealthy",
+            )
+        eligibility = await self.geoblock.check()
+        if not eligibility.allowed:
+            return self._batch_rejected(items, eligibility.reason)
+
+        for intent in intents:
+            if intent.notional_usd > self.settings.max_order_usd:
+                return self._batch_rejected(items, "executor order cap exceeded")
+        if (
+            sum((intent.notional_usd for intent in intents), Decimal("0"))
+            > self.settings.max_order_usd
+        ):
+            return self._batch_rejected(items, "aggregate batch order cap exceeded")
+        required_by_asset: dict[tuple[str, str | None], Decimal] = {}
+        for intent in intents:
+            asset = (
+                ("COLLATERAL", None)
+                if intent.side is Side.BUY
+                else ("CONDITIONAL", intent.token_id)
+            )
+            amount = intent.notional_usd if intent.side is Side.BUY else intent.size
+            required_by_asset[asset] = required_by_asset.get(asset, Decimal("0")) + amount
+        for (asset_type, token_id), amount in required_by_asset.items():
+            balance = await asyncio.to_thread(
+                self.client.get_balance_allowance,
+                asset_type=asset_type,
+                token_id=token_id,
+            )
+            required = amount * Decimal("1000000")
+            if Decimal(balance.balance) < required:
+                return self._batch_rejected(
+                    items,
+                    f"insufficient {asset_type.lower()} balance before batch signing",
+                )
+            allowances = [Decimal(value) for value in balance.allowances.values()]
+            if not allowances or min(allowances) < required:
+                return self._batch_rejected(
+                    items,
+                    f"insufficient {asset_type.lower()} allowance before batch signing",
+                )
+
+        expiration = int(control.armed_until.timestamp())
+        signed_orders: list[Any] = []
+        serialized_orders: list[bytes] = []
+        try:
+            for intent, _ in items:
+                signed = await asyncio.to_thread(
+                    self.client.create_limit_order,
+                    token_id=intent.token_id,
+                    price=intent.price,
+                    size=intent.size,
+                    side=intent.side.value,
+                    post_only=True,
+                    expiration=expiration,
+                )
+                signed_orders.append(signed)
+                serialized_orders.append(self._serialize_signed_order(signed))
+        except Exception as exc:
+            return self._batch_errors(
+                items,
+                f"batch preparation/signing failed: {type(exc).__name__}",
+            )
+
+        try:
+            for (intent, _), serialized in zip(items, serialized_orders, strict=True):
+                await self.store.prepare_signed_order(
+                    intent,
+                    signed_order_hash=hashlib.sha256(serialized).hexdigest(),
+                    payload_ciphertext=self._encrypt_signed_order(intent, serialized),
+                    key_version=self.settings.payload_key_version,
+                    fencing_token=fencing_token,
+                    order_type="GTD",
+                    expires_at=control.armed_until,
+                )
+        except Exception as exc:
+            return self._batch_errors(
+                items,
+                f"signed batch was not fully persisted: {type(exc).__name__}",
+            )
+
+        if not await self._batch_gate_is_current(
+            fencing_token=fencing_token,
+            control_version=control.version,
+            items=items,
+        ):
+            return self._batch_rejected(
+                items,
+                "worker lease, runtime control, or book changed after batch signing",
+            )
+        try:
+            for intent in intents:
+                await self.store.mark_order_submitting(
+                    intent.intent_hash,
+                    intent.account_id,
+                    fencing_token,
+                    control_version=control.version,
+                )
+        except Exception as exc:
+            return self._batch_errors(
+                items,
+                f"durable batch submitting transition failed: {type(exc).__name__}",
+            )
+        if not await self._batch_gate_is_current(
+            fencing_token=fencing_token,
+            control_version=control.version,
+            items=items,
+        ):
+            return self._batch_rejected(
+                items,
+                "worker lease, runtime control, or book changed before batch post",
+            )
+
+        try:
+            raw_responses = await asyncio.to_thread(self.client.post_orders, signed_orders)
+            responses = list(raw_responses)
+        except Exception as exc:
+            cancellation = "verified"
+            try:
+                await self.cancel_all("ambiguous live batch submission")
+            except Exception:
+                cancellation = "FAILED"
+            return self._batch_errors(
+                items,
+                (
+                    f"ambiguous batch post ({type(exc).__name__}); no blind retry; "
+                    f"cancel-all {cancellation}"
+                ),
+            )
+        if len(responses) != len(items):
+            cancellation = False
+            try:
+                cancellation = await self.cancel_all("malformed batch response")
+            except Exception:
+                pass
+            return self._batch_errors(
+                items,
+                "batch response count mismatch; cancellation "
+                + ("verified" if cancellation else "unverified"),
+            )
+        if any(
+            bool(getattr(response, "ok", False))
+            and not str(getattr(response, "order_id", ""))
+            for response in responses
+        ):
+            cancellation = False
+            try:
+                cancellation = await self.cancel_all("accepted batch response missing order id")
+            except Exception:
+                pass
+            return self._batch_errors(
+                items,
+                "accepted batch response omitted order id; cancellation "
+                + ("verified" if cancellation else "unverified"),
+            )
+
+        runtime_current = await self._batch_gate_is_current(
+            fencing_token=fencing_token,
+            control_version=control.version,
+            items=items,
+        )
+        accepted_ids = [
+            str(getattr(response, "order_id", ""))
+            for response in responses
+            if bool(getattr(response, "ok", False))
+            and str(getattr(response, "order_id", ""))
+        ]
+        mixed = bool(accepted_ids) and len(accepted_ids) != len(responses)
+        cancellation_verified = False
+        if not runtime_current or mixed:
+            try:
+                cancellation_verified = await self.cancel_orders(
+                    accepted_ids,
+                    "runtime changed or batch legs were only partially accepted",
+                )
+            except Exception:
+                cancellation_verified = False
+
+        results: list[ExecutionResult] = []
+        for (intent, _), response in zip(items, responses, strict=True):
+            response_ok = bool(getattr(response, "ok", False))
+            order_id = str(getattr(response, "order_id", "")) or None
+            raw = {
+                **self._response_trace(response),
+                "order_type": "GTD",
+                "expires_at": control.armed_until.isoformat(),
+                "batch_non_atomic": True,
+            }
+            if response_ok and (not runtime_current or mixed):
+                result = ExecutionResult(
+                    intent_hash=intent.intent_hash,
+                    status=ExecutionStatus.ERROR,
+                    order_id=order_id,
+                    message=(
+                        "batch leg accepted independently; targeted cancellation "
+                        + (
+                            "left no open order, but fill race remains ambiguous; "
+                            "freeze and reconcile"
+                            if cancellation_verified
+                            else "unverified; freeze group and reconcile immediately"
+                        )
+                    ),
+                    raw=raw,
+                )
+            elif response_ok:
+                result = ExecutionResult(
+                    intent_hash=intent.intent_hash,
+                    status=ExecutionStatus.ACCEPTED,
+                    order_id=order_id,
+                    message=(
+                        "batch leg accepted independently; no atomic pair-fill guarantee"
+                    ),
+                    raw=raw,
+                )
+            else:
+                result = ExecutionResult(
+                    intent_hash=intent.intent_hash,
+                    status=ExecutionStatus.REJECTED,
+                    message=str(getattr(response, "message", "batch leg rejected")),
+                    raw={
+                        **raw,
+                        "code": str(getattr(response, "code", "unknown")),
+                    },
+                )
+            try:
+                await self.store.save_execution(result, intent.account_id)
+            except Exception as exc:
+                result = ExecutionResult(
+                    intent_hash=intent.intent_hash,
+                    status=ExecutionStatus.ERROR,
+                    order_id=result.order_id,
+                    message=(
+                        "CLOB batch replied but durable response save failed: "
+                        f"{type(exc).__name__}"
+                    ),
+                    raw=result.raw,
+                )
+            results.append(result)
+        return results
+
+    async def cancel_order(self, order_id: str, reason: str) -> bool:
+        if not order_id:
+            raise ValueError("order_id is required")
+        await asyncio.to_thread(self.client.cancel_order, order_id=order_id)
+        return await self._verify_orders_absent({order_id}, reason)
+
+    async def cancel_orders(self, order_ids: Sequence[str], reason: str) -> bool:
+        unique = tuple(dict.fromkeys(order_id for order_id in order_ids if order_id))
+        if not unique:
+            return True
+        await asyncio.to_thread(self.client.cancel_orders, order_ids=unique)
+        return await self._verify_orders_absent(set(unique), reason)
+
     async def cancel_all(self, reason: str) -> bool:
         await asyncio.to_thread(self.client.cancel_all)
         for delay in (0.0, 0.2, 0.5):
@@ -523,6 +878,147 @@ class PolymarketBroker:
                 )
             ],
         }
+
+    @staticmethod
+    def _serialize_signed_order(signed_order: Any) -> bytes:
+        if attrs.has(type(signed_order)):
+            payload = attrs.asdict(signed_order)
+        else:
+            payload = {
+                name: getattr(signed_order, name)
+                for name in (
+                    "builder",
+                    "expiration",
+                    "maker",
+                    "maker_amount",
+                    "metadata",
+                    "order_type",
+                    "post_only",
+                    "salt",
+                    "side",
+                    "signature",
+                    "signature_type",
+                    "signer",
+                    "taker_amount",
+                    "timestamp",
+                    "token_id",
+                )
+                if hasattr(signed_order, name)
+            }
+        return json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode()
+
+    def _validate_post_only_submission(
+        self,
+        intent: TradeIntent,
+        book: OrderBookSnapshot,
+    ) -> str | None:
+        if book.market_id != intent.market_id or book.token_id != intent.token_id:
+            return "intent/order-book identity mismatch"
+        if intent.price % book.tick_size != 0:
+            return "intent price is off the current tick grid"
+        if intent.size < book.minimum_order_size:
+            return "intent is below the current minimum order size"
+        if self._book_is_stale(book):
+            return "order book exceeded the live executor age limit"
+        if (
+            book.best_bid is not None
+            and book.best_ask is not None
+            and book.best_bid >= book.best_ask
+        ):
+            return "post-only submission rejected a locked or crossed order book"
+        if intent.side is Side.BUY:
+            if book.best_ask is None:
+                return "post-only buy requires a visible best ask"
+            if intent.price >= book.best_ask:
+                return "post-only buy would cross or lock the best ask"
+        else:
+            if book.best_bid is None:
+                return "post-only sell requires a visible best bid"
+            if intent.price <= book.best_bid:
+                return "post-only sell would cross or lock the best bid"
+        return None
+
+    def _encrypt_signed_order(self, intent: TradeIntent, serialized: bytes) -> bytes:
+        return self.cipher.encrypt(
+            serialized,
+            EncryptionContext(
+                account_id=intent.account_id,
+                purpose="signed-order",
+                object_id=intent.intent_hash,
+                key_version=self.settings.payload_key_version,
+            ),
+        )
+
+    async def _batch_gate_is_current(
+        self,
+        *,
+        fencing_token: int,
+        control_version: int,
+        items: Sequence[tuple[TradeIntent, OrderBookSnapshot]],
+    ) -> bool:
+        if self._lease_guard is None or await self._lease_guard() != fencing_token:
+            return False
+        control = await self.store.get_runtime_control(self.settings.account_id)
+        if (
+            not control.is_live_armed
+            or control.mode is not self.settings.mode
+            or control.version != control_version
+        ):
+            return False
+        return all(
+            self._validate_post_only_submission(intent, book) is None
+            for intent, book in items
+        )
+
+    async def _verify_orders_absent(self, order_ids: set[str], reason: str) -> bool:
+        for delay in (0.0, 0.2, 0.5):
+            if delay:
+                await asyncio.sleep(delay)
+            open_orders = await asyncio.to_thread(
+                lambda: list(self.client.list_open_orders().iter_items())
+            )
+            remaining = {
+                str(getattr(order, "id", None) or getattr(order, "order_id", ""))
+                for order in open_orders
+            }
+            if order_ids.isdisjoint(remaining):
+                return True
+        raise RuntimeError(
+            f"targeted cancellation verification failed ({reason}): orders remain"
+        )
+
+    @staticmethod
+    def _batch_rejected(
+        items: Sequence[tuple[TradeIntent, OrderBookSnapshot]],
+        message: str,
+    ) -> list[ExecutionResult]:
+        return [
+            ExecutionResult(
+                intent_hash=intent.intent_hash,
+                status=ExecutionStatus.REJECTED,
+                message=message,
+            )
+            for intent, _ in items
+        ]
+
+    @staticmethod
+    def _batch_errors(
+        items: Sequence[tuple[TradeIntent, OrderBookSnapshot]],
+        message: str,
+    ) -> list[ExecutionResult]:
+        return [
+            ExecutionResult(
+                intent_hash=intent.intent_hash,
+                status=ExecutionStatus.ERROR,
+                message=message,
+            )
+            for intent, _ in items
+        ]
 
     def _book_is_stale(self, book: OrderBookSnapshot) -> bool:
         age = (datetime.now(UTC) - book.captured_at).total_seconds()

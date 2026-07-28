@@ -60,6 +60,79 @@ def test_live_api_component_does_not_require_signer_secrets() -> None:
     assert settings.polymarket_private_key is None
 
 
+def test_control_api_rejects_accidentally_injected_signer_secrets() -> None:
+    with pytest.raises(ValidationError, match="control API must not receive signer secrets"):
+        Settings(
+            _env_file=None,
+            component="api",
+            polymarket_private_key="0xdeadbeef",
+            signed_payload_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        )
+
+
+def test_control_api_rejects_worker_only_provider_and_decryption_secrets() -> None:
+    with pytest.raises(ValidationError, match="OPENAI_API_KEY"):
+        Settings(
+            _env_file=None,
+            component="api",
+            openai_api_key="sk-must-live-in-worker",
+        )
+
+    with pytest.raises(ValidationError, match="CREDENTIAL_PRIVATE_KEY_PEM"):
+        Settings(
+            _env_file=None,
+            component="api",
+            credential_private_key_pem="worker-only-private-key",
+        )
+
+
+def test_tenant_queue_worker_uses_encrypted_tenant_inputs_instead_of_global_keys() -> None:
+    settings = Settings(
+        _env_file=None,
+        mode="canary",
+        component="worker",
+        worker_execution_model="tenant_queue",
+        live_ack=LIVE_ACK_TEXT,
+        beta_sdk_ack=BETA_SDK_ACK_TEXT,
+        dedicated_wallet_ack=DEDICATED_WALLET_ACK_TEXT,
+        signed_payload_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        credential_private_key_pem="worker-only-private-key",
+        supabase_url="https://example.supabase.co",
+        supabase_service_role_key="service-role-test",
+    )
+
+    assert settings.polymarket_private_key is None
+    assert settings.openai_api_key is None
+    assert settings.worker_execution_model == "tenant_queue"
+
+
+def test_validated_copy_reapplies_endpoint_security_validation() -> None:
+    settings = Settings(_env_file=None)
+
+    with pytest.raises(ValidationError, match="remote.*HTTPS"):
+        settings.validated_copy(
+            ai_provider="litellm",
+            litellm_api_key="third-party-key",
+            litellm_base_url="http://gateway.example/v1",
+        )
+
+
+def test_dashboard_origins_are_exact_origins_without_paths_or_wildcards() -> None:
+    settings = Settings(
+        _env_file=None,
+        dashboard_origins=(
+            "https://dashboard.example, https://dashboard.example/, "
+            "https://dashboard.example/path, http://localhost:3000, "
+            "http://remote.example, https://*.example"
+        ),
+    )
+
+    assert settings.allowed_dashboard_origins == [
+        "https://dashboard.example",
+        "http://localhost:3000",
+    ]
+
+
 def test_canary_worker_accepts_one_litellm_key_and_derives_wallet() -> None:
     settings = Settings(
         _env_file=None,

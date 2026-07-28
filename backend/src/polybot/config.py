@@ -78,6 +78,10 @@ class Settings(BaseSettings):
 
     mode: TradingMode = TradingMode.PAPER
     component: Literal["all", "api", "worker"] = "all"
+    worker_execution_model: Literal["single_account", "tenant_queue"] = "single_account"
+    tenant_worker_max_concurrency: int = Field(default=4, ge=1, le=32)
+    tenant_job_lease_seconds: int = Field(default=60, ge=10, le=300)
+    tenant_job_poll_seconds: float = Field(default=1.0, gt=0, le=30)
     account_id: str = "00000000-0000-0000-0000-000000000001"
     log_level: str = "INFO"
     api_host: str = "0.0.0.0"
@@ -142,6 +146,10 @@ class Settings(BaseSettings):
     )
     signed_payload_key: SecretStr | None = None
     payload_key_version: int = Field(default=1, ge=1)
+    credential_public_key_pem: SecretStr | None = None
+    credential_private_key_pem: SecretStr | None = None
+    credential_private_keys_json: SecretStr | None = None
+    credential_fingerprint_key: SecretStr | None = None
     geoblock_url: str = OFFICIAL_GEOBLOCK_URL
     auto_redeem_resolved: bool = False
     live_ack: str = ""
@@ -152,11 +160,36 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_live_configuration(self) -> Settings:
+        if self.component == "api":
+            forbidden = {
+                "POLYMARKET_PRIVATE_KEY": self.polymarket_private_key,
+                "POLYBOT_SIGNED_PAYLOAD_KEY": self.signed_payload_key,
+                "POLYBOT_CREDENTIAL_PRIVATE_KEY_PEM": self.credential_private_key_pem,
+                "POLYBOT_CREDENTIAL_PRIVATE_KEYS_JSON": (
+                    self.credential_private_keys_json
+                ),
+                "OPENAI_API_KEY": self.openai_api_key,
+                "LITELLM_API_KEY": self.litellm_api_key,
+            }
+            exposed = [
+                name
+                for name, value in forbidden.items()
+                if value is not None and bool(value.get_secret_value())
+            ]
+            if exposed:
+                raise ValueError(
+                    "control API must not receive signer secrets: " + ", ".join(exposed)
+                )
         if self.uses_supabase:
             try:
                 UUID(self.account_id)
             except ValueError as exc:
                 raise ValueError("POLYBOT_ACCOUNT_ID must be a Supabase Auth UUID") from exc
+        if self.credential_private_key_pem and self.credential_private_keys_json:
+            raise ValueError(
+                "configure exactly one of POLYBOT_CREDENTIAL_PRIVATE_KEY_PEM "
+                "or POLYBOT_CREDENTIAL_PRIVATE_KEYS_JSON"
+            )
         if self.ai_provider.lower() == "litellm":
             endpoint = _http_endpoint(self.litellm_base_url)
             if endpoint is None:
@@ -169,40 +202,51 @@ class Settings(BaseSettings):
                 missing.append("POLYBOT_LIVE_ACK")
             if self.beta_sdk_ack != BETA_SDK_ACK_TEXT:
                 missing.append("POLYBOT_BETA_SDK_ACK")
+            tenant_queue_worker = (
+                self.component == "worker" and self.worker_execution_model == "tenant_queue"
+            )
             if self.component in {"all", "worker"}:
                 if self.dedicated_wallet_ack != DEDICATED_WALLET_ACK_TEXT:
                     missing.append("POLYBOT_DEDICATED_WALLET_ACK")
-                if self.polymarket_private_key is None:
-                    missing.append("POLYMARKET_PRIVATE_KEY")
                 if self.signed_payload_key is None:
                     missing.append("POLYBOT_SIGNED_PAYLOAD_KEY")
-                if self.evidence_provider == "none":
-                    missing.append("POLYBOT_EVIDENCE_PROVIDER")
-                provider = self.ai_provider.lower()
-                if provider == "mock":
-                    missing.append("POLYBOT_AI_PROVIDER cannot be mock")
-                elif provider == "openai":
-                    if self.openai_api_key is None:
-                        missing.append("OPENAI_API_KEY")
-                elif provider == "litellm":
-                    if self.litellm_api_key is None:
-                        missing.append("LITELLM_API_KEY")
-                    endpoint = _http_endpoint(self.litellm_base_url)
-                    if endpoint is None or endpoint.scheme.lower() != "https":
-                        missing.append("POLYBOT_LITELLM_BASE_URL must use HTTPS")
+                if tenant_queue_worker:
+                    if (
+                        self.credential_private_key_pem is None
+                        and self.credential_private_keys_json is None
+                    ):
+                        missing.append(
+                            "POLYBOT_CREDENTIAL_PRIVATE_KEY_PEM/"
+                            "POLYBOT_CREDENTIAL_PRIVATE_KEYS_JSON"
+                        )
                 else:
-                    missing.append("POLYBOT_AI_PROVIDER")
-                evidence_name = (
-                    "openai_web"
-                    if self.evidence_provider == "auto" and provider == "openai"
-                    else "gdelt"
-                    if self.evidence_provider == "auto" and provider == "litellm"
-                    else self.evidence_provider
-                )
-                if evidence_name == "openai_web" and self.openai_api_key is None:
-                    missing.append("OPENAI_API_KEY for web evidence")
-            if self.component in {"all", "api"} and self.admin_token is None:
-                missing.append("POLYBOT_ADMIN_TOKEN")
+                    if self.polymarket_private_key is None:
+                        missing.append("POLYMARKET_PRIVATE_KEY")
+                    if self.evidence_provider == "none":
+                        missing.append("POLYBOT_EVIDENCE_PROVIDER")
+                    provider = self.ai_provider.lower()
+                    if provider == "mock":
+                        missing.append("POLYBOT_AI_PROVIDER cannot be mock")
+                    elif provider == "openai":
+                        if self.openai_api_key is None:
+                            missing.append("OPENAI_API_KEY")
+                    elif provider == "litellm":
+                        if self.litellm_api_key is None:
+                            missing.append("LITELLM_API_KEY")
+                        endpoint = _http_endpoint(self.litellm_base_url)
+                        if endpoint is None or endpoint.scheme.lower() != "https":
+                            missing.append("POLYBOT_LITELLM_BASE_URL must use HTTPS")
+                    else:
+                        missing.append("POLYBOT_AI_PROVIDER")
+                    evidence_name = (
+                        "openai_web"
+                        if self.evidence_provider == "auto" and provider == "openai"
+                        else "gdelt"
+                        if self.evidence_provider == "auto" and provider == "litellm"
+                        else self.evidence_provider
+                    )
+                    if evidence_name == "openai_web" and self.openai_api_key is None:
+                        missing.append("OPENAI_API_KEY for web evidence")
             if not self.uses_supabase:
                 missing.append("SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY")
             elif not self.supabase_url.lower().startswith("https://"):
@@ -218,6 +262,11 @@ class Settings(BaseSettings):
                 raise ValueError("canary mode hard-caps POLYBOT_MAX_ORDER_USD at 5 pUSD")
         return self
 
+    def validated_copy(self, **updates: object) -> Settings:
+        """Rebuild settings through validation instead of Pydantic's unchecked model_copy."""
+
+        return type(self).model_validate({**self.model_dump(), **updates})
+
     @property
     def uses_supabase(self) -> bool:
         return bool(
@@ -228,12 +277,19 @@ class Settings(BaseSettings):
 
     @property
     def allowed_dashboard_origins(self) -> list[str]:
-        origins = [item.strip().rstrip("/") for item in self.dashboard_origins.split(",")]
-        return [
-            origin
-            for origin in origins
-            if origin.startswith("https://") or origin.startswith("http://localhost:")
-        ]
+        result: list[str] = []
+        for item in self.dashboard_origins.split(","):
+            endpoint = _http_endpoint(item.strip())
+            if (
+                endpoint is None
+                or endpoint.path not in {"", "/"}
+                or (endpoint.scheme.lower() != "https" and not _is_local_endpoint(endpoint))
+            ):
+                continue
+            origin = f"{endpoint.scheme.lower()}://{endpoint.netloc}".rstrip("/")
+            if origin not in result:
+                result.append(origin)
+        return result
 
 
 @lru_cache(maxsize=1)

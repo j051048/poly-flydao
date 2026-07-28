@@ -1,156 +1,169 @@
 # 部署手册：Vercel + Zeabur + Supabase
 
-> 当前交付可直接用于本地回测、paper 和 shadow。`canary/live` 代码路径具备多重硬锁，但尚未完成真实资金 canary 验收，因此不得直接扩大资金。
+生产拓扑是一个 Vercel 前端、一个公开 Zeabur API、一个私有 Zeabur Worker，以及一个 Supabase 项目。API 与 Worker 使用同一镜像，但秘密权限完全不同。
 
-## 1. 组件边界
+## 1. 生成内部密钥
 
-生产建议部署三个服务：
-
-1. Vercel：`apps/web` 控制台，只保存公开 API 地址；不放私钥、Supabase service-role key 或管理员令牌。
-2. Zeabur API：同一 Docker 镜像，`SERVICE_ROLE=api`。这是无 signer 的控制面，只读状态并写入短时 arm/kill control。
-3. Zeabur worker：同一镜像，`SERVICE_ROLE=worker`，单副本。只有这里保存钱包私钥，并且只有持有 Supabase fencing lease、健康账户对账流和短时 arm 时才能提交订单。
-
-Supabase 保存市场快照、证据、预测、意图、加密签名单、订单、成交、账户 activity、仓位、日初权益、风险事件、运行控制和 worker lease。新项目依次执行 [0001](../backend/supabase/migrations/0001_initial.sql)、[0002](../backend/supabase/migrations/0002_daily_equity_risk.sql)、[0003](../backend/supabase/migrations/0003_account_activity_ledger.sql)、[0004](../backend/supabase/migrations/0004_reconciliation_state.sql)、[0005](../backend/supabase/migrations/0005_runtime_control_expiry.sql) 和 [0006](../backend/supabase/migrations/0006_order_expiry.sql)；已有项目只执行尚未应用的后续迁移。
-
-## 2. 本地验证
-
-需要 Python 3.11–3.14、uv 和 Node.js 20.9+：
+在可信本地终端运行：
 
 ```powershell
 Set-Location backend
-uv sync --frozen --extra dev --no-editable
-uv run --no-editable ruff check .
-uv run --no-editable pytest
-uv run --no-editable polybot config-check
-uv run --no-editable polybot backtest --input examples/backtest_sample.jsonl
-uv run --no-editable polybot generate-secrets
+uv sync --frozen
+uv run --frozen polybot generate-secrets
 ```
 
-`--no-editable` 是刻意的：它兼容 Windows/Python 3.11 的非 ASCII 项目路径；源码变化后用 `uv sync --frozen --extra dev --no-editable --reinstall-package polybot` 刷新已安装包。
+输出不会自动写文件。分别保存：
 
-可选 Nautilus 离线研究环境：
+- API：`POLYBOT_CREDENTIAL_PUBLIC_KEY_PEM`、`POLYBOT_CREDENTIAL_FINGERPRINT_KEY`
+- Worker：`POLYBOT_CREDENTIAL_PRIVATE_KEY_PEM`、`POLYBOT_SIGNED_PAYLOAD_KEY`
+- Worker 实盘硬锁确认值：三个 `*_ACK`
 
-```powershell
-Set-Location backend
-uv sync --frozen --extra research --no-editable
-uv run --no-editable polybot research-runtime
+公钥和私钥必须来自同一次生成。私钥、签名 payload key、Supabase service role 不能进入 Vercel、Git、日志或公开 API。
+
+## 2. Supabase
+
+1. 创建 Supabase 项目。
+2. 确保 Auth access token 使用后端支持的非对称签名算法：RS256 或 ES256，并有可访问的 JWKS；本项目拒绝 HS256 共享密钥 token。
+3. 按顺序执行：
+
+```text
+backend/supabase/migrations/0001_initial.sql
+...
+backend/supabase/migrations/0010_atomic_tenant_submission_gate.sql
 ```
 
-启动本地 API 和 worker：
+4. 在 Auth 中配置站点 URL、Vercel 登录回调 URL和邮件验证回调：
 
-```powershell
-Set-Location backend
-uv run --no-editable uvicorn polybot.api:app --host 127.0.0.1 --port 8080
-uv run --no-editable python -m polybot.worker
+```text
+https://YOUR_VERCEL_DOMAIN/auth/callback
 ```
 
-安全默认值为 `POLYBOT_MODE=paper`、`POLYBOT_AI_PROVIDER=mock`，不会提交真实订单。
+5. 为真实资金账户启用 TOTP MFA。前端写入/撤销 AI Key、导入/撤销钱包、启用自动实盘和 arm 都要求 AAL2。
 
-## 3. Supabase
+迁移启用了 RLS/FORCE RLS。浏览器只有 owner-read 元数据；密文写入、任务领取、钱包生命周期和订单状态变更只能通过受限 RPC。
 
-1. 新建项目和一个对应 `POLYBOT_ACCOUNT_ID` 的 Auth 用户。
-2. 按文件名顺序运行 `backend/supabase/migrations/0001`–`0006`；`0004` 为消失订单的两次确认保存持久状态，`0005` 用数据库时钟和 CAS 保证 arm 到期必须先撤单再重新授权，`0006` 保存交易所侧 GTD 到期时间。
-3. 仅把 `SUPABASE_URL` 和 `SUPABASE_SERVICE_ROLE_KEY` 放进 Zeabur API/worker；绝不放入 Vercel 的 `NEXT_PUBLIC_*`。
-4. 迁移启用了 RLS：认证用户只有 owner-read，浏览器没有写策略；service role 执行可信服务写入。
-5. signer worker 的 `POLYBOT_SIGNED_PAYLOAD_KEY` 必须是独立 Fernet key；数据库只保存 ciphertext，密钥不进入数据库/API/Vercel。
+## 3. Zeabur Control API
 
-首次应用迁移后，用 service-role 身份验证 `/health` 返回 200。启动预检会验证目标 Auth user、`0002`–`0004`/`0006` 的关键列和 `0005` 的 expiry RPC；账户 UUID、迁移或 service-role 权限错误会返回 503，worker 会在三次有界重试后非零退出，而不是无限伪健康重试。
-
-## 4. Zeabur：两个服务
-
-在 Zeabur 分别创建 API 和 worker 两个 Git 服务，并把两者的 **Root Directory 都设为 `backend`**。Zeabur 随后会在该目录发现 [Dockerfile](../backend/Dockerfile) 与 `zeabur.json`；不要使用仓库根目录作为 Docker build context，也不要在根目录保留第二份后端配置。镜像以非 root 用户运行，`backend/uv.lock` 是冻结依赖来源。
-
-### API 服务（无 signer）
+从 GitHub 仓库创建服务，Root Directory 设置为 `backend`，公开 HTTPS 域名。环境变量：
 
 ```dotenv
 SERVICE_ROLE=api
-POLYBOT_MODE=canary
-POLYBOT_ACCOUNT_ID=<supabase-auth-user-uuid>
-POLYBOT_LIVE_ACK=I_UNDERSTAND_REAL_FUNDS_CAN_BE_LOST
-POLYBOT_BETA_SDK_ACK=I_ACCEPT_BETA_SDK_CANARY_ONLY
-POLYBOT_ADMIN_TOKEN=<long-random-secret>
-POLYBOT_DASHBOARD_ORIGINS=https://your-dashboard.vercel.app
-POLYBOT_AI_PROVIDER=mock
-SUPABASE_URL=...
+POLYBOT_MODE=paper
+POLYBOT_DASHBOARD_ORIGINS=https://YOUR_VERCEL_DOMAIN
+
+SUPABASE_URL=https://PROJECT_REF.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=...
+
+POLYBOT_CREDENTIAL_PUBLIC_KEY_PEM=-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----
+POLYBOT_CREDENTIAL_KEY_VERSION=1
+POLYBOT_CREDENTIAL_FINGERPRINT_KEY=...
 ```
 
-API 服务不需要、也不应拥有 `POLYMARKET_PRIVATE_KEY`、deposit wallet 或 signed-payload key。
+可选显式 JWT 配置：
 
-### worker 服务（唯一 signer）
+```dotenv
+POLYBOT_SUPABASE_JWT_ISSUER=https://PROJECT_REF.supabase.co/auth/v1
+POLYBOT_SUPABASE_JWT_AUDIENCE=authenticated
+POLYBOT_SUPABASE_JWKS_URL=https://PROJECT_REF.supabase.co/auth/v1/.well-known/jwks.json
+```
+
+API 服务禁止出现：
+
+```text
+POLYBOT_CREDENTIAL_PRIVATE_KEY_PEM
+POLYBOT_CREDENTIAL_PRIVATE_KEYS_JSON
+POLYBOT_SIGNED_PAYLOAD_KEY
+POLYMARKET_PRIVATE_KEY
+OPENAI_API_KEY
+LITELLM_API_KEY
+```
+
+健康检查：
+
+```text
+GET /livez
+GET /health
+```
+
+`/health` 必须返回 200。生产缺少 Supabase 时控制面会 fail closed，不会回退到内存状态。
+
+## 4. Zeabur Tenant Worker
+
+从同一仓库再创建一个服务，Root Directory 同样为 `backend`。不要绑定公网域名，初期保持单副本：
 
 ```dotenv
 SERVICE_ROLE=worker
+POLYBOT_COMPONENT=worker
+POLYBOT_WORKER_EXECUTION_MODEL=tenant_queue
 POLYBOT_MODE=canary
-POLYBOT_ACCOUNT_ID=<same-uuid>
+
+SUPABASE_URL=https://PROJECT_REF.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=...
+
+POLYBOT_CREDENTIAL_PRIVATE_KEY_PEM=-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----
+POLYBOT_CREDENTIAL_KEY_VERSION=1
+POLYBOT_SIGNED_PAYLOAD_KEY=...
+POLYBOT_PAYLOAD_KEY_VERSION=1
+
+POLYBOT_TENANT_WORKER_MAX_CONCURRENCY=4
+POLYBOT_TENANT_JOB_LEASE_SECONDS=60
+POLYBOT_TENANT_JOB_POLL_SECONDS=1
+
 POLYBOT_LIVE_ACK=I_UNDERSTAND_REAL_FUNDS_CAN_BE_LOST
 POLYBOT_BETA_SDK_ACK=I_ACCEPT_BETA_SDK_CANARY_ONLY
 POLYBOT_DEDICATED_WALLET_ACK=I_CONFIRM_DEDICATED_WALLET_NO_EXTERNAL_FLOWS
-POLYBOT_MAX_ORDER_USD=5
-POLYBOT_AI_PROVIDER=litellm
-POLYBOT_EVIDENCE_PROVIDER=auto
-LITELLM_API_KEY=<one-third-party-ai-key>
-POLYBOT_LITELLM_BASE_URL=https://your-provider.example/v1
-POLYBOT_FORECAST_MODEL=<provider-model>
-POLYBOT_CRITIC_MODEL=<provider-model>
-SUPABASE_URL=...
-SUPABASE_SERVICE_ROLE_KEY=...
-POLYMARKET_PRIVATE_KEY=...
-# 可选；留空时官方 SDK 自动派生/部署默认 Deposit Wallet
-POLYMARKET_DEPOSIT_WALLET=
-POLYBOT_SIGNED_PAYLOAD_KEY=<fernet-key>
-POLYBOT_PAYLOAD_KEY_VERSION=1
 POLYBOT_AUTO_REDEEM_RESOLVED=false
 ```
 
-worker 必须保持单副本；数据库 lease 是第二道保护，而不是允许随意水平扩容。worker 每 2 秒观察持久化的 `cancellation_pending`，验证 cancel-all 后用版本 CAS 确认完成；确认前数据库拒绝重新 arm。失去 lease、对账健康或数据库健康时也会尝试 cancel-all 并验证开放订单为零。
+不要配置全局 AI key 或全局钱包私钥。Tenant Worker 会根据任务中的账户引用解密该账户自己的凭证，并创建一次性运行时。
 
-`POLYBOT_DEDICATED_WALLET_ACK` 是运行时硬门，不是检测能力：Polymarket 账户接口不能可靠归因 pUSD 存取款、奖励和任意 token transfer。必须在**首次 worker 启动前**完成唯一一次启动入金，之后禁止外部存取款、人工 token transfer、split/merge/conversion 和人工交易。系统会对可见的成交、仓位与 REDEEM activity 做核对，但不能声称识别所有外部现金流；违反约束会使日初权益/结算损失指标失真。
-
-`POLYBOT_EVIDENCE_PROVIDER=auto` 在 LiteLLM 模式使用 GDELT Context 2.0 的近 72 小时同句 snippet，因此不需要第二个搜索 key。只有 snippet 非空且查询词确实出现在返回的 matching sentence 中才保留可计数 URL；market resolution source 与 title-only lead 不计数。不足两个独立可注册发布域名时不会交易。GDELT 的 429、5xx、断连和畸形响应会缓存退避并关闭证据门。若第三方 endpoint 只支持普通 Chat Completions 而不支持原生 `json_schema`，provider 只对 LiteLLM 明确的 400/422 capability mismatch 回退一次并缓存该模型能力，随后仍用本地 schema 严格校验；鉴权、限流、超时、内容策略和网络错误不重试。
+Worker 与任务都有数据库 fencing lease。即使滚动部署短暂出现两个副本，旧副本也不能通过最终订单闸门；但仍建议单副本，确认稳定后再评估水平扩展。
 
 ## 5. Vercel
 
-项目 Root Directory 设为 `apps/web`，唯一必需变量：
+Root Directory 设置为 `apps/web`。只配置浏览器可公开值：
 
 ```dotenv
-NEXT_PUBLIC_API_BASE_URL=https://your-api.zeabur.app
+NEXT_PUBLIC_API_BASE_URL=https://YOUR_ZEABUR_API_DOMAIN
+NEXT_PUBLIC_SUPABASE_URL=https://PROJECT_REF.supabase.co
+NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=...
 ```
 
-当前控制台是运维原型：管理员令牌只保存在当前页面 React state，但仍由浏览器直接发送 Bearer token。正式资金前应把 API 放在 SSO/VPN/访问代理后，或实现 Supabase Auth + MFA 的服务端会话代理；不要把管理员令牌写入 Vercel 环境变量或 localStorage。
+也可使用旧的 `NEXT_PUBLIC_SUPABASE_ANON_KEY`，但不要同时误放 `SUPABASE_SERVICE_ROLE_KEY`。
 
-## 6. 健康检查与控制
+生产构建漏配 API 或 Supabase 时仍能成功构建，但界面会禁用认证/操作并 fail closed；不会把 Bearer JWT、邮箱或密码发送到 localhost。
 
-- `GET /livez`：进程 liveness。
-- `GET /health`：Supabase readiness，失败返回 503。
-- `GET /v1/status`：需要管理员 Bearer token。
-- `POST /v1/cycles/run`：只允许 paper/shadow；真实资金周期只能由 leased worker 执行。
-- `POST /v1/control/arm`：canary/live，最长 15 分钟。
-- `POST /v1/control/disarm`：原子写 kill switch 与持久化撤单锁存。无 signer API 会返回 `cancellation_pending_worker=true`，由 worker watcher 撤单并确认；同进程 signer 能立即验证和确认。撤单无法验证时返回 503；锁存清除前 `/arm` 返回 409。
+## 6. 首个租户的启用顺序
 
-示例：
+1. 注册并完成邮箱验证。
+2. 登录，在“系统配置”绑定并验证 TOTP，使当前会话达到 AAL2。
+3. 输入第三方 AI provider、模型 ID 和 API key。密钥只提交一次，之后不回显。
+4. 导入一个全新、低余额、只给机器人使用的 EVM 私钥。绝不能使用主钱包。
+5. 等待 Worker 将钱包从 `pending_verification` 变为 `active`，前端会显示入金地址、chain ID 和 collateral token。
+6. 按显示的网络与 collateral 资产转入一笔可完全承受损失的小额启动资金。
+7. 先选择 `paper`，启用自动周期并观察任务、预测、风险拒绝和账本。
+8. 完成策略验证门槛后切换 `canary`。每次真实运行还需要在控制台以 AAL2 短时 arm；Worker 检测到资金后才执行已明确授权的标准 trading approvals。
+9. 首笔真实订单旁观核对：限价、post-only、GTD 到期、成交、撤单、持仓和 Supabase 账本。
+10. 任何异常立即 disarm。系统会持久化 kill/cancellation latch，并要求 Worker 验证零开放订单后才能重新 arm。
 
-```bash
-curl -X POST https://your-api.example/v1/control/arm \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"mode":"canary","minutes":5}'
+自动周期不等于永久授权。Canary/live 只有在短时 arm、任务和账户租约、配置/风险快照、钱包/凭证状态、对账、余额、allowance、地理限制和盘口新鲜度全部有效时才可能提交订单。
+
+## 7. 部署前验证
+
+```powershell
+Set-Location backend
+uv run --frozen --extra dev ruff check .
+uv run --frozen --extra dev python -m pytest
+uv run --frozen polybot pair-replay --input examples/pair_replay_sample.json
+
+Set-Location ..\apps\web
+npm ci
+npm test
+npm run build
 ```
 
-## 7. 上线顺序
+还必须在临时 Supabase 项目实际执行一次完整 migration reset；纯字符串单测不能替代 PostgreSQL 解析、权限和事务验证。
 
-1. 用 `polybot generate-secrets` 生成 Fernet/admin secret；不要把输出提交到 Git。
-2. 在只临时设置 `POLYMARKET_PRIVATE_KEY` 的安全终端运行 `polybot wallet-info`。官方 SDK 会派生凭据，并在需要时部署默认 Deposit Wallet；该命令不是纯离线查询。
-3. 在首次 worker 启动前，把唯一一笔启动资金转到输出的 `trading_wallet`，再运行 `polybot wallet-bootstrap --confirm-standard-allowances`。这个显式一次性命令调用官方 SDK 建立标准交易授权、等待交易完成并检查 CLOB allowance；不要把 approval 隐式塞进每次下单。
-4. 钱包必须是全新专用钱包：worker 首次启动后不再入金/出金，不做人工交易、token transfer、split/merge/conversion。冷启动会从 epoch 0 重放成交并核对所有 dust 仓位；不一致会停机。若必须追加资金，先 disarm、清零挂单并建立新的人工审计基线；当前版本不提供自动安全重基线。
-5. 本地单测、lint、构建全部通过。
-6. 至少 14 天 paper，使用真实实时行情；修正成本、深度、延迟和数据缺口。
-7. 至少 7 天 shadow；逐笔比较预期成交与真实可成交路径。
-8. 完成冻结样本外与 walk-forward 报告，重点看 Brier、log loss、净 EV、最大回撤，不以胜率单指标决策。
-9. 人工审阅未解决 `unknown/signed/submitting` 订单；这些状态会 fail closed。
-10. canary 仅用可完全损失的小额，单笔硬上限 5 pUSD；首次真实订单人工旁观并核对订单、成交、仓位和取消。
-11. 未达到 [策略验证阶段门](STRATEGY_VALIDATION.md) 前，不切换 `live`，不提高限额。
+## 8. P2 上线门槛
 
-自动赎回默认关闭。代码会把 `REDEEM` 写入 activity ledger、关闭 condition 成本并刷新权益，但启用前仍必须用小额单独验证 relayer/EOA 交易、wait 结果、审计和失败恢复。
-
-真实资金 arm 最长 15 分钟。`0005` 禁止直接续期一个已经过期、尚未完成撤单确认的 arm；worker 用数据库时钟原子转换为 kill/cancellation latch，验证零挂单并完成 CAS acknowledgement 后才允许再次 arm。真实订单同时使用不晚于 `armed_until` 的 GTD 到期时间；剩余授权少于 3.5 分钟时拒绝新签名，因此 worker 离线时交易所仍有第二道到期保护。该安全契约允许进程持续扫描和对账，但不声称支持无人值守、永久授权的真实下单。
+P2 配对策略当前 `research_only=true` 且 `execution_enabled=false`。不能通过环境变量直接解除。只有满足 [策略验证门槛](STRATEGY_VALIDATION.md)，完成单独代码审查和小额 canary 后，才能设计后续 live migration；目前交付不声明可持续优势或保证盈利。

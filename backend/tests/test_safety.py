@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from cryptography.exceptions import InvalidTag
 
 from polybot.brokers.polymarket import PolymarketBroker
 from polybot.config import (
@@ -25,6 +26,7 @@ from polybot.models import (
     utc_now,
 )
 from polybot.stores.memory import MemoryStore
+from polybot.tenant_crypto import EncryptionContext
 
 
 async def test_geoblock_fails_closed_on_malformed_response() -> None:
@@ -43,7 +45,10 @@ class AllowedChecker:
 class FakeSecureClient:
     def __init__(self) -> None:
         self.calls = 0
+        self.batch_calls = 0
+        self.cancelled_order_ids: list[str] = []
         self.order_kwargs: list[dict[str, object]] = []
+        self.approval_calls = 0
 
     def create_limit_order(self, **kwargs):
         self.order_kwargs.append(kwargs)
@@ -75,8 +80,32 @@ class FakeSecureClient:
             transactions_hashes=("0xtx",),
         )
 
+    def post_orders(self, signed_orders):
+        self.batch_calls += 1
+        return tuple(
+            SimpleNamespace(
+                ok=True,
+                order_id=f"batch-order-{index}",
+                status="live",
+                trade_ids=(),
+                transactions_hashes=(),
+            )
+            for index, _ in enumerate(signed_orders)
+        )
+
+    def cancel_order(self, *, order_id):
+        self.cancelled_order_ids.append(order_id)
+        return None
+
+    def cancel_orders(self, *, order_ids):
+        self.cancelled_order_ids.extend(order_ids)
+        return None
+
     def cancel_all(self):
         return None
+
+    def setup_trading_approvals(self):
+        self.approval_calls += 1
 
     def get_balance_allowance(self, **kwargs):
         return SimpleNamespace(balance=10_000_000, allowances={"exchange": 10_000_000})
@@ -110,6 +139,180 @@ def live_settings() -> Settings:
         supabase_url="https://example.supabase.co",
         supabase_service_role_key="service-role-test",
     )
+
+
+def post_only_intent(
+    settings: Settings,
+    *,
+    intent_hash: str,
+    token_id: str,
+    outcome: Outcome,
+    price: Decimal,
+) -> TradeIntent:
+    size = Decimal("2")
+    return TradeIntent(
+        intent_hash=intent_hash,
+        account_id=settings.account_id,
+        run_id="pair-run",
+        mode=TradingMode.CANARY,
+        market_id="m1",
+        event_id="e1",
+        bucket="crypto",
+        token_id=token_id,
+        outcome=outcome,
+        side=Side.BUY,
+        price=price,
+        size=size,
+        notional_usd=size * price,
+        edge_after_costs=Decimal("0.02"),
+        forecast_id=None,
+        strategy="pair_accumulator_v1",
+        post_only=True,
+    )
+
+
+async def test_live_approval_setup_waits_for_funding_and_verifies_allowance() -> None:
+    settings = live_settings()
+    store = MemoryStore()
+
+    class ApprovalClient(FakeSecureClient):
+        def __init__(self, balance: int) -> None:
+            super().__init__()
+            self.balance = balance
+            self.approved = False
+
+        def get_balance_allowance(self, **kwargs):
+            allowance = 10_000_000 if self.approved else 0
+            return SimpleNamespace(
+                balance=self.balance,
+                allowances={"exchange": allowance},
+            )
+
+        def setup_trading_approvals(self):
+            super().setup_trading_approvals()
+            self.approved = True
+
+    await store.set_runtime_control(
+        RuntimeControl(
+            account_id=settings.account_id,
+            mode=TradingMode.CANARY,
+            armed=True,
+            accept_new_intents=True,
+            armed_until=utc_now() + timedelta(minutes=5),
+            kill_switch=False,
+        )
+    )
+    lease = await store.claim_worker_lease(
+        settings.account_id,
+        "approval-test-worker",
+        timedelta(seconds=30),
+    )
+    assert lease is not None
+
+    async def lease_guard() -> int | None:
+        valid = await store.validate_worker_lease(
+            settings.account_id,
+            "approval-test-worker",
+            lease.fencing_token,
+        )
+        return lease.fencing_token if valid else None
+
+    unfunded = PolymarketBroker(
+        settings,
+        store,
+        client=ApprovalClient(0),
+        geoblock=AllowedChecker(),
+    )
+    unfunded.set_execution_guard(lease_guard)
+    with pytest.raises(RuntimeError, match="fund"):
+        await unfunded.ensure_trading_approvals()
+
+    funded_client = ApprovalClient(10_000_000)
+    funded = PolymarketBroker(
+        settings,
+        store,
+        client=funded_client,
+        geoblock=AllowedChecker(),
+    )
+    funded.set_execution_guard(lease_guard)
+    await funded.ensure_trading_approvals()
+    assert funded_client.approval_calls == 1
+
+
+async def test_live_approval_setup_obeys_official_geoblock() -> None:
+    settings = live_settings()
+    store = MemoryStore()
+    client = FakeSecureClient()
+    await store.set_runtime_control(
+        RuntimeControl(
+            account_id=settings.account_id,
+            mode=TradingMode.CANARY,
+            armed=True,
+            accept_new_intents=True,
+            armed_until=utc_now() + timedelta(minutes=5),
+            kill_switch=False,
+        )
+    )
+
+    class BlockedChecker:
+        async def check(self) -> GeoblockResult:
+            return GeoblockResult(False, reason="region unavailable")
+
+    broker = PolymarketBroker(
+        settings,
+        store,
+        client=client,
+        geoblock=BlockedChecker(),
+    )
+
+    async def lease_guard() -> int | None:
+        return 1
+
+    broker.set_execution_guard(lease_guard)
+    with pytest.raises(RuntimeError, match="geoblock"):
+        await broker.ensure_trading_approvals()
+    assert client.approval_calls == 0
+
+
+async def test_live_approval_setup_rechecks_authority_before_broadcast() -> None:
+    settings = live_settings()
+    store = MemoryStore()
+
+    class ApprovalClient(FakeSecureClient):
+        def get_balance_allowance(self, **kwargs):
+            return SimpleNamespace(
+                balance=10_000_000,
+                allowances={"exchange": 0},
+            )
+
+    client = ApprovalClient()
+    await store.set_runtime_control(
+        RuntimeControl(
+            account_id=settings.account_id,
+            mode=TradingMode.CANARY,
+            armed=True,
+            accept_new_intents=True,
+            armed_until=utc_now() + timedelta(minutes=5),
+            kill_switch=False,
+        )
+    )
+    broker = PolymarketBroker(
+        settings,
+        store,
+        client=client,
+        geoblock=AllowedChecker(),
+    )
+    calls = 0
+
+    async def expiring_guard() -> int | None:
+        nonlocal calls
+        calls += 1
+        return 7 if calls == 1 else None
+
+    broker.set_execution_guard(expiring_guard)
+    with pytest.raises(RuntimeError, match="authority changed"):
+        await broker.ensure_trading_approvals()
+    assert client.approval_calls == 0
 
 
 async def test_live_broker_requires_short_lived_arm(yes_book) -> None:
@@ -165,10 +368,230 @@ async def test_live_broker_requires_short_lived_arm(yes_book) -> None:
     assert accepted.status.value == "accepted"
     assert client.calls == 1
     assert intent.intent_hash in store.signed_orders
+    ciphertext = store.signed_orders[intent.intent_hash][1]
+    context = EncryptionContext(
+        account_id=intent.account_id,
+        purpose="signed-order",
+        object_id=intent.intent_hash,
+        key_version=settings.payload_key_version,
+    )
+    assert b'"signature":"0x02"' in broker.cipher.decrypt(ciphertext, context)
+    with pytest.raises(InvalidTag):
+        broker.cipher.decrypt(
+            ciphertext,
+            context.__class__(
+                account_id="22222222-2222-2222-2222-222222222222",
+                purpose=context.purpose,
+                object_id=context.object_id,
+                key_version=context.key_version,
+            ),
+        )
     assert accepted.raw["trade_ids"] == ["trade-1"]
     assert accepted.raw["transaction_hashes"] == ["0xtx"]
     assert accepted.raw["order_type"] == "GTD"
     assert client.order_kwargs[0]["expiration"] > int(utc_now().timestamp()) + 180
+
+
+async def test_live_post_only_pair_uses_non_atomic_sdk_batch(yes_book, no_book) -> None:
+    settings = live_settings()
+    store = MemoryStore()
+    client = FakeSecureClient()
+    broker = PolymarketBroker(settings, store, client=client, geoblock=AllowedChecker())
+    await store.set_runtime_control(
+        RuntimeControl(
+            account_id=settings.account_id,
+            mode=TradingMode.CANARY,
+            armed=True,
+            accept_new_intents=True,
+            armed_until=utc_now() + timedelta(minutes=5),
+            kill_switch=False,
+        )
+    )
+    lease = await store.claim_worker_lease(
+        settings.account_id,
+        "pair-worker",
+        timedelta(seconds=30),
+    )
+    assert lease is not None
+
+    async def lease_guard() -> int | None:
+        valid = await store.validate_worker_lease(
+            settings.account_id,
+            "pair-worker",
+            lease.fencing_token,
+        )
+        return lease.fencing_token if valid else None
+
+    broker.set_execution_guard(lease_guard)
+    results = await broker.submit_batch(
+        [
+            (
+                post_only_intent(
+                    settings,
+                    intent_hash="1" * 64,
+                    token_id="yes-1",
+                    outcome=Outcome.YES,
+                    price=Decimal("0.39"),
+                ),
+                yes_book,
+            ),
+            (
+                post_only_intent(
+                    settings,
+                    intent_hash="2" * 64,
+                    token_id="no-1",
+                    outcome=Outcome.NO,
+                    price=Decimal("0.59"),
+                ),
+                no_book,
+            ),
+        ]
+    )
+    assert [result.status for result in results] == [
+        ExecutionStatus.ACCEPTED,
+        ExecutionStatus.ACCEPTED,
+    ]
+    assert client.batch_calls == 1
+    assert client.calls == 0
+    assert all(call["post_only"] is True for call in client.order_kwargs)
+    assert all(result.raw["batch_non_atomic"] is True for result in results)
+
+
+async def test_post_only_batch_rejects_crossing_leg_before_signing(
+    yes_book,
+    no_book,
+) -> None:
+    settings = live_settings()
+    client = FakeSecureClient()
+    broker = PolymarketBroker(
+        settings,
+        MemoryStore(),
+        client=client,
+        geoblock=AllowedChecker(),
+    )
+    results = await broker.submit_batch(
+        [
+            (
+                post_only_intent(
+                    settings,
+                    intent_hash="3" * 64,
+                    token_id="yes-1",
+                    outcome=Outcome.YES,
+                    price=Decimal("0.40"),
+                ),
+                yes_book,
+            ),
+            (
+                post_only_intent(
+                    settings,
+                    intent_hash="4" * 64,
+                    token_id="no-1",
+                    outcome=Outcome.NO,
+                    price=Decimal("0.59"),
+                ),
+                no_book,
+            ),
+        ]
+    )
+    assert all(result.status is ExecutionStatus.REJECTED for result in results)
+    assert "would cross" in results[0].message
+    assert client.batch_calls == 0
+    assert not client.order_kwargs
+
+
+async def test_targeted_cancel_calls_sdk_and_verifies_absence() -> None:
+    settings = live_settings()
+    client = FakeSecureClient()
+    broker = PolymarketBroker(
+        settings,
+        MemoryStore(),
+        client=client,
+        geoblock=AllowedChecker(),
+    )
+    assert await broker.cancel_order("order-1", "unit test")
+    assert await broker.cancel_orders(["order-2", "order-3"], "unit test")
+    assert client.cancelled_order_ids == ["order-1", "order-2", "order-3"]
+
+
+async def test_mixed_batch_response_cancels_accepted_leg_and_reports_non_atomicity(
+    yes_book,
+    no_book,
+) -> None:
+    class MixedResponseClient(FakeSecureClient):
+        def post_orders(self, signed_orders):
+            self.batch_calls += 1
+            return (
+                SimpleNamespace(
+                    ok=True,
+                    order_id="accepted-leg",
+                    status="live",
+                    trade_ids=(),
+                    transactions_hashes=(),
+                ),
+                SimpleNamespace(
+                    ok=False,
+                    order_id="",
+                    status="rejected",
+                    message="maker constraint",
+                    code="POST_ONLY",
+                    trade_ids=(),
+                    transactions_hashes=(),
+                ),
+            )
+
+    settings = live_settings()
+    store = MemoryStore()
+    client = MixedResponseClient()
+    broker = PolymarketBroker(settings, store, client=client, geoblock=AllowedChecker())
+    await store.set_runtime_control(
+        RuntimeControl(
+            account_id=settings.account_id,
+            mode=TradingMode.CANARY,
+            armed=True,
+            accept_new_intents=True,
+            armed_until=utc_now() + timedelta(minutes=5),
+            kill_switch=False,
+        )
+    )
+    lease = await store.claim_worker_lease(
+        settings.account_id,
+        "mixed-worker",
+        timedelta(seconds=30),
+    )
+    assert lease is not None
+
+    async def lease_guard() -> int | None:
+        return lease.fencing_token
+
+    broker.set_execution_guard(lease_guard)
+    results = await broker.submit_batch(
+        [
+            (
+                post_only_intent(
+                    settings,
+                    intent_hash="5" * 64,
+                    token_id="yes-1",
+                    outcome=Outcome.YES,
+                    price=Decimal("0.39"),
+                ),
+                yes_book,
+            ),
+            (
+                post_only_intent(
+                    settings,
+                    intent_hash="6" * 64,
+                    token_id="no-1",
+                    outcome=Outcome.NO,
+                    price=Decimal("0.59"),
+                ),
+                no_book,
+            ),
+        ]
+    )
+    assert results[0].status is ExecutionStatus.ERROR
+    assert "fill race remains ambiguous" in results[0].message
+    assert results[1].status is ExecutionStatus.REJECTED
+    assert client.cancelled_order_ids == ["accepted-leg"]
 
 
 async def test_live_broker_refuses_order_when_gtd_expiry_is_too_close(yes_book) -> None:

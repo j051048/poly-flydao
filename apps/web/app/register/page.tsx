@@ -1,124 +1,136 @@
 "use client";
 
-import { useState } from "react";
 import Link from "next/link";
-import { supabase } from "../../lib/supabase";
+import { useState } from "react";
+
+import {
+  getSupabaseBrowserClient,
+  isSupabaseBrowserConfigured,
+} from "../../lib/supabase/browser";
+
+type Message = { type: "success" | "error"; text: string };
 
 export default function RegisterPage() {
-  const [formData, setFormData] = useState({
-    username: "",
-    email: "",
-    password: "",
-  });
+  const configured = isSupabaseBrowserConfigured();
+  const [username, setUsername] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
-  const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
+  const [message, setMessage] = useState<Message | null>(
+    configured
+      ? null
+      : {
+          type: "error",
+          text: "Supabase Auth 未配置。控制台仍可构建，但注册功能暂不可用。",
+        },
+  );
 
-  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const { name, value } = e.target;
-    setFormData((prev) => ({ ...prev, [name]: value }));
-  };
+  async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const supabase = getSupabaseBrowserClient();
+    if (!supabase) {
+      setMessage({
+        type: "error",
+        text: "Supabase Auth 未配置，请联系部署管理员。",
+      });
+      return;
+    }
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
     setLoading(true);
     setMessage(null);
-
-    const { data, error } = await supabase.auth.signUp({
-      email: formData.email,
-      password: formData.password,
-      options: {
-        data: {
-          username: formData.username,
+    try {
+      const { error } = await supabase.auth.signUp({
+        email: email.trim(),
+        password,
+        options: {
+          data: { username: username.trim() },
+          emailRedirectTo: `${window.location.origin}/auth/callback`,
         },
-      },
-    });
-
-    setLoading(false);
-
-    if (error) {
-      setMessage({ type: "error", text: error.message });
-    } else {
-      setMessage({ type: "success", text: "注册成功！请检查您的邮箱进行验证（如果后台开启了邮箱验证）。" });
+      });
+      if (error) throw error;
+      setPassword("");
+      setMessage({
+        type: "success",
+        text: "注册成功。请检查邮箱并完成验证，然后返回登录。",
+      });
+    } catch (error) {
+      setMessage({
+        type: "error",
+        text: error instanceof Error ? error.message : "注册请求失败，请稍后重试。",
+      });
+    } finally {
+      setLoading(false);
     }
-  };
+  }
 
   return (
-    <main className="page-shell" style={{ display: "flex", justifyContent: "center", alignItems: "center", minHeight: "calc(100vh - 62px)" }}>
-      <section className="panel controls-panel" style={{ width: "100%", maxWidth: "480px" }}>
-        <div className="section-heading" style={{ justifyContent: "center", marginBottom: "32px" }}>
-          <div style={{ textAlign: "center" }}>
-            <div className="brand-mark" aria-hidden="true" style={{ width: "48px", height: "48px", fontSize: "20px", margin: "0 auto 16px" }}>PM</div>
-            <p className="eyebrow">JOIN US</p>
-            <h2>注册 Polybot</h2>
-          </div>
+    <main className="auth-shell">
+      <section className="panel auth-panel">
+        <div className="auth-heading">
+          <div className="brand-mark" aria-hidden="true">PM</div>
+          <p className="eyebrow">CREATE ACCOUNT</p>
+          <h1>注册 Polybot</h1>
+          <p>每个账户拥有独立的钱包、AI 凭证和风控边界。</p>
         </div>
 
-        <form onSubmit={handleSubmit} style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
-          <div>
-            <label className="field-label" htmlFor="username">用户名</label>
-            <div className="token-row">
-              <input
-                id="username"
-                name="username"
-                type="text"
-                value={formData.username}
-                onChange={handleChange}
-                placeholder="请输入您的用户名"
-                required
-              />
-            </div>
-          </div>
+        <form className="form-stack" onSubmit={handleSubmit}>
+          <label className="form-field" htmlFor="username">
+            <span className="field-label">用户名</span>
+            <input
+              id="username"
+              name="username"
+              type="text"
+              value={username}
+              onChange={(event) => setUsername(event.target.value)}
+              autoComplete="username"
+              required
+            />
+          </label>
 
-          <div>
-            <label className="field-label" htmlFor="email">电子邮箱</label>
-            <div className="token-row">
-              <input
-                id="email"
-                name="email"
-                type="email"
-                value={formData.email}
-                onChange={handleChange}
-                placeholder="name@example.com"
-                required
-              />
-            </div>
-          </div>
+          <label className="form-field" htmlFor="email">
+            <span className="field-label">电子邮箱</span>
+            <input
+              id="email"
+              name="email"
+              type="email"
+              value={email}
+              onChange={(event) => setEmail(event.target.value)}
+              autoComplete="email"
+              required
+            />
+          </label>
 
-          <div>
-            <label className="field-label" htmlFor="password">密码</label>
-            <div className="token-row">
-              <input
-                id="password"
-                name="password"
-                type="password"
-                value={formData.password}
-                onChange={handleChange}
-                placeholder="创建至少 8 位密码"
-                required
-              />
-            </div>
-          </div>
+          <label className="form-field" htmlFor="password">
+            <span className="field-label">密码</span>
+            <input
+              id="password"
+              name="password"
+              type="password"
+              minLength={8}
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              autoComplete="new-password"
+              required
+            />
+          </label>
 
           {message && (
-            <div className={`notice ${message.type === "success" ? "success" : "error"}`}>
+            <div className={`notice ${message.type}`} role="status">
               {message.text}
             </div>
           )}
 
-          <div style={{ marginTop: "12px" }}>
-            <button
-              className="primary-button"
-              type="submit"
-              disabled={loading}
-              style={{ width: "100%", justifyContent: "center", padding: "14px" }}
-            >
-              {loading ? "注册中..." : "创建账号"}
-            </button>
-          </div>
+          <button
+            className="primary-button full-width"
+            type="submit"
+            disabled={!configured || loading}
+          >
+            {loading ? "注册中…" : "创建账户"}
+          </button>
         </form>
 
-        <p className="muted" style={{ textAlign: "center", marginTop: "24px", fontSize: "14px" }}>
-          已有账号？前往 <Link href="/" style={{ color: "var(--green)", textDecoration: "none" }}>控制台</Link> 登录。
+        <p className="auth-switch">
+          已有账户？<Link href="/login">前往登录</Link>
         </p>
       </section>
     </main>

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -208,8 +209,52 @@ def _aggregate_order_fill_payload(
     return payload
 
 
+class TenantScopeError(RuntimeError):
+    """Raised when service-role code attempts to cross its bound account scope."""
+
+
+@dataclass(frozen=True)
+class TenantExecutionFence:
+    """Immutable cycle snapshot required by the final live-order database gate."""
+
+    job_id: str
+    claimed_by: str
+    job_fencing_token: int
+    profile_version: int
+    risk_policy_id: str
+    risk_policy_version: int
+    mode: TradingMode
+
+    def __post_init__(self) -> None:
+        if not self.job_id or not self.claimed_by or not self.risk_policy_id:
+            raise ValueError("tenant execution fence identifiers are required")
+        if min(
+            self.job_fencing_token,
+            self.profile_version,
+            self.risk_policy_version,
+        ) <= 0:
+            raise ValueError("tenant execution fence versions must be positive")
+        if self.mode not in {TradingMode.CANARY, TradingMode.LIVE}:
+            raise ValueError("tenant execution fence is only valid for live modes")
+
+
+def _rpc_boolean(value: Any, function_name: str) -> bool:
+    """Decode PostgREST scalar booleans without treating ``[False]`` as true."""
+
+    if isinstance(value, list):
+        value = value[0] if value else False
+    if isinstance(value, dict):
+        value = value.get(function_name, value.get("ok", value.get("valid", False)))
+    return value is True
+
+
 class SupabaseStore:
-    """Service-role-only state store. No private key is accepted or persisted here."""
+    """Service-role-only, account-bound state store.
+
+    Supabase's service role bypasses row-level security.  Binding the store to a
+    single account and checking every account-bearing call prevents a caller bug
+    from turning that privilege into a cross-tenant confused-deputy issue.
+    """
 
     def __init__(
         self,
@@ -220,7 +265,7 @@ class SupabaseStore:
         client: Client | None = None,
     ):
         self.client = client or create_client(url, service_role_key)
-        self.account_id = account_id
+        self._account_id = account_id
         self._market_ids: dict[str, str] = {}
         self._condition_market_ids: dict[str, str] = {}
         self._condition_event_ids: dict[str, str | None] = {}
@@ -228,6 +273,24 @@ class SupabaseStore:
         self._intents: dict[str, TradeIntent] = {}
         self._fill_ledger_cache: tuple[str, float, FillLedgerSnapshot] | None = None
         self._preflight_complete = False
+        self._tenant_execution_fence: TenantExecutionFence | None = None
+
+    @property
+    def account_id(self) -> str:
+        return self._account_id
+
+    def _require_account(self, account_id: str) -> None:
+        if account_id != self.account_id:
+            raise TenantScopeError(
+                f"store is bound to account {self.account_id}; cross-account access denied"
+            )
+
+    def bind_tenant_execution_fence(self, fence: TenantExecutionFence) -> None:
+        """Bind this one-shot account store to exactly one live cycle job."""
+
+        if self._tenant_execution_fence is not None:
+            raise RuntimeError("tenant execution fence is already bound")
+        self._tenant_execution_fence = fence
 
     async def _execute(self, builder: Any) -> Any:
         return await asyncio.to_thread(builder.execute)
@@ -254,6 +317,9 @@ class SupabaseStore:
                     ("account_risk_state", "risk_day"),
                     ("account_activities", "activity_key"),
                     ("orders", "open_snapshot_miss_count,expires_at"),
+                    ("cycle_jobs", "risk_policy_version"),
+                    ("order_groups", "execution_enabled"),
+                    ("pair_inventory_events", "clob_trade_id"),
                 ):
                     await self._execute(
                         self.client.table(table)
@@ -274,6 +340,28 @@ class SupabaseStore:
                         },
                     )
                 )
+                # A deliberately ineligible mode returns false before touching
+                # data, while proving migration 0010 and its service-role grant.
+                await self._execute(
+                    self.client.rpc(
+                        "mark_tenant_order_submitting",
+                        {
+                            "p_account_id": self.account_id,
+                            "p_intent_hash": "schema-preflight",
+                            "p_worker_fencing_token": 0,
+                            "p_control_version": 0,
+                            "p_job_id": "00000000-0000-0000-0000-000000000000",
+                            "p_claimed_by": "schema-preflight",
+                            "p_job_fencing_token": 0,
+                            "p_profile_version": 0,
+                            "p_risk_policy_id": (
+                                "00000000-0000-0000-0000-000000000000"
+                            ),
+                            "p_risk_policy_version": 0,
+                            "p_mode": "paper",
+                        },
+                    )
+                )
                 self._preflight_complete = True
         except Exception:
             return False
@@ -284,6 +372,7 @@ class SupabaseStore:
             "gamma_market_id": market.id,
             "condition_id": market.condition_id or market.id,
             "event_id": market.event_id,
+            "slug": market.slug,
             "question": market.question,
             "description": market.description,
             "resolution_source": market.resolution_source,
@@ -299,12 +388,18 @@ class SupabaseStore:
             "last_synced_at": market.updated_at.isoformat(),
             "raw_payload": {
                 "category": market.category,
+                "event_slug": market.event_slug,
+                "tags": list(market.tags),
+                "start_at": market.start_at.isoformat() if market.start_at else None,
+                "outcome_labels": [market.yes_label, market.no_label],
                 "resolution_rules": market.resolution_rules,
                 "liquidity_usd": str(market.liquidity_usd),
                 "volume_24h_usd": str(market.volume_24h_usd),
                 "fees_enabled": market.fees_enabled,
                 "fee_rate": str(market.fee_rate),
                 "fee_exponent": str(market.fee_exponent),
+                "fee_taker_only": market.fee_taker_only,
+                "maker_rebate_rate": str(market.maker_rebate_rate),
             },
         }
         response = await self._execute(
@@ -391,6 +486,7 @@ class SupabaseStore:
             )
 
     async def save_forecast(self, forecast: Forecast, account_id: str) -> None:
+        self._require_account(account_id)
         input_hash = hashlib.sha256(
             json.dumps(
                 {
@@ -429,6 +525,7 @@ class SupabaseStore:
         await self._execute(self.client.table("forecasts").insert(payload))
 
     async def forecast_is_fresh(self, market_id: str, account_id: str, max_age: timedelta) -> bool:
+        self._require_account(account_id)
         from polybot.models import utc_now
 
         response = await self._execute(
@@ -444,6 +541,8 @@ class SupabaseStore:
     async def save_risk_decision(
         self, intent: TradeIntent, decision: RiskDecision, account_id: str
     ) -> None:
+        self._require_account(account_id)
+        self._require_account(intent.account_id)
         codes = decision.codes or ["risk_approved"]
         await self._execute(
             self.client.table("risk_events").insert(
@@ -471,6 +570,7 @@ class SupabaseStore:
         )
 
     async def reserve_intent(self, intent: TradeIntent) -> bool:
+        self._require_account(intent.account_id)
         payload = {
             **intent.model_dump(mode="json"),
             "market_id": await self._db_market_id(intent.market_id),
@@ -496,6 +596,7 @@ class SupabaseStore:
         order_type: str = "GTC",
         expires_at: datetime | None = None,
     ) -> None:
+        self._require_account(intent.account_id)
         normalized_order_type = order_type.upper()
         if normalized_order_type == "GTD" and expires_at is None:
             raise ValueError("GTD signed orders require an exchange expiry")
@@ -548,8 +649,42 @@ class SupabaseStore:
                 raise RuntimeError("signed order idempotency conflict") from exc
 
     async def mark_order_submitting(
-        self, intent_hash: str, account_id: str, fencing_token: int
+        self,
+        intent_hash: str,
+        account_id: str,
+        fencing_token: int,
+        *,
+        control_version: int | None = None,
     ) -> None:
+        self._require_account(account_id)
+        fence = self._tenant_execution_fence
+        if fence is not None:
+            if control_version is None:
+                raise RuntimeError("tenant submission requires a runtime-control version")
+            response = await self._execute(
+                self.client.rpc(
+                    "mark_tenant_order_submitting",
+                    {
+                        "p_account_id": account_id,
+                        "p_intent_hash": intent_hash,
+                        "p_worker_fencing_token": fencing_token,
+                        "p_control_version": control_version,
+                        "p_job_id": fence.job_id,
+                        "p_claimed_by": fence.claimed_by,
+                        "p_job_fencing_token": fence.job_fencing_token,
+                        "p_profile_version": fence.profile_version,
+                        "p_risk_policy_id": fence.risk_policy_id,
+                        "p_risk_policy_version": fence.risk_policy_version,
+                        "p_mode": fence.mode.value,
+                    },
+                )
+            )
+            if not _rpc_boolean(response.data, "mark_tenant_order_submitting"):
+                raise RuntimeError(
+                    "tenant job, profile, risk, control, wallet, or lease fence "
+                    "changed before submission"
+                )
+            return
         response = await self._execute(
             self.client.rpc(
                 "mark_order_submitting",
@@ -560,12 +695,13 @@ class SupabaseStore:
                 },
             )
         )
-        if not bool(response.data):
+        if not _rpc_boolean(response.data, "mark_order_submitting"):
             raise RuntimeError(
                 "signed order or its active worker lease was unavailable for submission"
             )
 
     async def save_execution(self, result: ExecutionResult, account_id: str) -> None:
+        self._require_account(account_id)
         intent = self._intents.get(result.intent_hash)
         if intent is None:
             response = await self._execute(
@@ -676,6 +812,7 @@ class SupabaseStore:
             )
 
     async def get_runtime_control(self, account_id: str) -> RuntimeControl:
+        self._require_account(account_id)
         response = await self._execute(
             self.client.table("runtime_controls").select("*").eq("account_id", account_id).limit(1)
         )
@@ -690,6 +827,7 @@ class SupabaseStore:
         return RuntimeControl.model_validate(rows[0])
 
     async def set_runtime_control(self, control: RuntimeControl) -> RuntimeControl:
+        self._require_account(control.account_id)
         payload = control.model_dump(mode="json")
         response = await self._execute(
             self.client.table("runtime_controls").upsert(payload, on_conflict="account_id")
@@ -704,6 +842,7 @@ class SupabaseStore:
         armed_until: datetime,
         expected_version: int,
     ) -> RuntimeControl | None:
+        self._require_account(account_id)
         response = await self._execute(
             self.client.rpc(
                 "arm_runtime_control",
@@ -727,6 +866,7 @@ class SupabaseStore:
         mode: str,
         expected_version: int,
     ) -> RuntimeControl | None:
+        self._require_account(account_id)
         response = await self._execute(
             self.client.rpc(
                 "expire_runtime_control",
@@ -744,6 +884,7 @@ class SupabaseStore:
         return RuntimeControl.model_validate(row)
 
     async def disarm_runtime_control(self, account_id: str, mode: str) -> RuntimeControl:
+        self._require_account(account_id)
         response = await self._execute(
             self.client.rpc(
                 "disarm_runtime_control",
@@ -762,6 +903,7 @@ class SupabaseStore:
     async def acknowledge_runtime_cancellation(
         self, account_id: str, expected_version: int
     ) -> RuntimeControl | None:
+        self._require_account(account_id)
         response = await self._execute(
             self.client.rpc(
                 "acknowledge_runtime_cancellation",
@@ -780,6 +922,7 @@ class SupabaseStore:
     async def claim_worker_lease(
         self, account_id: str, owner_id: str, ttl: timedelta
     ) -> WorkerLease | None:
+        self._require_account(account_id)
         response = await self._execute(
             self.client.rpc(
                 "claim_worker_lease",
@@ -806,6 +949,7 @@ class SupabaseStore:
     async def validate_worker_lease(
         self, account_id: str, owner_id: str, fencing_token: int
     ) -> bool:
+        self._require_account(account_id)
         response = await self._execute(
             self.client.rpc(
                 "validate_worker_lease",
@@ -816,11 +960,12 @@ class SupabaseStore:
                 },
             )
         )
-        return bool(response.data)
+        return _rpc_boolean(response.data, "validate_worker_lease")
 
     async def release_worker_lease(
         self, account_id: str, owner_id: str, fencing_token: int
     ) -> bool:
+        self._require_account(account_id)
         response = await self._execute(
             self.client.rpc(
                 "release_worker_lease",
@@ -831,9 +976,10 @@ class SupabaseStore:
                 },
             )
         )
-        return bool(response.data)
+        return _rpc_boolean(response.data, "release_worker_lease")
 
     async def has_unresolved_live_orders(self, account_id: str) -> bool:
+        self._require_account(account_id)
         unknown = await self._execute(
             self.client.table("orders")
             .select("id")
@@ -857,6 +1003,7 @@ class SupabaseStore:
         account_id: str,
         equity_usd: Decimal,
     ) -> EquityRiskState:
+        self._require_account(account_id)
         response = await self._execute(
             self.client.rpc(
                 "record_equity_state",
@@ -880,11 +1027,13 @@ class SupabaseStore:
         )
 
     async def realized_pnl_since(self, account_id: str, since: datetime) -> Decimal:
+        self._require_account(account_id)
         return (await self.fill_ledger_snapshot(account_id, since)).realized_pnl_usd
 
     async def fill_ledger_snapshot(self, account_id: str, since: datetime) -> FillLedgerSnapshot:
         """Replay complete bot fills into UTC PnL, quantities, and cost basis."""
 
+        self._require_account(account_id)
         since_key = since.isoformat()
         now = asyncio.get_running_loop().time()
         cached = self._fill_ledger_cache
@@ -1021,6 +1170,7 @@ class SupabaseStore:
         return outcomes
 
     async def durable_order_ids(self, candidate_order_ids: set[str], account_id: str) -> set[str]:
+        self._require_account(account_id)
         candidates = sorted(str(value) for value in candidate_order_ids if value)
         durable: set[str] = set()
         for start in range(0, len(candidates), 100):
@@ -1037,6 +1187,7 @@ class SupabaseStore:
         return durable
 
     async def pending_trade_ids(self, account_id: str) -> set[str]:
+        self._require_account(account_id)
         pending: set[str] = set()
         response = await self._execute(
             self.client.table("orders")
@@ -1081,6 +1232,7 @@ class SupabaseStore:
         return pending - terminal
 
     async def reconcile_order(self, update: UserOrderUpdate, account_id: str) -> None:
+        self._require_account(account_id)
         status_map = {
             "LIVE": "live",
             "UNMATCHED": "live",
@@ -1157,6 +1309,7 @@ class SupabaseStore:
     async def reconcile_open_order_snapshot(
         self, open_order_ids: set[str], account_id: str
     ) -> list[OrderReconcileTarget]:
+        self._require_account(account_id)
         response = await self._execute(
             self.client.table("orders")
             .select("clob_order_id,status,open_snapshot_miss_count")
@@ -1180,6 +1333,7 @@ class SupabaseStore:
         return missing
 
     async def confirm_orders_absent(self, clob_order_ids: set[str], account_id: str) -> None:
+        self._require_account(account_id)
         if not clob_order_ids:
             return
         response = await self._execute(
@@ -1227,6 +1381,7 @@ class SupabaseStore:
                 )
 
     async def reconcile_trade(self, update: UserTradeUpdate, account_id: str) -> None:
+        self._require_account(account_id)
         response = await self._execute(
             self.client.table("orders")
             .select(
@@ -1334,6 +1489,7 @@ class SupabaseStore:
     async def reconcile_account_activity(
         self, update: AccountActivityUpdate, account_id: str
     ) -> None:
+        self._require_account(account_id)
         await self._execute(
             self.client.table("account_activities").upsert(
                 {
@@ -1354,6 +1510,7 @@ class SupabaseStore:
     async def reconcile_positions(
         self, positions: list[AccountPositionUpdate], account_id: str
     ) -> None:
+        self._require_account(account_id)
         existing = await self._execute(
             self.client.table("positions")
             .select("outcome_token_id")
@@ -1418,6 +1575,7 @@ class SupabaseStore:
         entity_id: str,
         metadata: dict[str, Any],
     ) -> None:
+        self._require_account(account_id)
         await self._execute(
             self.client.table("audit_events").insert(
                 {
