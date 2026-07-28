@@ -1878,7 +1878,7 @@ revoke all on function public.complete_trading_wallet_revocation(
   uuid, uuid, text, bigint
 ) from public, anon, authenticated;
 revoke all on function public.update_account_runtime_profile(
-  uuid, text, text, uuid, uuid, uuid, text, boolean, integer
+  uuid, bigint, text, text, uuid, uuid, uuid, text, boolean, integer
 ) from public, anon, authenticated;
 revoke all on function public.enqueue_cycle_job(
   uuid, text, text, uuid, uuid, uuid, timestamptz
@@ -1926,7 +1926,7 @@ grant execute on function public.complete_trading_wallet_revocation(
   uuid, uuid, text, bigint
 ) to service_role;
 grant execute on function public.update_account_runtime_profile(
-  uuid, text, text, uuid, uuid, uuid, text, boolean, integer
+  uuid, bigint, text, text, uuid, uuid, uuid, text, boolean, integer
 ) to service_role;
 grant execute on function public.enqueue_cycle_job(
   uuid, text, text, uuid, uuid, uuid, timestamptz
