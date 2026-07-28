@@ -54,6 +54,7 @@ class AIProvider(StrEnum):
     ANTHROPIC = "anthropic"
     OPENROUTER = "openrouter"
     LITELLM = "litellm"
+    CUSTOM = "custom"
     MOCK = "mock"
 
 

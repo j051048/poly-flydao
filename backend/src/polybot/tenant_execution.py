@@ -92,6 +92,7 @@ class TenantRuntimeExecutor:
                 job=job,
                 provider=profile.ai_provider,
                 model=profile.forecast_model,
+                ai_base_url=profile.ai_base_url,
                 ai_secret=ai_secret,
                 signer_secret=signer_secret,
                 wallet_address=wallet_address,
@@ -219,6 +220,7 @@ class TenantRuntimeExecutor:
         job: CycleJob,
         provider: AIProvider,
         model: str,
+        ai_base_url: str | None,
         ai_secret: bytearray | None,
         signer_secret: bytearray | None,
         wallet_address: str | None,
@@ -255,6 +257,16 @@ class TenantRuntimeExecutor:
             updates["litellm_api_key"] = SecretStr(_decode_ai_secret(ai_secret))
             if provider in _PROVIDER_ENDPOINTS:
                 updates["litellm_base_url"] = _PROVIDER_ENDPOINTS[provider]
+        elif provider is AIProvider.CUSTOM:
+            if not ai_base_url:
+                raise TenantJobExecutionError(
+                    "custom_provider_missing_base_url", retryable=False
+                )
+            updates["ai_provider"] = "litellm"
+            updates["evidence_provider"] = "auto"
+            updates["openai_api_key"] = None
+            updates["litellm_api_key"] = SecretStr(_decode_ai_secret(ai_secret))
+            updates["litellm_base_url"] = ai_base_url
         elif provider is AIProvider.MOCK and job.mode in {
             TradingMode.PAPER,
             TradingMode.SHADOW,

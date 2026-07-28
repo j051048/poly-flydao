@@ -131,6 +131,8 @@ async def test_import_verify_use_and_revoke_wallet_lifecycle_is_fenced() -> None
         fencing_token=claim.lifecycle_fencing_token,
         signer_address="0x" + ("1" * 40),
         deposit_wallet_address="0x" + ("2" * 40),
+        chain_id=137,
+        collateral_token="0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
     )
     assert active is not None and active.status == "active"
     assert (
@@ -175,6 +177,7 @@ async def test_auto_scheduler_and_job_lease_fencing() -> None:
     await repository.update_profile(
         ACCOUNT,
         RuntimeProfilePatch(
+            expected_version=profile.version,
             ai_provider=AIProvider.PLATFORM,
             forecast_model="gpt-5.6-terra",
             risk_policy_id=profile.risk_policy_id,

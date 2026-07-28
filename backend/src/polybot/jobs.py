@@ -41,6 +41,7 @@ class RuntimeProfile(BaseModel):
 
     account_id: UUID
     ai_provider: AIProvider = AIProvider.PLATFORM
+    ai_base_url: str | None = None
     forecast_model: str = "gpt-5.6-terra"
     ai_credential_id: UUID | None = None
     trading_wallet_id: UUID | None = None
@@ -58,6 +59,11 @@ class RuntimeProfile(BaseModel):
 class RuntimeProfilePatch(BaseModel):
     expected_version: int = Field(ge=1)
     ai_provider: AIProvider
+    ai_base_url: str | None = Field(
+        default=None,
+        max_length=256,
+        pattern=r"^https?://[A-Za-z0-9._:/-]+$",
+    )
     forecast_model: str = Field(
         min_length=1,
         max_length=128,
@@ -314,6 +320,7 @@ class SupabaseJobRepository:
                     "p_account_id": account_id,
                     "p_expected_version": patch.expected_version,
                     "p_ai_provider": patch.ai_provider.value,
+                    "p_ai_base_url": patch.ai_base_url,
                     "p_forecast_model": patch.forecast_model,
                     "p_ai_credential_id": (
                         str(patch.ai_credential_id) if patch.ai_credential_id else None
@@ -844,6 +851,7 @@ class InMemoryJobRepository:
         updated = RuntimeProfile(
             account_id=account_id,
             ai_provider=patch.ai_provider,
+            ai_base_url=patch.ai_base_url,
             forecast_model=patch.forecast_model,
             ai_credential_id=patch.ai_credential_id,
             trading_wallet_id=patch.trading_wallet_id,
