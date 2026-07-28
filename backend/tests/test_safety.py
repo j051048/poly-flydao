@@ -242,7 +242,15 @@ async def test_live_approval_setup_waits_for_funding_and_verifies_allowance() ->
 async def test_live_approval_setup_obeys_official_geoblock() -> None:
     settings = live_settings()
     store = MemoryStore()
-    client = FakeSecureClient()
+    class ApprovalClient(FakeSecureClient):
+        def get_balance_allowance(self, **kwargs):
+            from types import SimpleNamespace
+            return SimpleNamespace(
+                balance=10_000_000,
+                allowances={"exchange": 0},
+            )
+
+    client = ApprovalClient()
     await store.set_runtime_control(
         RuntimeControl(
             account_id=settings.account_id,

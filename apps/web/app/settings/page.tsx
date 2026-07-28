@@ -14,6 +14,7 @@ interface CredentialStatus {
   aiConfigured: boolean;
   aiCredentialId?: string;
   provider?: string;
+  aiBaseUrl?: string;
   model?: string;
   keyMask?: string;
   aiStatus?: string;
@@ -26,6 +27,7 @@ interface CredentialStatus {
   desiredMode?: string;
   autoRunEnabled: boolean;
   cycleIntervalSeconds: number;
+  expectedVersion: number;
 }
 
 interface MfaEnrollment {
@@ -108,6 +110,7 @@ function parseCredentialStatus(payload: unknown): CredentialStatus {
     walletStatus: stringValue(wallet.status),
     autoRunEnabled: false,
     cycleIntervalSeconds: 60,
+    expectedVersion: 1,
   };
 }
 
@@ -122,6 +125,7 @@ export default function SettingsPage() {
   const [apiKey, setApiKey] = useState("");
   const [privateKey, setPrivateKey] = useState("");
   const [provider, setProvider] = useState("openrouter");
+  const [baseUrl, setBaseUrl] = useState("");
   const [model, setModel] = useState("");
   const [showAdvancedImport, setShowAdvancedImport] = useState(false);
   const [importConfirmed, setImportConfirmed] = useState(false);
@@ -146,6 +150,7 @@ export default function SettingsPage() {
       const runtimeProfile = record(me.runtime_profile);
       parsed.provider =
         stringValue(runtimeProfile.ai_provider, parsed.provider) ?? "openrouter";
+      parsed.aiBaseUrl = stringValue(runtimeProfile.ai_base_url);
       parsed.model = stringValue(runtimeProfile.forecast_model, parsed.model);
       parsed.aiCredentialId =
         stringValue(runtimeProfile.ai_credential_id, parsed.aiCredentialId);
@@ -160,8 +165,11 @@ export default function SettingsPage() {
         booleanValue(runtimeProfile.auto_run_enabled) ?? false;
       parsed.cycleIntervalSeconds =
         Number(runtimeProfile.cycle_interval_seconds) || 60;
+      parsed.expectedVersion =
+        Number(runtimeProfile.version) || 1;
       setStatus(parsed);
       if (parsed.provider) setProvider(parsed.provider);
+      if (parsed.aiBaseUrl) setBaseUrl(parsed.aiBaseUrl);
       if (parsed.model) setModel(parsed.model);
       setDesiredMode(parsed.desiredMode);
       setAutoRunEnabled(parsed.autoRunEnabled);
@@ -250,7 +258,9 @@ export default function SettingsPage() {
       await apiRequest("/v1/me/runtime-profile", {
         method: "PUT",
         body: {
+          expected_version: status?.expectedVersion ?? 1,
           ai_provider: provider,
+          ai_base_url: provider === "custom" ? baseUrl.trim() || null : null,
           forecast_model: model.trim(),
           ...(credentialId ? { ai_credential_id: credentialId } : {}),
           ...(status?.walletId
@@ -390,7 +400,9 @@ export default function SettingsPage() {
       await apiRequest("/v1/me/runtime-profile", {
         method: "PUT",
         body: {
+          expected_version: status.expectedVersion ?? 1,
           ai_provider: provider,
+          ai_base_url: provider === "custom" ? baseUrl.trim() || null : null,
           forecast_model: model.trim(),
           ai_credential_id: status.aiCredentialId,
           ...(status.walletId ? { trading_wallet_id: status.walletId } : {}),
@@ -522,6 +534,9 @@ export default function SettingsPage() {
 
           <dl className="detail-list credential-status">
             <div><dt>提供商</dt><dd>{status?.provider ?? "—"}</dd></div>
+            {status?.provider === "custom" && (
+              <div><dt>Base URL</dt><dd>{status?.aiBaseUrl ?? "—"}</dd></div>
+            )}
             <div><dt>模型</dt><dd>{status?.model ?? "—"}</dd></div>
             <div><dt>Key</dt><dd>{status?.keyMask ?? "永不回显"}</dd></div>
             <div><dt>状态</dt><dd>{status?.aiStatus ?? "—"}</dd></div>
@@ -539,8 +554,22 @@ export default function SettingsPage() {
                 <option value="openai">OpenAI</option>
                 <option value="anthropic">Anthropic</option>
                 <option value="litellm">LiteLLM</option>
+                <option value="custom">Custom (自定义)</option>
               </select>
             </label>
+            {provider === "custom" && (
+              <label className="form-field" htmlFor="base-url">
+                <span className="field-label">Base URL</span>
+                <input
+                  id="base-url"
+                  type="url"
+                  value={baseUrl}
+                  onChange={(event) => setBaseUrl(event.target.value)}
+                  placeholder="例如 https://my-proxy.example.com/v1"
+                  autoComplete="off"
+                />
+              </label>
+            )}
             <label className="form-field" htmlFor="model">
               <span className="field-label">模型 ID</span>
               <input
