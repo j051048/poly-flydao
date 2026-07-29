@@ -24,6 +24,20 @@ API 接收秘密时：
 
 Python 字符串无法保证内存安全擦除；代码会尽力清零可变 bytearray，但生产上仍应使用短生命周期进程、最小权限和平台 secret 管理。
 
+## 自定义 AI 出站请求
+
+租户可以配置 OpenAI 兼容 HTTPS 中转站，但不能把 Worker 当作任意 URL 请求器：
+
+- Runtime Profile 只保存规范化 HTTPS Base URL，数据库约束拒绝 HTTP；
+- Control API 保存时解析 DNS，Worker 在解密租户 AI Key 前重新解析；
+- 自定义 Provider 的 HTTP transport 在每次携带 Key 的请求前再次验证全部 A/AAAA 地址；
+- 私网、loopback、link-local、CGNAT、保留、组播、未指定地址和本地域名全部拒绝；
+- 禁止 URL credentials/query/fragment、环境代理和 HTTP redirect；
+- 可通过 `POLYBOT_CUSTOM_AI_ALLOWED_HOSTS` 将域名进一步限制为管理员批准列表；
+- 自定义 Provider 持有 Key 的 SDK client 会随单次租户 Runtime 关闭，不复用到其他租户。
+
+DNS 验证与实际 TCP 建连之间仍存在很小的解析竞态。生产必须同时使用云平台 egress policy/firewall 阻止 RFC1918、loopback、link-local 与 metadata 网段，不能把应用层检查描述为对 DNS rebinding 的绝对证明。
+
 ## 身份与会话
 
 - 后端只接受 Supabase 非对称 RS256/ES256 JWT，并验证签名、issuer、audience、exp、nbf/iat、UUID subject、role 和 AAL。

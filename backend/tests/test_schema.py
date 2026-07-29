@@ -247,3 +247,28 @@ def test_atomic_tenant_submission_gate_checks_every_live_authority() -> None:
     assert ") from public, anon, authenticated;" in sql
     assert "grant execute on function public.mark_tenant_order_submitting" in sql
     assert ") to service_role;" in sql
+
+
+def test_custom_ai_provider_migrations_are_https_and_service_role_only() -> None:
+    initial = (
+        Path("supabase/migrations/0011_custom_ai_provider.sql")
+        .read_text(encoding="utf-8")
+        .lower()
+    )
+    hardening = (
+        Path("supabase/migrations/0012_harden_custom_ai_provider.sql")
+        .read_text(encoding="utf-8")
+        .lower()
+    )
+    for sql in (initial, hardening):
+        assert "ai_base_url" in sql
+        assert "^https://" in sql
+        assert "^https?://" not in sql
+        grant = sql.split(
+            "grant execute on function public.update_account_runtime_profile", 1
+        )[1]
+        assert "to service_role;" in grant
+        assert "to authenticated" not in grant
+    assert "from public, anon, authenticated, service_role;" in hardening
+    assert "ai_provider = 'platform'" in hardening
+    assert "auto_run_enabled = false" in hardening

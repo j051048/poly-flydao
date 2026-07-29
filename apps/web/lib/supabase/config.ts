@@ -8,6 +8,7 @@ function isConfiguredValue(value: string | undefined): value is string {
   const normalized = value.trim().toLowerCase();
   return (
     normalized.length > 0 &&
+    !["undefined", "null"].includes(normalized) &&
     !normalized.startsWith("your_") &&
     !normalized.includes("project_ref") &&
     !normalized.includes("replace_me") &&

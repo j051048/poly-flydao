@@ -7,10 +7,21 @@ const originalAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 const originalPublishableKey =
   process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
 
+function restoreEnvironmentValue(name: string, value: string | undefined) {
+  if (value === undefined) {
+    delete process.env[name];
+  } else {
+    process.env[name] = value;
+  }
+}
+
 afterEach(() => {
-  process.env.NEXT_PUBLIC_SUPABASE_URL = originalUrl;
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY = originalAnonKey;
-  process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY = originalPublishableKey;
+  restoreEnvironmentValue("NEXT_PUBLIC_SUPABASE_URL", originalUrl);
+  restoreEnvironmentValue("NEXT_PUBLIC_SUPABASE_ANON_KEY", originalAnonKey);
+  restoreEnvironmentValue(
+    "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY",
+    originalPublishableKey,
+  );
 });
 
 describe("getPublicSupabaseConfig", () => {
@@ -25,6 +36,15 @@ describe("getPublicSupabaseConfig", () => {
   it("rejects example placeholders", () => {
     process.env.NEXT_PUBLIC_SUPABASE_URL = "your_supabase_project_url";
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY = "your_supabase_anon_key";
+
+    expect(getPublicSupabaseConfig()).toBeNull();
+  });
+
+  it("rejects stringified missing environment values", () => {
+    process.env.NEXT_PUBLIC_SUPABASE_URL =
+      "https://project-ref.supabase.co";
+    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY = "undefined";
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY = "null";
 
     expect(getPublicSupabaseConfig()).toBeNull();
   });

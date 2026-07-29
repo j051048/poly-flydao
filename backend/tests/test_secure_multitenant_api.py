@@ -80,8 +80,17 @@ def test_secret_enrollment_never_reflects_or_transports_plaintext() -> None:
         )
         assert response.status_code == 201
         assert AI_SECRET not in response.text
-        assert response.json()["last_four"] == "alue"
+        assert "last_four" not in response.json()
+        assert "fingerprint" not in response.json()
         assert response.headers["cache-control"] == "no-store"
+        status_response = client.get(
+            "/v1/me/credentials/status",
+            headers=_auth("a-aal1"),
+        )
+        assert status_response.status_code == 200
+        public_credential = status_response.json()["ai_credentials"][0]
+        assert "last_four" not in public_credential
+        assert "fingerprint" not in public_credential
 
         stored = next(iter(repository._credentials.values()))
         assert AI_SECRET not in str(stored)

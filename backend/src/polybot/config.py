@@ -12,6 +12,8 @@ import idna
 from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from polybot.ai_endpoint import UnsafeAIBaseURLError, normalize_ai_base_url
+
 
 class TradingMode(StrEnum):
     PAPER = "paper"
@@ -123,6 +125,7 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("LITELLM_API_KEY", "POLYBOT_LITELLM_API_KEY"),
     )
     litellm_base_url: str = "http://litellm:4000/v1"
+    custom_ai_allowed_hosts: str = ""
 
     supabase_url: str | None = Field(
         default=None, validation_alias=AliasChoices("SUPABASE_URL", "POLYBOT_SUPABASE_URL")
@@ -190,12 +193,20 @@ class Settings(BaseSettings):
                 "configure exactly one of POLYBOT_CREDENTIAL_PRIVATE_KEY_PEM "
                 "or POLYBOT_CREDENTIAL_PRIVATE_KEYS_JSON"
             )
-        if self.ai_provider.lower() == "litellm":
+        provider_name = self.ai_provider.lower()
+        if provider_name == "litellm":
             endpoint = _http_endpoint(self.litellm_base_url)
             if endpoint is None:
                 raise ValueError("POLYBOT_LITELLM_BASE_URL must be a valid HTTP(S) endpoint")
             if endpoint.scheme.lower() != "https" and not _is_local_endpoint(endpoint):
                 raise ValueError("remote POLYBOT_LITELLM_BASE_URL must use HTTPS")
+        elif provider_name == "openai_compatible":
+            try:
+                self.litellm_base_url = normalize_ai_base_url(self.litellm_base_url)
+            except UnsafeAIBaseURLError as exc:
+                raise ValueError(
+                    "POLYBOT_LITELLM_BASE_URL must be a safe public HTTPS endpoint"
+                ) from exc
         if self.mode in {TradingMode.CANARY, TradingMode.LIVE}:
             missing: list[str] = []
             if self.live_ack != LIVE_ACK_TEXT:
@@ -224,25 +235,27 @@ class Settings(BaseSettings):
                         missing.append("POLYMARKET_PRIVATE_KEY")
                     if self.evidence_provider == "none":
                         missing.append("POLYBOT_EVIDENCE_PROVIDER")
-                    provider = self.ai_provider.lower()
+                    provider = provider_name
                     if provider == "mock":
                         missing.append("POLYBOT_AI_PROVIDER cannot be mock")
                     elif provider == "openai":
                         if self.openai_api_key is None:
                             missing.append("OPENAI_API_KEY")
-                    elif provider == "litellm":
+                    elif provider in {"litellm", "openai_compatible"}:
                         if self.litellm_api_key is None:
                             missing.append("LITELLM_API_KEY")
-                        endpoint = _http_endpoint(self.litellm_base_url)
-                        if endpoint is None or endpoint.scheme.lower() != "https":
-                            missing.append("POLYBOT_LITELLM_BASE_URL must use HTTPS")
+                        if provider == "litellm":
+                            endpoint = _http_endpoint(self.litellm_base_url)
+                            if endpoint is None or endpoint.scheme.lower() != "https":
+                                missing.append("POLYBOT_LITELLM_BASE_URL must use HTTPS")
                     else:
                         missing.append("POLYBOT_AI_PROVIDER")
                     evidence_name = (
                         "openai_web"
                         if self.evidence_provider == "auto" and provider == "openai"
                         else "gdelt"
-                        if self.evidence_provider == "auto" and provider == "litellm"
+                        if self.evidence_provider == "auto"
+                        and provider in {"litellm", "openai_compatible"}
                         else self.evidence_provider
                     )
                     if evidence_name == "openai_web" and self.openai_api_key is None:

@@ -953,6 +953,17 @@ footer {
   color: #587065;
 }
 
+.field-help {
+  margin-top: 7px;
+  color: var(--muted);
+  font-size: 0.72rem;
+  line-height: 1.45;
+}
+
+.field-help.error {
+  color: #ff9d92;
+}
+
 .full-width {
   width: 100%;
   justify-content: center;

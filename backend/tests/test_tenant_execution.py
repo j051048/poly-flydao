@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import pytest
 
+from polybot.ai_endpoint import UnsafeAIBaseURLError
 from polybot.config import Settings, TradingMode
 from polybot.credentials import (
     AIProvider,
@@ -241,3 +242,73 @@ async def test_profile_reference_change_fails_before_secret_decryption() -> None
         await executor(job, JobLeaseGuard(job))
 
     assert decryptor.calls == 0
+
+
+async def test_custom_provider_rejects_unsafe_endpoint_before_secret_decryption(
+    monkeypatch,
+) -> None:
+    profile, risk, credential, job = _fixture()
+    profile = profile.model_copy(
+        update={
+            "ai_provider": AIProvider.CUSTOM,
+            "ai_base_url": "https://relay.example.com/v1",
+        }
+    )
+    credential = credential.model_copy(update={"provider": "custom"})
+    decryptor = FakeDecryptor(b"must-not-be-used")
+
+    async def reject_endpoint(*args, **kwargs):
+        del args, kwargs
+        raise UnsafeAIBaseURLError("private endpoint")
+
+    monkeypatch.setattr(
+        "polybot.tenant_execution.validate_public_ai_base_url",
+        reject_endpoint,
+    )
+    executor = TenantRuntimeExecutor(
+        base_settings=Settings(_env_file=None, component="worker"),
+        jobs=FakeJobs(profile, risk),
+        credentials=FakeCredentials(credential),
+        decryptor=decryptor,
+        stores=FakeStores(),
+    )
+
+    with pytest.raises(TenantJobExecutionError, match="custom_provider_endpoint_unsafe"):
+        await executor(job, JobLeaseGuard(job))
+
+    assert decryptor.calls == 0
+
+
+def test_tenant_runtime_maps_only_custom_provider_to_hardened_adapter() -> None:
+    profile, risk, credential, job = _fixture()
+    executor = TenantRuntimeExecutor(
+        base_settings=Settings(_env_file=None, component="worker"),
+        jobs=FakeJobs(profile, risk),
+        credentials=FakeCredentials(credential),
+        decryptor=FakeDecryptor(b"unused"),
+        stores=FakeStores(),
+    )
+    shared = {
+        "job": job,
+        "model": "relay-model",
+        "ai_secret": bytearray(b"tenant-api-key"),
+        "signer_secret": None,
+        "wallet_address": None,
+        "risk": risk,
+    }
+
+    custom = executor._job_settings(
+        **shared,
+        provider=AIProvider.CUSTOM,
+        ai_base_url="https://relay.example.com/v1",
+    )
+    openrouter = executor._job_settings(
+        **shared,
+        provider=AIProvider.OPENROUTER,
+        ai_base_url=None,
+    )
+
+    assert custom.ai_provider == "openai_compatible"
+    assert custom.litellm_base_url == "https://relay.example.com/v1"
+    assert openrouter.ai_provider == "litellm"
+    assert openrouter.litellm_base_url == "https://openrouter.ai/api/v1"

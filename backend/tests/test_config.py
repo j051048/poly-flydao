@@ -235,3 +235,21 @@ def test_canary_worker_requires_dedicated_wallet_acknowledgement() -> None:
             supabase_url="https://example.supabase.co",
             supabase_service_role_key="service-role-test",
         )
+
+
+def test_openai_compatible_provider_requires_safe_https_base_url() -> None:
+    settings = Settings(
+        _env_file=None,
+        ai_provider="openai_compatible",
+        litellm_api_key="relay-key",
+        litellm_base_url="https://Relay.Example.com:443/v1/",
+    )
+    assert settings.litellm_base_url == "https://relay.example.com/v1"
+
+    with pytest.raises(ValidationError, match="safe public HTTPS"):
+        Settings(
+            _env_file=None,
+            ai_provider="openai_compatible",
+            litellm_api_key="relay-key",
+            litellm_base_url="http://relay.example.com/v1",
+        )

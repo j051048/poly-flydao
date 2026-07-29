@@ -33,9 +33,15 @@ class Runtime:
     broker: Broker
     engine: TradingEngine
     market_data: StreamingPolymarketMarketData
+    forecast_provider: ForecastProvider
     reconciler: OrderReconciler | None = None
 
     async def close(self) -> None:
+        close_provider = getattr(self.forecast_provider, "close", None)
+        if close_provider is not None:
+            result = close_provider()
+            if inspect.isawaitable(result):
+                await result
         if self.reconciler is not None:
             await self.reconciler.close()
         close_broker = getattr(self.broker, "close", None)
@@ -80,6 +86,24 @@ def _ai(settings: Settings) -> tuple[ForecastProvider, EvidenceCollector]:
                 api_key=settings.litellm_api_key.get_secret_value(),
                 api_base=settings.litellm_base_url,
                 timeout_seconds=settings.ai_timeout_seconds,
+            ),
+            _evidence_collector(settings, default="gdelt"),
+        )
+    if provider_name == "openai_compatible":
+        from polybot.ai.openai_compatible_provider import (
+            OpenAICompatibleForecastProvider,
+        )
+
+        if settings.litellm_api_key is None:
+            raise ValueError(
+                "LITELLM_API_KEY is required for POLYBOT_AI_PROVIDER=openai_compatible"
+            )
+        return (
+            OpenAICompatibleForecastProvider(
+                api_key=settings.litellm_api_key.get_secret_value(),
+                api_base=settings.litellm_base_url,
+                timeout_seconds=settings.ai_timeout_seconds,
+                allowed_hosts=settings.custom_ai_allowed_hosts,
             ),
             _evidence_collector(settings, default="gdelt"),
         )
@@ -158,5 +182,6 @@ def build_runtime(
         broker=broker,
         engine=engine,
         market_data=market_data,
+        forecast_provider=provider,
         reconciler=reconciler,
     )
