@@ -214,6 +214,35 @@ async def test_auto_scheduler_and_job_lease_fencing() -> None:
     )
 
 
+def test_custom_runtime_profile_requires_safe_https_base_url() -> None:
+    common = {
+        "expected_version": 1,
+        "ai_provider": AIProvider.CUSTOM,
+        "forecast_model": "relay-model",
+    }
+    profile = RuntimeProfilePatch(
+        **common,
+        ai_base_url="https://Relay.Example.com:443/v1/",
+    )
+    assert profile.ai_base_url == "https://relay.example.com/v1"
+
+    with pytest.raises(ValueError, match="HTTPS"):
+        RuntimeProfilePatch(**common, ai_base_url="http://relay.example.com/v1")
+
+    with pytest.raises(ValueError, match="requires ai_base_url"):
+        RuntimeProfilePatch(**common)
+
+
+def test_non_custom_runtime_profile_rejects_base_url() -> None:
+    with pytest.raises(ValueError, match="only allowed"):
+        RuntimeProfilePatch(
+            expected_version=1,
+            ai_provider=AIProvider.OPENAI,
+            ai_base_url="https://relay.example.com/v1",
+            forecast_model="gpt-test",
+        )
+
+
 class _Response:
     def __init__(self, data: object):
         self.data = data

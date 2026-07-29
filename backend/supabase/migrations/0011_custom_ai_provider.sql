@@ -20,7 +20,7 @@ alter table public.account_runtime_profiles
     check (
       (ai_provider = 'custom' and ai_base_url is not null
         and length(ai_base_url) between 8 and 256
-        and ai_base_url ~ '^https?://')
+        and ai_base_url ~ '^https://[^/?#[:space:]@]+(/[^?#[:space:]]*)?$')
       or (ai_provider <> 'custom' and ai_base_url is null)
     );
 
@@ -65,7 +65,7 @@ begin
   if p_ai_provider = 'custom' then
     if p_ai_base_url is null
        or length(p_ai_base_url) not between 8 and 256
-       or p_ai_base_url !~ '^https?://'
+       or p_ai_base_url !~ '^https://[^/?#[:space:]@]+(/[^?#[:space:]]*)?$'
     then
       raise exception 'custom provider requires a valid base URL'
         using errcode = '22023';
@@ -154,6 +154,6 @@ revoke all on function public.update_account_runtime_profile(
 
 grant execute on function public.update_account_runtime_profile(
   uuid, bigint, text, text, text, uuid, uuid, uuid, text, boolean, integer
-) to authenticated, service_role;
+) to service_role;
 
 commit;

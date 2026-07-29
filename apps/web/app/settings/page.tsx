@@ -6,6 +6,7 @@ import {
   apiRequest,
   readableApiError,
 } from "../../lib/api";
+import { validateCustomAIBaseUrl } from "../../lib/ai-provider";
 import { getSupabaseBrowserClient } from "../../lib/supabase/browser";
 
 type Notice = { tone: "success" | "error" | "info"; text: string };
@@ -52,7 +53,10 @@ function booleanValue(...values: unknown[]): boolean | undefined {
   return values.find((value): value is boolean => typeof value === "boolean");
 }
 
-function parseCredentialStatus(payload: unknown): CredentialStatus {
+function parseCredentialStatus(
+  payload: unknown,
+  preferredProvider?: string,
+): CredentialStatus {
   const root = record(payload);
   const aiItems = Array.isArray(root.ai_credentials) ? root.ai_credentials : [];
   const walletItems = Array.isArray(root.wallets)
@@ -60,11 +64,16 @@ function parseCredentialStatus(payload: unknown): CredentialStatus {
     : Array.isArray(root.trading_wallets)
       ? root.trading_wallets
       : [];
-  const activeAi =
-    aiItems.find((item) => {
+  const activeAiItems = aiItems.filter((item) => {
       const status = stringValue(record(item).status);
       return !status || !["revoked", "deleted"].includes(status);
-    }) ?? aiItems[0];
+    });
+  const activeAi =
+    activeAiItems.find(
+      (item) => stringValue(record(item).provider) === preferredProvider,
+    ) ??
+    activeAiItems[0] ??
+    aiItems[0];
   const activeWallet =
     walletItems.find((item) => {
       const status = stringValue(record(item).status);
@@ -83,9 +92,6 @@ function parseCredentialStatus(payload: unknown): CredentialStatus {
   const keyMask = stringValue(
     ai.masked,
     ai.masked_key,
-    ai.last4,
-    ai.last_four,
-    ai.fingerprint,
     root.ai_key_masked,
   );
   const signatureType = Number(
@@ -137,6 +143,10 @@ export default function SettingsPage() {
   const [mfaFactorId, setMfaFactorId] = useState<string | null>(null);
   const [mfaEnrollment, setMfaEnrollment] = useState<MfaEnrollment | null>(null);
   const [mfaCode, setMfaCode] = useState("");
+  const baseUrlValidation =
+    provider === "custom"
+      ? validateCustomAIBaseUrl(baseUrl)
+      : { normalized: null, error: null };
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -145,11 +155,16 @@ export default function SettingsPage() {
         apiRequest<unknown>("/v1/me/credentials/status"),
         apiRequest<unknown>("/v1/me"),
       ]);
-      const parsed = parseCredentialStatus(credentialsResult.data);
       const me = record(meResult.data);
       const runtimeProfile = record(me.runtime_profile);
+      const configuredProvider =
+        stringValue(runtimeProfile.ai_provider) ?? "openrouter";
+      const parsed = parseCredentialStatus(
+        credentialsResult.data,
+        configuredProvider,
+      );
       parsed.provider =
-        stringValue(runtimeProfile.ai_provider, parsed.provider) ?? "openrouter";
+        stringValue(configuredProvider, parsed.provider) ?? "openrouter";
       parsed.aiBaseUrl = stringValue(runtimeProfile.ai_base_url);
       parsed.model = stringValue(runtimeProfile.forecast_model, parsed.model);
       parsed.aiCredentialId =
@@ -220,6 +235,20 @@ export default function SettingsPage() {
   async function saveAiCredential(includeSecret: boolean) {
     const trimmedKey = apiKey.trim();
     if (includeSecret && !trimmedKey) return;
+    if (provider === "custom" && !baseUrlValidation.normalized) {
+      setNotice({
+        tone: "error",
+        text: baseUrlValidation.error ?? "请输入安全的 HTTPS Base URL。",
+      });
+      return;
+    }
+    if (!includeSecret && provider !== status?.provider) {
+      setNotice({
+        tone: "error",
+        text: "切换 AI 提供商时必须同时输入并加密保存该提供商的 API Key。",
+      });
+      return;
+    }
     if (includeSecret && mfaLevel !== "aal2") {
       setNotice({
         tone: "error",
@@ -260,7 +289,7 @@ export default function SettingsPage() {
         body: {
           expected_version: status?.expectedVersion ?? 1,
           ai_provider: provider,
-          ai_base_url: provider === "custom" ? baseUrl.trim() || null : null,
+          ai_base_url: baseUrlValidation.normalized,
           forecast_model: model.trim(),
           ...(credentialId ? { ai_credential_id: credentialId } : {}),
           ...(status?.walletId
@@ -384,6 +413,20 @@ export default function SettingsPage() {
       });
       return;
     }
+    if (provider !== status.provider) {
+      setNotice({
+        tone: "error",
+        text: "请先加密保存新提供商的 API Key，再启用自动运行。",
+      });
+      return;
+    }
+    if (provider === "custom" && !baseUrlValidation.normalized) {
+      setNotice({
+        tone: "error",
+        text: baseUrlValidation.error ?? "请输入安全的 HTTPS Base URL。",
+      });
+      return;
+    }
     if (
       autoRunEnabled &&
       ["canary", "live"].includes(desiredMode) &&
@@ -402,7 +445,7 @@ export default function SettingsPage() {
         body: {
           expected_version: status.expectedVersion ?? 1,
           ai_provider: provider,
-          ai_base_url: provider === "custom" ? baseUrl.trim() || null : null,
+          ai_base_url: baseUrlValidation.normalized,
           forecast_model: model.trim(),
           ai_credential_id: status.aiCredentialId,
           ...(status.walletId ? { trading_wallet_id: status.walletId } : {}),
@@ -554,7 +597,7 @@ export default function SettingsPage() {
                 <option value="openai">OpenAI</option>
                 <option value="anthropic">Anthropic</option>
                 <option value="litellm">LiteLLM</option>
-                <option value="custom">Custom (自定义)</option>
+                <option value="custom">自定义 OpenAI 兼容中转站</option>
               </select>
             </label>
             {provider === "custom" && (
@@ -567,7 +610,18 @@ export default function SettingsPage() {
                   onChange={(event) => setBaseUrl(event.target.value)}
                   placeholder="例如 https://my-proxy.example.com/v1"
                   autoComplete="off"
+                  required
+                  maxLength={256}
+                  aria-invalid={Boolean(baseUrlValidation.error)}
+                  aria-describedby="base-url-help"
                 />
+                <span
+                  className={`field-help ${baseUrlValidation.error ? "error" : ""}`}
+                  id="base-url-help"
+                >
+                  {baseUrlValidation.error ??
+                    "仅支持公开 HTTPS 域名；后端还会执行 DNS、私网地址与重定向防护。"}
+                </span>
               </label>
             )}
             <label className="form-field" htmlFor="model">
@@ -605,6 +659,7 @@ export default function SettingsPage() {
                 disabled={
                   !apiKey.trim() ||
                   !model.trim() ||
+                  (provider === "custom" && !baseUrlValidation.normalized) ||
                   mfaLevel !== "aal2" ||
                   busy !== null
                 }
@@ -617,7 +672,12 @@ export default function SettingsPage() {
                     className="secondary-button"
                     type="button"
                     onClick={() => void saveAiCredential(false)}
-                    disabled={!model.trim() || busy !== null}
+                    disabled={
+                      !model.trim() ||
+                      provider !== status.provider ||
+                      (provider === "custom" && !baseUrlValidation.normalized) ||
+                      busy !== null
+                    }
                   >
                     保存模型设置
                   </button>

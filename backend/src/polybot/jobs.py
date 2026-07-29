@@ -8,8 +8,9 @@ from typing import Any, Protocol
 from uuid import UUID, uuid4
 
 from postgrest.exceptions import APIError
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from polybot.ai_endpoint import UnsafeAIBaseURLError, normalize_ai_base_url
 from polybot.config import TradingMode
 from polybot.credentials import AIProvider
 from polybot.models import RuntimeControl, utc_now
@@ -62,7 +63,6 @@ class RuntimeProfilePatch(BaseModel):
     ai_base_url: str | None = Field(
         default=None,
         max_length=256,
-        pattern=r"^https?://[A-Za-z0-9._:/-]+$",
     )
     forecast_model: str = Field(
         min_length=1,
@@ -75,6 +75,19 @@ class RuntimeProfilePatch(BaseModel):
     desired_mode: TradingMode = TradingMode.PAPER
     auto_run_enabled: bool = False
     cycle_interval_seconds: int = Field(default=60, ge=30, le=3600)
+
+    @model_validator(mode="after")
+    def validate_custom_provider_endpoint(self) -> RuntimeProfilePatch:
+        if self.ai_provider is AIProvider.CUSTOM:
+            if self.ai_base_url is None:
+                raise ValueError("custom AI provider requires ai_base_url")
+            try:
+                self.ai_base_url = normalize_ai_base_url(self.ai_base_url)
+            except UnsafeAIBaseURLError as exc:
+                raise ValueError(str(exc)) from exc
+        elif self.ai_base_url is not None:
+            raise ValueError("ai_base_url is only allowed for the custom AI provider")
+        return self
 
 
 class CycleJobRequest(BaseModel):

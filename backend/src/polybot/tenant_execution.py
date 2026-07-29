@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from pydantic import SecretStr
 
+from polybot.ai_endpoint import UnsafeAIBaseURLError, validate_public_ai_base_url
 from polybot.brokers.polymarket import PolymarketBroker
 from polybot.config import Settings, TradingMode
 from polybot.credentials import (
@@ -85,6 +86,18 @@ class TenantRuntimeExecutor:
         signer_secret: bytearray | None = None
         runtime: Runtime | None = None
         try:
+            if profile.ai_provider is AIProvider.CUSTOM:
+                try:
+                    safe_base_url = await validate_public_ai_base_url(
+                        profile.ai_base_url or "",
+                        allowed_hosts=self.base_settings.custom_ai_allowed_hosts,
+                    )
+                except UnsafeAIBaseURLError as exc:
+                    raise TenantJobExecutionError(
+                        "custom_provider_endpoint_unsafe",
+                        retryable=False,
+                    ) from exc
+                profile = profile.model_copy(update={"ai_base_url": safe_base_url})
             risk = await self._risk_policy(job)
             ai_secret = await self._ai_secret(job, profile.ai_provider)
             signer_secret, wallet_address = await self._wallet_secret(job)
@@ -262,7 +275,7 @@ class TenantRuntimeExecutor:
                 raise TenantJobExecutionError(
                     "custom_provider_missing_base_url", retryable=False
                 )
-            updates["ai_provider"] = "litellm"
+            updates["ai_provider"] = "openai_compatible"
             updates["evidence_provider"] = "auto"
             updates["openai_api_key"] = None
             updates["litellm_api_key"] = SecretStr(_decode_ai_secret(ai_secret))

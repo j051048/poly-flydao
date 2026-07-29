@@ -4,6 +4,7 @@ import logging
 import os
 import re
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
@@ -22,6 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, SecretStr
 
+from polybot.ai_endpoint import UnsafeAIBaseURLError, validate_public_ai_base_url
 from polybot.auth import (
     AuthPrincipal,
     JWTVerificationError,
@@ -99,6 +101,23 @@ class MeResponse(BaseModel):
     aal: str
     runtime_profile: RuntimeProfile
     capabilities: dict[str, bool]
+
+
+class PublicCredentialMetadata(BaseModel):
+    id: UUID
+    kind: str
+    provider: str
+    label: str | None = None
+    status: str
+    version: int
+    created_at: datetime
+    rotated_at: datetime | None = None
+    revoked_at: datetime | None = None
+
+
+class PublicCredentialStatus(BaseModel):
+    ai_credentials: list[PublicCredentialMetadata]
+    wallets: list[TradingWalletMetadata]
 
 
 class ControlPlaneUnavailable(RuntimeError):
@@ -438,7 +457,7 @@ def create_app(
             )
         )
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={"detail": "request validation failed"},
             headers={"Cache-Control": "no-store"},
         )
@@ -490,6 +509,18 @@ def create_app(
                 status.HTTP_403_FORBIDDEN,
                 "AAL2 is required to enable automatic real-money cycles",
             )
+        if body.ai_provider is AIProvider.CUSTOM:
+            try:
+                safe_base_url = await validate_public_ai_base_url(
+                    body.ai_base_url or "",
+                    allowed_hosts=api_settings.custom_ai_allowed_hosts,
+                )
+            except UnsafeAIBaseURLError as exc:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    str(exc),
+                ) from exc
+            body = body.model_copy(update={"ai_base_url": safe_base_url})
         current = await repo.get_or_create_profile(principal.account_id)
         fields = body.model_fields_set
         effective = body.model_copy(
@@ -517,7 +548,7 @@ def create_app(
         )
         return await repo.update_profile(principal.account_id, effective)
 
-    @application.get("/v1/me/credentials/status", response_model=CredentialStatus)
+    @application.get("/v1/me/credentials/status", response_model=PublicCredentialStatus)
     async def credentials_status(
         principal: PrincipalDep,
         repository: CredentialRepositoryDep,
@@ -526,7 +557,7 @@ def create_app(
 
     @application.put(
         "/v1/me/credentials/ai",
-        response_model=CredentialMetadata,
+        response_model=PublicCredentialMetadata,
         status_code=status.HTTP_201_CREATED,
     )
     async def put_ai_credential(
@@ -542,11 +573,11 @@ def create_app(
                 label=body.label,
             )
         except ValueError as exc:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
 
     @application.delete(
         "/v1/me/credentials/ai",
-        response_model=CredentialMetadata,
+        response_model=PublicCredentialMetadata,
     )
     async def delete_ai_credential(
         principal: AAL2PrincipalDep,
@@ -589,7 +620,7 @@ def create_app(
     ) -> TradingWalletMetadata:
         if idempotency_key is None or not _IDEMPOTENCY_KEY.fullmatch(idempotency_key):
             raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
                 "Idempotency-Key must contain 16-128 safe characters",
             )
         try:
@@ -602,7 +633,7 @@ def create_app(
                 idempotency_key=idempotency_key,
             )
         except ValueError as exc:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
 
     @application.delete(
         "/v1/me/wallets/{wallet_id}",
@@ -642,7 +673,7 @@ def create_app(
     ) -> CycleJob:
         if idempotency_key is None or not _IDEMPOTENCY_KEY.fullmatch(idempotency_key):
             raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
                 "Idempotency-Key must contain 16-128 safe characters",
             )
         if body.mode in {TradingMode.CANARY, TradingMode.LIVE} and not principal.is_aal2:

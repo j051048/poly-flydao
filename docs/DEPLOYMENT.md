@@ -29,7 +29,7 @@ uv run --frozen polybot generate-secrets
 ```text
 backend/supabase/migrations/0001_initial.sql
 ...
-backend/supabase/migrations/0010_atomic_tenant_submission_gate.sql
+backend/supabase/migrations/0012_harden_custom_ai_provider.sql
 ```
 
 4. 在 Auth 中配置站点 URL、Vercel 登录回调 URL和邮件验证回调：
@@ -57,6 +57,9 @@ SUPABASE_SERVICE_ROLE_KEY=...
 POLYBOT_CREDENTIAL_PUBLIC_KEY_PEM=-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----
 POLYBOT_CREDENTIAL_KEY_VERSION=1
 POLYBOT_CREDENTIAL_FINGERPRINT_KEY=...
+
+# 多租户 SaaS 建议设置；API 与 Worker 必须完全一致
+POLYBOT_CUSTOM_AI_ALLOWED_HOSTS=api.trusted-relay.example,*.ai-gateway.example
 ```
 
 可选显式 JWT 配置：
@@ -109,6 +112,9 @@ POLYBOT_TENANT_WORKER_MAX_CONCURRENCY=4
 POLYBOT_TENANT_JOB_LEASE_SECONDS=60
 POLYBOT_TENANT_JOB_POLL_SECONDS=1
 
+# 与 Control API 保持一致
+POLYBOT_CUSTOM_AI_ALLOWED_HOSTS=api.trusted-relay.example,*.ai-gateway.example
+
 POLYBOT_LIVE_ACK=I_UNDERSTAND_REAL_FUNDS_CAN_BE_LOST
 POLYBOT_BETA_SDK_ACK=I_ACCEPT_BETA_SDK_CANARY_ONLY
 POLYBOT_DEDICATED_WALLET_ACK=I_CONFIRM_DEDICATED_WALLET_NO_EXTERNAL_FLOWS
@@ -137,7 +143,7 @@ NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=...
 
 1. 注册并完成邮箱验证。
 2. 登录，在“系统配置”绑定并验证 TOTP，使当前会话达到 AAL2。
-3. 输入第三方 AI provider、模型 ID 和 API key。密钥只提交一次，之后不回显。
+3. 输入第三方 AI provider、模型 ID 和 API key。使用 OpenAI 兼容中转站时选择“自定义”，Base URL 填写到 API 版本根路径，例如 `https://relay.example.com/v1`。密钥只提交一次，之后不回显。
 4. 导入一个全新、低余额、只给机器人使用的 EVM 私钥。绝不能使用主钱包。
 5. 等待 Worker 将钱包从 `pending_verification` 变为 `active`，前端会显示入金地址、chain ID 和 collateral token。
 6. 按显示的网络与 collateral 资产转入一笔可完全承受损失的小额启动资金。
@@ -147,6 +153,14 @@ NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=...
 10. 任何异常立即 disarm。系统会持久化 kill/cancellation latch，并要求 Worker 验证零开放订单后才能重新 arm。
 
 自动周期不等于永久授权。Canary/live 只有在短时 arm、任务和账户租约、配置/风险快照、钱包/凭证状态、对账、余额、allowance、地理限制和盘口新鲜度全部有效时才可能提交订单。
+
+### 自定义 AI 中转站的边界
+
+- 仅支持 OpenAI Chat Completions 兼容接口和公开 HTTPS 域名，不支持 HTTP、localhost、私网/链路本地/云元数据地址、URL 内账号密码、查询参数或重定向。
+- API 保存配置时与 Worker 解密 Key 前都会解析 DNS；真正发送 HTTP 前还会再次检查全部 DNS 地址。任何一个地址不是公网地址都会 fail closed。
+- `POLYBOT_CUSTOM_AI_ALLOWED_HOSTS` 为空时允许任意通过上述检查的公网域名；商业多租户部署应配置可信中转站白名单。支持逗号分隔的精确域名和 `*.example.com`。
+- 中转站能够读取发给模型的市场证据和 API Key。只使用可信服务、专用低额度 Key，并在 Zeabur/云网络层额外禁止访问私网和 metadata 网段。应用层 DNS 检查不能替代基础设施 egress firewall。
+- 中转站若不支持 JSON Schema，系统只会在明确的“不支持 structured output”错误下退回普通 JSON，并继续使用 Pydantic 严格校验；认证、限流、超时和内容策略错误不会自动重复付费请求。
 
 ## 7. 部署前验证
 
