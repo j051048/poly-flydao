@@ -263,6 +263,112 @@ class _ScalarRPCClient:
         return _Builder(True)
 
 
+class _HealthTableBuilder(_Builder):
+    def select(self, columns: str) -> _HealthTableBuilder:
+        assert columns == "id,result_summary"
+        return self
+
+    def limit(self, value: int) -> _HealthTableBuilder:
+        assert value == 1
+        return self
+
+
+class _HealthClient:
+    def __init__(self, version: int):
+        self.version = version
+
+    def table(self, name: str) -> _HealthTableBuilder:
+        assert name == "cycle_jobs"
+        return _HealthTableBuilder([])
+
+    def rpc(self, name: str, payload: object) -> _Builder:
+        assert name == "polybot_schema_version"
+        assert payload == {}
+        return _Builder(self.version)
+
+
+class _AnalysisBuilder(_Builder):
+    def __init__(self, data: object, calls: list[tuple[str, object]]):
+        super().__init__(data)
+        self.calls = calls
+
+    def select(self, columns: str) -> _AnalysisBuilder:
+        self.calls.append(("select", columns))
+        return self
+
+    def eq(self, column: str, value: object) -> _AnalysisBuilder:
+        self.calls.append((f"eq:{column}", value))
+        return self
+
+    def order(self, column: str, *, desc: bool = False) -> _AnalysisBuilder:
+        self.calls.append((f"order:{column}", desc))
+        return self
+
+    def limit(self, value: int) -> _AnalysisBuilder:
+        self.calls.append(("limit", value))
+        return self
+
+    def in_(self, column: str, values: list[str]) -> _AnalysisBuilder:
+        self.calls.append((f"in:{column}", values))
+        return self
+
+
+class _AnalysisClient:
+    def __init__(self):
+        self.calls: dict[str, list[tuple[str, object]]] = {
+            "forecasts": [],
+            "markets": [],
+            "evidence": [],
+        }
+        self.rows = {
+            "forecasts": [
+                {
+                    "id": "forecast-1",
+                    "market_id": "market-1",
+                    "evidence_ids": ["evidence-1"],
+                    "p_yes": "0.61",
+                    "rationale": {"text": "bounded rationale"},
+                }
+            ],
+            "markets": [
+                {
+                    "id": "market-1",
+                    "question": "Will the test pass?",
+                    "slug": "test-market",
+                }
+            ],
+            "evidence": [
+                {
+                    "id": "evidence-1",
+                    "source_title": "Primary source",
+                    "summary": "Evidence summary",
+                }
+            ],
+        }
+
+    def table(self, name: str) -> _AnalysisBuilder:
+        return _AnalysisBuilder(self.rows[name], self.calls[name])
+
+
+@pytest.mark.asyncio
+async def test_supabase_health_requires_latest_schema_sentinel() -> None:
+    assert await SupabaseJobRepository(_HealthClient(14)).health()
+    assert not await SupabaseJobRepository(_HealthClient(13)).health()
+
+
+@pytest.mark.asyncio
+async def test_recent_analysis_is_tenant_scoped_and_joins_safe_context() -> None:
+    client = _AnalysisClient()
+    result = await SupabaseJobRepository(client).recent_analysis(ACCOUNT, limit=5)
+
+    assert result[0]["question"] == "Will the test pass?"
+    assert result[0]["rationale"] == {"text": "bounded rationale"}
+    assert result[0]["evidence"][0]["source_title"] == "Primary source"
+    assert ("eq:account_id", ACCOUNT) in client.calls["forecasts"]
+    assert ("eq:account_id", ACCOUNT) in client.calls["evidence"]
+    assert ("limit", 5) in client.calls["forecasts"]
+
+
 @pytest.mark.asyncio
 async def test_supabase_scalar_boolean_rpc_results_are_not_dropped() -> None:
     repository = SupabaseJobRepository(_ScalarRPCClient())

@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
@@ -47,7 +48,10 @@ interface JobView {
   status?: string;
   mode?: string;
   marketsScanned?: number;
+  forecastsCreated?: number;
+  candidatesCreated?: number;
   executions?: number;
+  skipped?: Array<{ code: string; count: number }>;
   message?: string;
 }
 
@@ -94,17 +98,59 @@ function parseJob(payload: unknown): JobView {
   const root = asRecord(payload);
   const job = asRecord(root.job);
   const source = Object.keys(job).length ? job : root;
+  const summary = asRecord(source.result_summary);
+  const skipped = asRecord(summary.skipped);
   const executions = Array.isArray(source.executions)
     ? source.executions.length
-    : asNumber(source.executions ?? source.execution_count);
+    : asNumber(
+        summary.executions ?? source.executions ?? source.execution_count,
+      );
   return {
     id: asString(source.job_id ?? source.id ?? source.run_id),
     status: asString(source.status) ?? (source.completed_at ? "completed" : undefined),
     mode: asString(source.mode),
-    marketsScanned: asNumber(source.markets_scanned),
+    marketsScanned: asNumber(summary.markets_scanned ?? source.markets_scanned),
+    forecastsCreated: asNumber(
+      summary.forecasts_created ?? source.forecasts_created,
+    ),
+    candidatesCreated: asNumber(
+      summary.candidates_created ?? source.candidates_created,
+    ),
     executions,
+    skipped: Object.entries(skipped)
+      .map(([code, count]) => ({ code, count: asNumber(count) ?? 0 }))
+      .filter((item) => item.count > 0)
+      .sort((left, right) => right.count - left.count),
     message: asString(source.message ?? source.error_code),
   };
+}
+
+function jobCompletionText(job: JobView): string {
+  if (
+    job.marketsScanned === undefined &&
+    job.forecastsCreated === undefined &&
+    job.executions === undefined
+  ) {
+    return "任务已完成；旧任务没有可展示的运行摘要。";
+  }
+  return `任务已完成：扫描 ${job.marketsScanned ?? 0} 个市场，生成 ${job.forecastsCreated ?? 0} 个预测，执行 ${job.executions ?? 0} 笔。`;
+}
+
+function skipReasonLabel(code: string): string {
+  const exact: Record<string, string> = {
+    market_liquidity_screen: "市场流动性不足",
+    forecast_cooldown: "预测仍在冷却期",
+    insufficient_distinct_evidence: "独立证据不足",
+    forecast_insufficient_citations: "AI 引用来源不足",
+    no_positive_value_candidate: "费用后没有正优势",
+    market_resolution_too_close: "距离结算太近",
+    stale_order_book: "盘口数据过期",
+  };
+  if (exact[code]) return exact[code];
+  if (code.startsWith("forecast_generation_error")) return "AI 预测调用失败";
+  if (code.startsWith("evidence_pipeline_error")) return "外部证据检索失败";
+  if (code.startsWith("risk_")) return "被风险规则拒绝";
+  return code.replaceAll("_", " ");
 }
 
 function parseStatus(payload: unknown): StatusView {
@@ -247,7 +293,7 @@ export default function HomePage() {
         ) {
           setNotice({
             tone: "success",
-            text: `任务已完成：扫描 ${updated.marketsScanned ?? 0} 个市场，执行 ${updated.executions ?? 0} 笔。`,
+            text: jobCompletionText(updated),
           });
         } else if (
           updated.status &&
@@ -317,10 +363,10 @@ export default function HomePage() {
       setLastJob(job);
       setNotice({
         tone: "success",
-        text:
-          result.status === 202
-            ? `任务已进入队列${job.id ? `（${job.id}）` : ""}，worker 将异步执行。`
-            : `周期已完成：扫描 ${job.marketsScanned ?? 0} 个市场，执行 ${job.executions ?? 0} 笔。`,
+          text:
+            result.status === 202
+              ? `任务已进入队列${job.id ? `（${job.id}）` : ""}，worker 将异步执行。`
+              : jobCompletionText(job),
       });
       await refresh();
     } catch (error) {
@@ -409,6 +455,19 @@ export default function HomePage() {
           <span>{API_BASE_URL}</span>
         </div>
       </header>
+
+      {(!lastJob || status?.aiProvider === "mock") && (
+        <section className="getting-started-banner">
+          <div>
+            <p className="eyebrow">FIRST RUN</p>
+            <strong>第一次使用？让向导告诉你下一步</strong>
+            <p>先完成 MFA 和 AI 配置，再运行一次不会下真实订单的 Paper 任务。</p>
+          </div>
+          <Link className="primary-button" href="/setup">
+            打开新手向导
+          </Link>
+        </section>
+      )}
 
       <section className="safety-banner">
         <span className="shield" aria-hidden="true">◆</span>
@@ -615,7 +674,21 @@ export default function HomePage() {
                 <div><dt>任务 ID</dt><dd title={lastJob.id}>{lastJob.id ?? "—"}</dd></div>
                 <div><dt>模式</dt><dd>{modeLabel(lastJob.mode)}</dd></div>
                 <div><dt>扫描市场</dt><dd>{lastJob.marketsScanned ?? "等待 worker"}</dd></div>
+                <div><dt>AI 预测</dt><dd>{lastJob.forecastsCreated ?? "等待 worker"}</dd></div>
+                <div><dt>候选机会</dt><dd>{lastJob.candidatesCreated ?? "等待 worker"}</dd></div>
                 <div><dt>执行订单</dt><dd>{lastJob.executions ?? "等待 worker"}</dd></div>
+                {lastJob.skipped && lastJob.skipped.length > 0 && (
+                  <div className="skip-reasons">
+                    <dt>主要未交易原因</dt>
+                    <dd>
+                      {lastJob.skipped.slice(0, 3).map((item) => (
+                        <span key={item.code}>
+                          {skipReasonLabel(item.code)} × {item.count}
+                        </span>
+                      ))}
+                    </dd>
+                  </div>
+                )}
               </dl>
             ) : (
               <div className="empty-state">

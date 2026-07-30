@@ -24,6 +24,8 @@ interface CredentialStatus {
   walletAddress?: string;
   signatureType?: number;
   walletStatus?: string;
+  chainId?: number;
+  collateralToken?: string;
   riskPolicyId?: string;
   desiredMode?: string;
   autoRunEnabled: boolean;
@@ -109,15 +111,41 @@ function parseCredentialStatus(
     aiStatus: stringValue(ai.status),
     walletConfigured:
       booleanValue(wallet.configured, root.wallet_configured) ??
-      Boolean(walletAddress),
+      Boolean(
+        stringValue(wallet.id, wallet.wallet_id) ||
+          walletAddress ||
+          (wallet.status &&
+            !["revoked", "deleted", "failed"].includes(String(wallet.status))),
+      ),
     walletId: stringValue(wallet.id, wallet.wallet_id),
     walletAddress,
     signatureType: Number.isFinite(signatureType) ? signatureType : undefined,
     walletStatus: stringValue(wallet.status),
+    chainId: Number.isFinite(Number(wallet.chain_id))
+      ? Number(wallet.chain_id)
+      : undefined,
+    collateralToken: stringValue(wallet.collateral_token),
     autoRunEnabled: false,
     cycleIntervalSeconds: 60,
     expectedVersion: 1,
   };
+}
+
+function walletStatusLabel(
+  status: string | undefined,
+  configured = false,
+): string {
+  return (
+    {
+      active: "已验证",
+      provisioning: "正在创建",
+      pending_verification: "正在验证",
+      revocation_pending: "正在撤销",
+      revoked: "已撤销",
+      failed: "验证失败",
+    }[status ?? ""] ??
+    (configured ? "已绑定" : "未绑定")
+  );
 }
 
 export default function SettingsPage() {
@@ -143,6 +171,7 @@ export default function SettingsPage() {
   const [mfaFactorId, setMfaFactorId] = useState<string | null>(null);
   const [mfaEnrollment, setMfaEnrollment] = useState<MfaEnrollment | null>(null);
   const [mfaCode, setMfaCode] = useState("");
+  const [addressCopied, setAddressCopied] = useState(false);
   const baseUrlValidation =
     provider === "custom"
       ? validateCustomAIBaseUrl(baseUrl)
@@ -345,6 +374,13 @@ export default function SettingsPage() {
   async function importWallet() {
     const secret = privateKey.trim();
     if (!secret || !importConfirmed) return;
+    if (mfaLevel !== "aal2") {
+      setNotice({
+        tone: "error",
+        text: "导入钱包前必须先完成 TOTP 双因素验证。",
+      });
+      return;
+    }
     setBusy("import-wallet");
     setNotice({ tone: "info", text: "正在将专用机器人私钥写入隔离签名服务…" });
     try {
@@ -377,6 +413,13 @@ export default function SettingsPage() {
 
   async function revokeWallet() {
     if (!status?.walletId) return;
+    if (mfaLevel !== "aal2") {
+      setNotice({
+        tone: "error",
+        text: "撤销钱包前必须先完成 TOTP 双因素验证。",
+      });
+      return;
+    }
     if (
       !window.confirm(
         "确认撤销该机器人钱包？后端将停止新任务；请先确认没有开放订单。",
@@ -469,6 +512,30 @@ export default function SettingsPage() {
     }
   }
 
+  function applySafePaperPreset() {
+    setDesiredMode("paper");
+    setCycleIntervalSeconds(300);
+    setAutoRunEnabled(true);
+    setNotice({
+      tone: "info",
+      text: "已套用推荐值：Paper 模拟盘、每 5 分钟运行。请点击“保存自动运行设置”确认。",
+    });
+  }
+
+  async function copyWalletAddress() {
+    if (!status?.walletAddress) return;
+    try {
+      await navigator.clipboard.writeText(status.walletAddress);
+      setAddressCopied(true);
+      window.setTimeout(() => setAddressCopied(false), 2000);
+    } catch {
+      setNotice({
+        tone: "error",
+        text: "浏览器无法复制地址，请手工选择并复制。",
+      });
+    }
+  }
+
   async function beginMfaEnrollment() {
     const supabase = getSupabaseBrowserClient();
     if (!supabase) return;
@@ -557,6 +624,14 @@ export default function SettingsPage() {
         </div>
       </section>
 
+      <section className="configuration-path" aria-label="推荐配置顺序">
+        <strong>推荐顺序</strong>
+        <span>1. 双因素验证</span>
+        <span>2. AI Key</span>
+        <span>3. Paper 模拟</span>
+        <span>4. 专属钱包与 Canary</span>
+      </section>
+
       {notice && (
         <div className={`notice ${notice.tone} page-notice`} role="status">
           {notice.text}
@@ -564,7 +639,7 @@ export default function SettingsPage() {
       )}
 
       <div className="settings-grid">
-        <section className="panel">
+        <section className="panel" id="ai">
           <div className="section-heading">
             <div>
               <p className="eyebrow">AI PROFILE</p>
@@ -664,7 +739,11 @@ export default function SettingsPage() {
                   busy !== null
                 }
               >
-                {busy === "ai" ? "保存中…" : status?.aiConfigured ? "轮换并验证 Key" : "加密保存 Key"}
+                {busy === "ai"
+                  ? "保存中…"
+                  : status?.aiConfigured
+                    ? "加密轮换 Key"
+                    : "加密保存 Key"}
               </button>
               {status?.aiConfigured && (
                 <>
@@ -692,10 +771,13 @@ export default function SettingsPage() {
                 </>
               )}
             </div>
+            <p className="field-help">
+              保存只代表密钥已安全入库；真实可用性会在下一次 Paper 任务调用模型时确认。
+            </p>
           </div>
         </section>
 
-        <section className="panel">
+        <section className="panel" id="mfa">
           <div className="section-heading">
             <div>
               <p className="eyebrow">SESSION SECURITY</p>
@@ -765,7 +847,7 @@ export default function SettingsPage() {
           )}
         </section>
 
-        <section className="panel">
+        <section className="panel" id="automation">
           <div className="section-heading">
             <div>
               <p className="eyebrow">AUTOMATION</p>
@@ -776,6 +858,14 @@ export default function SettingsPage() {
             </span>
           </div>
           <div className="form-stack">
+            <button
+              className="secondary-button full-width"
+              type="button"
+              onClick={applySafePaperPreset}
+              disabled={busy !== null || loading}
+            >
+              套用新手推荐：Paper / 每 5 分钟
+            </button>
             <label className="form-field" htmlFor="desired-mode">
               <span className="field-label">运行模式</span>
               <select
@@ -789,6 +879,12 @@ export default function SettingsPage() {
                 <option value="live">Live（真实资金）</option>
               </select>
             </label>
+            {["canary", "live"].includes(desiredMode) && (
+              <div className="notice error">
+                这是实际资金模式。自动周期并不等于持续实盘授权；仍需 AAL2
+                短时解锁，并且你应先完成 Paper、Shadow 和小额旁观验证。
+              </div>
+            )}
             <label className="form-field" htmlFor="cycle-interval">
               <span className="field-label">周期间隔（秒）</span>
               <input
@@ -828,14 +924,22 @@ export default function SettingsPage() {
           </div>
         </section>
 
-        <section className="panel">
+        <section className="panel" id="wallet">
           <div className="section-heading">
             <div>
               <p className="eyebrow">TRADING WALLET</p>
               <h2>机器人专属钱包</h2>
             </div>
-            <span className={`pill ${status?.walletConfigured ? "online" : "offline"}`}>
-              {status?.walletConfigured ? "已绑定" : "未绑定"}
+            <span
+              className={`pill ${
+                status?.walletStatus === "active"
+                  ? "online"
+                  : status?.walletConfigured
+                    ? "degraded"
+                    : "offline"
+              }`}
+            >
+              {walletStatusLabel(status?.walletStatus, status?.walletConfigured)}
             </span>
           </div>
 
@@ -845,7 +949,9 @@ export default function SettingsPage() {
               <dd title={status?.walletAddress}>{status?.walletAddress ?? "—"}</dd>
             </div>
             <div><dt>签名类型</dt><dd>{status?.signatureType ?? "—"}</dd></div>
-            <div><dt>状态</dt><dd>{status?.walletStatus ?? "—"}</dd></div>
+            <div><dt>状态</dt><dd>{walletStatusLabel(status?.walletStatus, status?.walletConfigured)}</dd></div>
+            <div><dt>网络 Chain ID</dt><dd>{status?.chainId ?? "等待 Worker 返回"}</dd></div>
+            <div><dt>抵押资产合约</dt><dd title={status?.collateralToken}>{status?.collateralToken ?? "等待 Worker 返回"}</dd></div>
           </dl>
 
           {!status?.walletConfigured && (
@@ -904,7 +1010,12 @@ export default function SettingsPage() {
                 className="warning-button"
                 type="button"
                 onClick={() => void importWallet()}
-                disabled={!privateKey.trim() || !importConfirmed || busy !== null}
+                disabled={
+                  !privateKey.trim() ||
+                  !importConfirmed ||
+                  mfaLevel !== "aal2" ||
+                  busy !== null
+                }
               >
                 {busy === "import-wallet" ? "导入中…" : "加密导入专用钱包"}
               </button>
@@ -915,7 +1026,16 @@ export default function SettingsPage() {
             <div className="deposit-callout">
               <strong>启动资金地址</strong>
               <code>{status.walletAddress}</code>
-              <p>仅按后端明确展示的网络与资产入金，并先使用可承受损失的小额资金。</p>
+              <button
+                className="text-button"
+                type="button"
+                onClick={() => void copyWalletAddress()}
+              >
+                {addressCopied ? "已复制" : "复制地址"}
+              </button>
+              <p>
+                仅在 Chain ID 和抵押资产都已明确后入金，并先使用可完全承受损失的小额资金。
+              </p>
             </div>
           )}
           {status?.walletId && (
@@ -923,7 +1043,7 @@ export default function SettingsPage() {
               className="danger-button full-width"
               type="button"
               onClick={() => void revokeWallet()}
-              disabled={busy !== null}
+              disabled={mfaLevel !== "aal2" || busy !== null}
               style={{ marginTop: "16px" }}
             >
               {busy === "revoke-wallet" ? "撤销中…" : "撤销机器人钱包"}

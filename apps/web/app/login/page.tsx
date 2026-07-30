@@ -19,7 +19,7 @@ function LoginForm() {
   const [loading, setLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(
     configured
-      ? searchParams.get("error")
+      ? loginErrorMessage(searchParams.get("error"))
       : "Supabase Auth 未配置。请在 Vercel 配置公开的项目 URL 和 publishable/anon key。",
   );
 
@@ -82,7 +82,15 @@ function LoginForm() {
         </label>
 
         {errorMessage && (
-          <div className="notice error" role="alert">{errorMessage}</div>
+          <div className="notice error" role="alert">
+            {errorMessage}
+            {!configured && (
+              <>
+                {" "}
+                <Link href="/diagnostics">打开三端部署检查</Link>
+              </>
+            )}
+          </div>
         )}
 
         <button
@@ -98,6 +106,17 @@ function LoginForm() {
         还没有账户？<Link href="/register">立即注册</Link>
       </p>
     </section>
+  );
+}
+
+function loginErrorMessage(value: string | null): string | null {
+  if (!value) return null;
+  return (
+    {
+      auth_not_configured: "Supabase Auth 尚未配置，请先完成部署检查。",
+      invalid_callback: "登录回调无效或已过期，请重新登录。",
+      auth_callback_failed: "登录回调失败，请检查 Supabase Redirect URL。",
+    }[value] ?? "登录会话无效，请重新登录。"
   );
 }
 

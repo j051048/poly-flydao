@@ -24,6 +24,12 @@ https://YOUR_VERCEL_DOMAIN/auth/callback
 
 When the two Supabase public variables are absent, production builds still
 succeed and the registration/login forms show a disabled configuration notice.
+`/diagnostics` remains publicly accessible and reports only safe boolean
+connectivity results; it never returns configured values or secrets. After
+login, `/setup` guides the user through MFA, AI, a Paper run, safe automation,
+and only then the optional dedicated Canary wallet.
+`/analysis` turns the tenant-scoped forecast/evidence ledger into a readable
+probability, uncertainty, counter-evidence, invalidation, and source view.
 
 ## Session and API boundary
 

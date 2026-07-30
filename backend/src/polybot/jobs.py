@@ -123,6 +123,7 @@ class CycleJob(BaseModel):
     updated_at: datetime
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    result_summary: dict[str, Any] | None = None
     deduplicated: bool = False
 
 
@@ -181,6 +182,8 @@ class JobRepository(Protocol):
 
     async def get_job(self, *, account_id: str, job_id: UUID) -> CycleJob | None: ...
 
+    async def get_latest_job(self, *, account_id: str) -> CycleJob | None: ...
+
     async def get_runtime_control(self, account_id: str) -> RuntimeControl: ...
 
     async def arm(
@@ -197,6 +200,13 @@ class JobRepository(Protocol):
     async def assert_live_ready(self, account_id: str) -> None: ...
 
     async def portfolio(self, account_id: str) -> PortfolioSnapshot: ...
+
+    async def recent_analysis(
+        self,
+        account_id: str,
+        *,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]: ...
 
     async def get_active_risk_policy(
         self, account_id: str
@@ -249,6 +259,7 @@ class WorkerJobRepository(Protocol):
         job_id: UUID,
         claimed_by: str,
         fencing_token: int,
+        result_summary: dict[str, Any] | None = None,
     ) -> CycleJob | None: ...
 
     async def fail(
@@ -306,8 +317,24 @@ class SupabaseJobRepository:
 
     async def health(self) -> bool:
         try:
-            await self._execute(self._client.table("cycle_jobs").select("id").limit(1))
-            return True
+            # Include the latest schema-contract column so a deployment that
+            # forgot to apply migrations fails readiness instead of accepting
+            # jobs that the worker cannot later complete.
+            await self._execute(
+                self._client.table("cycle_jobs").select("id,result_summary").limit(1)
+            )
+            version_response = await self._execute(
+                self._client.rpc("polybot_schema_version", {})
+            )
+            version_data = getattr(version_response, "data", None)
+            if isinstance(version_data, list):
+                version_data = version_data[0] if version_data else None
+            if isinstance(version_data, dict):
+                version_data = version_data.get(
+                    "polybot_schema_version",
+                    version_data.get("version"),
+                )
+            return version_data == 14
         except Exception:
             return False
 
@@ -396,10 +423,26 @@ class SupabaseJobRepository:
                 "id,account_id,trading_wallet_id,ai_credential_id,risk_policy_id,mode,"
                 "risk_policy_version,idempotency_key,status,attempt_count,max_attempts,"
                 "claimed_by,fencing_token,heartbeat_at,lease_expires_at,run_after,error_code,"
-                "requested_run_after,created_at,updated_at,started_at,completed_at"
+                "requested_run_after,created_at,updated_at,started_at,completed_at,result_summary"
             )
             .eq("account_id", account_id)
             .eq("id", str(job_id))
+            .limit(1)
+        )
+        row = self._first(response)
+        return _job_from_row(row) if row else None
+
+    async def get_latest_job(self, *, account_id: str) -> CycleJob | None:
+        response = await self._execute(
+            self._client.table("cycle_jobs")
+            .select(
+                "id,account_id,trading_wallet_id,ai_credential_id,risk_policy_id,mode,"
+                "risk_policy_version,idempotency_key,status,attempt_count,max_attempts,"
+                "claimed_by,fencing_token,heartbeat_at,lease_expires_at,run_after,error_code,"
+                "requested_run_after,created_at,updated_at,started_at,completed_at,result_summary"
+            )
+            .eq("account_id", account_id)
+            .order("created_at", desc=True)
             .limit(1)
         )
         row = self._first(response)
@@ -584,6 +627,116 @@ class SupabaseJobRepository:
             },
         )
 
+    async def recent_analysis(
+        self,
+        account_id: str,
+        *,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        if not 1 <= limit <= 50:
+            raise ValueError("analysis limit must be between 1 and 50")
+        forecasts_response = await self._execute(
+            self._client.table("forecasts")
+            .select(
+                "id,market_id,as_of,provider,model,p_yes,p_low,p_high,confidence,"
+                "evidence_ids,rationale,invalidation_conditions,status,created_at"
+            )
+            .eq("account_id", account_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+        )
+        forecast_rows = [
+            row
+            for row in (getattr(forecasts_response, "data", None) or [])
+            if isinstance(row, dict)
+        ]
+        if not forecast_rows:
+            return []
+
+        market_ids = sorted(
+            {
+                str(row["market_id"])
+                for row in forecast_rows
+                if row.get("market_id") is not None
+            }
+        )
+        evidence_ids = sorted(
+            {
+                str(evidence_id)
+                for row in forecast_rows
+                for evidence_id in (
+                    row.get("evidence_ids")
+                    if isinstance(row.get("evidence_ids"), list)
+                    else []
+                )
+            }
+        )
+        market_rows: list[dict[str, Any]] = []
+        evidence_rows: list[dict[str, Any]] = []
+        if market_ids:
+            response = await self._execute(
+                self._client.table("markets")
+                .select("id,question,slug,end_at,active,closed")
+                .in_("id", market_ids)
+            )
+            market_rows = [
+                row
+                for row in (getattr(response, "data", None) or [])
+                if isinstance(row, dict)
+            ]
+        if evidence_ids:
+            response = await self._execute(
+                self._client.table("evidence")
+                .select(
+                    "id,source_url,source_title,published_at,summary,"
+                    "reliability_score,fetched_at"
+                )
+                .eq("account_id", account_id)
+                .in_("id", evidence_ids)
+                .limit(200)
+            )
+            evidence_rows = [
+                row
+                for row in (getattr(response, "data", None) or [])
+                if isinstance(row, dict)
+            ]
+
+        markets = {str(row.get("id")): row for row in market_rows}
+        evidence = {str(row.get("id")): row for row in evidence_rows}
+        result: list[dict[str, Any]] = []
+        for row in forecast_rows:
+            market = markets.get(str(row.get("market_id")), {})
+            selected_evidence = [
+                evidence[str(evidence_id)]
+                for evidence_id in (
+                    row.get("evidence_ids")
+                    if isinstance(row.get("evidence_ids"), list)
+                    else []
+                )
+                if str(evidence_id) in evidence
+            ]
+            result.append(
+                {
+                    "id": row.get("id"),
+                    "market_id": row.get("market_id"),
+                    "question": market.get("question"),
+                    "slug": market.get("slug"),
+                    "end_at": market.get("end_at"),
+                    "as_of": row.get("as_of"),
+                    "provider": row.get("provider"),
+                    "model": row.get("model"),
+                    "probability_yes": row.get("p_yes"),
+                    "probability_low": row.get("p_low"),
+                    "probability_high": row.get("p_high"),
+                    "confidence": row.get("confidence"),
+                    "rationale": row.get("rationale"),
+                    "invalidation_conditions": row.get("invalidation_conditions"),
+                    "status": row.get("status"),
+                    "evidence": selected_evidence,
+                }
+            )
+        return result
+
     async def get_active_risk_policy(
         self, account_id: str
     ) -> RiskPolicySnapshot | None:
@@ -713,14 +866,22 @@ class SupabaseJobRepository:
         job_id: UUID,
         claimed_by: str,
         fencing_token: int,
+        result_summary: dict[str, Any] | None = None,
     ) -> CycleJob | None:
-        return await self._transition(
-            "complete_cycle_job",
-            account_id=account_id,
-            job_id=job_id,
-            claimed_by=claimed_by,
-            fencing_token=fencing_token,
+        response = await self._execute(
+            self._client.rpc(
+                "complete_cycle_job_with_result",
+                {
+                    "p_account_id": account_id,
+                    "p_job_id": str(job_id),
+                    "p_claimed_by": claimed_by,
+                    "p_fencing_token": fencing_token,
+                    "p_result_summary": result_summary or {},
+                },
+            )
         )
+        row = self._first(response)
+        return _job_from_row(row) if row else None
 
     async def fail(
         self,
@@ -949,6 +1110,12 @@ class InMemoryJobRepository:
             return None
         return job
 
+    async def get_latest_job(self, *, account_id: str) -> CycleJob | None:
+        jobs = [
+            job for job in self._jobs.values() if str(job.account_id) == account_id
+        ]
+        return max(jobs, key=lambda job: job.created_at) if jobs else None
+
     async def get_runtime_control(self, account_id: str) -> RuntimeControl:
         await self.get_or_create_profile(account_id)
         return self._controls[account_id]
@@ -1019,6 +1186,17 @@ class InMemoryJobRepository:
                 "pnl_usd": None,
             },
         )
+
+    async def recent_analysis(
+        self,
+        account_id: str,
+        *,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        del account_id
+        if not 1 <= limit <= 50:
+            raise ValueError("analysis limit must be between 1 and 50")
+        return []
 
     async def get_active_risk_policy(
         self, account_id: str
@@ -1213,6 +1391,7 @@ class InMemoryJobRepository:
         job_id: UUID,
         claimed_by: str,
         fencing_token: int,
+        result_summary: dict[str, Any] | None = None,
     ) -> CycleJob | None:
         job = self._worker_job(account_id, job_id, claimed_by, fencing_token)
         if job is None or job.status not in {
@@ -1227,6 +1406,7 @@ class InMemoryJobRepository:
                 "completed_at": now,
                 "lease_expires_at": None,
                 "updated_at": now,
+                "result_summary": result_summary or {},
             }
         )
         self._jobs[job.id] = saved

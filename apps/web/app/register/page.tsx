@@ -117,6 +117,12 @@ export default function RegisterPage() {
           {message && (
             <div className={`notice ${message.type}`} role="status">
               {message.text}
+              {!configured && (
+                <>
+                  {" "}
+                  <Link href="/diagnostics">打开三端部署检查</Link>
+                </>
+              )}
             </div>
           )}
 

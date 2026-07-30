@@ -30,6 +30,7 @@ from polybot.jobs import (
     SupabaseJobRepository,
     WorkerJobRepository,
 )
+from polybot.models import EngineCycleResult
 from polybot.runtime import Runtime, build_runtime
 from polybot.stores.factory import AccountStoreFactory
 from polybot.stores.supabase_store import TenantExecutionFence
@@ -70,7 +71,11 @@ class TenantRuntimeExecutor:
         self.stores = stores
         self.logger = logger or logging.getLogger("polybot.tenant_execution")
 
-    async def __call__(self, job: CycleJob, job_lease: JobLeaseGuard) -> None:
+    async def __call__(
+        self,
+        job: CycleJob,
+        job_lease: JobLeaseGuard,
+    ) -> EngineCycleResult:
         account_id = str(job.account_id)
         profile = await self.jobs.get_or_create_profile(account_id)  # type: ignore[union-attr]
         if profile.status != "active" or profile.desired_mode is not job.mode:
@@ -137,7 +142,7 @@ class TenantRuntimeExecutor:
                 settings,
                 store_override=store,
             )
-            await self._run_runtime(
+            return await self._run_runtime(
                 runtime=runtime,
                 job=job,
                 job_lease=job_lease,
@@ -245,6 +250,11 @@ class TenantRuntimeExecutor:
             "component": "worker",
             "worker_execution_model": "tenant_queue",
             "forecast_model": model,
+            # A tenant currently selects one provider/model contract. Reusing
+            # that model for the independent critic keeps custom relays and
+            # provider-specific model IDs valid. A future two-model option must
+            # store and validate the critic model explicitly per tenant.
+            "critic_model": model,
             "max_order_usd": risk.max_order_usd,
             "max_trade_risk_pct": risk.max_trade_risk_pct,
             "max_event_exposure_pct": risk.max_event_exposure_pct,
@@ -307,11 +317,10 @@ class TenantRuntimeExecutor:
         job_lease: JobLeaseGuard,
         profile_version: int,
         risk: RiskPolicySnapshot,
-    ) -> None:
+    ) -> EngineCycleResult:
         if job.mode not in {TradingMode.CANARY, TradingMode.LIVE}:
             runtime.engine.execution_guard = job_lease.execution_allowed
-            await runtime.engine.run_cycle()
-            return
+            return await runtime.engine.run_cycle()
         if not isinstance(runtime.broker, PolymarketBroker) or runtime.reconciler is None:
             raise TenantJobExecutionError("live_runtime_not_isolated", retryable=False)
 
@@ -467,7 +476,7 @@ class TenantRuntimeExecutor:
                 name=f"tenant-control-watch-{job.id}",
             )
             await runtime.broker.ensure_trading_approvals()
-            await runtime.engine.run_cycle()
+            result = await runtime.engine.run_cycle()
             if await broker_guard() is None:
                 raise TenantJobExecutionError("execution_fence_lost", retryable=True)
             if not await runtime.broker.cancel_all("tenant cycle boundary"):
@@ -475,6 +484,7 @@ class TenantRuntimeExecutor:
             if await runtime.store.has_unresolved_live_orders(account_id):
                 raise TenantJobExecutionError("cycle_boundary_order_unresolved", retryable=True)
             successful = True
+            return result
         finally:
             local_stop.set()
             for task in (lease_task, control_task, reconciler_task):
@@ -539,7 +549,7 @@ async def run_tenant_queue_worker(settings: Settings) -> None:
     jobs = SupabaseJobRepository(client)
     if not await jobs.health():
         raise RuntimeError(
-            "tenant job repository is unavailable; apply migrations through 0007"
+            "tenant job repository is unavailable; apply migrations through 0014"
         )
     credentials = SupabaseCredentialRepository(client)
     decryptor = build_worker_decryptor_from_environment()

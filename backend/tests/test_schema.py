@@ -272,3 +272,35 @@ def test_custom_ai_provider_migrations_are_https_and_service_role_only() -> None
     assert "from public, anon, authenticated, service_role;" in hardening
     assert "ai_provider = 'platform'" in hardening
     assert "auto_run_enabled = false" in hardening
+
+
+def test_cycle_result_summary_is_bounded_and_worker_only() -> None:
+    sql = (
+        Path("supabase/migrations/0013_cycle_result_summary.sql")
+        .read_text(encoding="utf-8")
+        .lower()
+    )
+    assert "add column result_summary jsonb" in sql
+    assert "jsonb_typeof(result_summary) = 'object'" in sql
+    assert "length(result_summary::text) <= 16384" in sql
+    assert "create or replace function public.complete_cycle_job_with_result" in sql
+    assert "job.lease_expires_at > now()" in sql
+    assert "set search_path = ''" in sql
+    assert ") from public, anon, authenticated;" in sql
+    assert ") to service_role;" in sql
+
+
+def test_custom_ai_credential_rpc_and_schema_sentinel_are_service_role_only() -> None:
+    sql = (
+        Path("supabase/migrations/0014_custom_ai_credential.sql")
+        .read_text(encoding="utf-8")
+        .lower()
+    )
+    assert "create or replace function public.store_ai_credential" in sql
+    assert "'litellm', 'custom'" in sql
+    assert "security definer" in sql
+    assert "set search_path = ''" in sql
+    assert "create or replace function public.polybot_schema_version()" in sql
+    assert "select 14;" in sql
+    assert "from public, anon, authenticated, service_role;" in sql
+    assert "to service_role;" in sql

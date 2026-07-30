@@ -25,9 +25,14 @@ uv run --frozen --extra dev polybot pair-replay --input examples/pair_replay_sam
 
 ## Supabase
 
-按文件名顺序应用 `supabase/migrations/0001_initial.sql` 至 `0010_atomic_tenant_submission_gate.sql`。`0007` 引入多租户凭证、钱包生命周期、风险快照和任务队列；`0008`–`0009` 是默认关闭的配对微结构研究账本；`0010` 是真实订单提交前的原子授权闸门。
+按文件名顺序应用 `supabase/migrations/0001_initial.sql` 至 `0014_custom_ai_credential.sql`。`0007` 引入多租户凭证、钱包生命周期、风险快照和任务队列；`0008`–`0009` 是默认关闭的配对微结构研究账本；`0010` 是真实订单提交前的原子授权闸门；`0011`–`0012` 加固自定义 AI 中转站；`0013` 保存不含秘密的任务结果摘要；`0014` 接通自定义中转站凭证并加入 schema readiness 标记。
 
 上线配置与操作顺序见 [部署手册](../docs/DEPLOYMENT.md)，安全边界见 [安全说明](../docs/SECURITY.md)。
+
+为避免把 Worker 私钥误放进公开 API，Zeabur 两个服务分别从
+[`deploy/api.env.example`](deploy/api.env.example) 和
+[`deploy/worker.env.example`](deploy/worker.env.example) 复制变量。API 健康检查使用
+`/health`；私有 Worker 使用只返回固定进程状态的 `/livez`，且不要绑定公网域名。
 
 ## P2 策略状态
 

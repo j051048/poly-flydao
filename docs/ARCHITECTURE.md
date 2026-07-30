@@ -24,6 +24,8 @@ flowchart TB
 
 - Supabase 注册、登录、回调、退出、会话恢复和受保护路由。
 - 缺少 Supabase 配置时惰性创建客户端，Vercel 预渲染不再因空 URL 失败。
+- 公开 `/diagnostics` 仅返回三端连通性布尔状态；登录后的 `/setup` 给出下一步，
+  `/analysis` 展示账户隔离的概率、反方证据、失效条件与来源。
 - 生产漏配 API/Auth 不回退 localhost。
 - TOTP MFA；敏感凭证、钱包和真实资金控制要求 AAL2。
 - AI key 与 EVM key 一次性提交；API 用 RSA-OAEP-256 + AES-256-GCM 账户绑定加密。
@@ -71,7 +73,7 @@ AI 只产出结构化概率、置信区间、论据和有限方向信号。以�
 
 ## 仍需外部验证
 
-- 0007–0010 在真实 PostgreSQL/Supabase 上的完整 migration reset。
+- 0007–0014 在真实 PostgreSQL/Supabase 上的完整 migration reset。
 - Polymarket 生产环境的小额 wallet approval、post-only/GTD、user stream 和模糊响应恢复。
 - 长期 point-in-time 数据、样本外概率校准、shadow 成交偏差和 live canary。
 - 生产监控、告警、备份恢复、密钥轮换演练和人工事件响应。

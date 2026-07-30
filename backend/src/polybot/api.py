@@ -372,10 +372,12 @@ def create_app(
                 headers={"Cache-Control": "no-store"},
             )
         response = await call_next(request)
-        if request.url.path.startswith("/v1/me/credentials") or request.url.path.startswith(
-            "/v1/me/wallets"
+        if request.url.path.startswith(
+            ("/v1/me", "/v1/status", "/v1/jobs", "/v1/control")
         ):
             response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
         return response
 
     if api_settings.allowed_dashboard_origins:
@@ -660,6 +662,19 @@ def create_app(
     ) -> PortfolioSnapshot:
         return await repo.portfolio(principal.account_id)
 
+    @application.get("/v1/me/analysis")
+    async def recent_analysis(
+        principal: PrincipalDep,
+        repo: JobRepositoryDep,
+        limit: Annotated[int, Query(ge=1, le=50)] = 20,
+    ) -> dict[str, object]:
+        return {
+            "items": await repo.recent_analysis(
+                principal.account_id,
+                limit=limit,
+            )
+        }
+
     @application.post(
         "/v1/jobs/cycles",
         response_model=CycleJob,
@@ -706,6 +721,12 @@ def create_app(
         control = await repo.get_runtime_control(principal.account_id)
         profile = await repo.get_or_create_profile(principal.account_id)
         risk = await repo.get_active_risk_policy(principal.account_id)
+        latest_job_getter = getattr(repo, "get_latest_job", None)
+        latest_job = (
+            await latest_job_getter(account_id=principal.account_id)
+            if callable(latest_job_getter)
+            else None
+        )
         return {
             "account_id": principal.account_id,
             "mode": profile.desired_mode.value,
@@ -731,6 +752,9 @@ def create_app(
                 }
                 if risk
                 else None
+            ),
+            "latest_job": (
+                latest_job.model_dump(mode="json") if latest_job is not None else None
             ),
             "execution": "leased_worker_only",
         }
