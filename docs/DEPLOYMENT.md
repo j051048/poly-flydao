@@ -29,7 +29,7 @@ uv run --frozen polybot generate-secrets
 ```text
 backend/supabase/migrations/0001_initial.sql
 ...
-backend/supabase/migrations/0012_harden_custom_ai_provider.sql
+backend/supabase/migrations/0014_custom_ai_credential.sql
 ```
 
 4. 在 Auth 中配置站点 URL、Vercel 登录回调 URL和邮件验证回调：
@@ -45,6 +45,10 @@ https://YOUR_VERCEL_DOMAIN/auth/callback
 ## 3. Zeabur Control API
 
 从 GitHub 仓库创建服务，Root Directory 设置为 `backend`，公开 HTTPS 域名。环境变量：
+
+最不容易配错的方法是逐项复制
+[`backend/deploy/api.env.example`](../backend/deploy/api.env.example)，不要复用 Worker
+的变量清单。健康检查 Path 设置为 `/health`。
 
 ```dotenv
 SERVICE_ROLE=api
@@ -93,6 +97,10 @@ GET /health
 ## 4. Zeabur Tenant Worker
 
 从同一仓库再创建一个服务，Root Directory 同样为 `backend`。不要绑定公网域名，初期保持单副本：
+
+逐项复制 [`backend/deploy/worker.env.example`](../backend/deploy/worker.env.example)。
+Worker 会在 `PORT` 上提供固定、无账户数据的 `/livez`，供 Zeabur 判断常驻进程是否存活；
+健康检查 Path 设置为 `/livez`，但仍不要为该服务绑定公网域名。
 
 ```dotenv
 SERVICE_ROLE=worker

@@ -9,6 +9,7 @@ from polybot.jobs import (
     CycleJobStatus,
     InMemoryJobRepository,
 )
+from polybot.models import EngineCycleResult
 from polybot.tenant_worker import (
     JobLeaseGuard,
     TenantJobExecutionError,
@@ -38,8 +39,16 @@ async def test_runner_completes_a_fenced_job() -> None:
     claimed = await _claimed_job(repository, account_id)
     observed: list[tuple[str, bool]] = []
 
-    async def execute(job, lease: JobLeaseGuard) -> None:
+    async def execute(job, lease: JobLeaseGuard) -> EngineCycleResult:
         observed.append((str(job.account_id), await lease.execution_allowed()))
+        return EngineCycleResult(
+            run_id="paper-run-1",
+            mode=TradingMode.PAPER,
+            markets_scanned=12,
+            forecasts_created=2,
+            candidates_created=1,
+            skipped={"no_positive_value_candidate": 1},
+        )
 
     runner = TenantJobRunner(
         repository=repository,
@@ -53,6 +62,18 @@ async def test_runner_completes_a_fenced_job() -> None:
     saved = await repository.get_job(account_id=account_id, job_id=claimed.id)
     assert saved is not None
     assert saved.status is CycleJobStatus.SUCCEEDED
+    assert saved.result_summary == {
+        "run_id": "paper-run-1",
+        "mode": "paper",
+        "markets_scanned": 12,
+        "forecasts_created": 2,
+        "candidates_created": 1,
+        "intents_approved": 0,
+        "executions": 0,
+        "skipped": {"no_positive_value_candidate": 1},
+        "started_at": saved.result_summary["started_at"],
+        "completed_at": None,
+    }
     assert observed == [(account_id, True)]
 
 

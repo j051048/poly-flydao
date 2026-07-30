@@ -33,6 +33,60 @@ class RuntimeControlWatchState:
     cancellation_pending: bool = False
 
 
+async def _handle_worker_health_request(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+) -> None:
+    """Serve the non-secret liveness contract required by Zeabur.
+
+    The worker must never expose queue, tenant, or credential state. A TCP
+    listener plus a fixed HTTP response is sufficient to distinguish a live
+    process from a crashed container.
+    """
+
+    status = "404 Not Found"
+    body = b'{"ok":false}'
+    try:
+        request_line = await asyncio.wait_for(reader.readline(), timeout=2.0)
+        parts = request_line.decode("ascii", errors="replace").strip().split()
+        if len(parts) == 3 and parts[0] in {"GET", "HEAD"} and parts[1] == "/livez":
+            status = "200 OK"
+            body = b'{"ok":true,"role":"worker"}'
+        if len(parts) == 3 and parts[0] == "HEAD":
+            body = b""
+    except (TimeoutError, ValueError):
+        status = "400 Bad Request"
+        body = b'{"ok":false}'
+
+    response = (
+        f"HTTP/1.1 {status}\r\n"
+        "Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+    ).encode("ascii")
+    writer.write(response + body)
+    with suppress(ConnectionError):
+        await writer.drain()
+    writer.close()
+    with suppress(ConnectionError):
+        await writer.wait_closed()
+
+
+async def _start_worker_health_server(
+    *,
+    host: str,
+    port: int,
+) -> asyncio.AbstractServer:
+    return await asyncio.start_server(
+        _handle_worker_health_request,
+        host=host,
+        port=port,
+        limit=4096,
+    )
+
+
 async def _wait_for_store_startup(
     store: StateStore,
     logger: logging.Logger,
@@ -295,7 +349,15 @@ async def run_worker() -> None:
     if settings.worker_execution_model == "tenant_queue":
         from polybot.tenant_execution import run_tenant_queue_worker
 
-        await run_tenant_queue_worker(settings)
+        health_server = await _start_worker_health_server(
+            host=settings.api_host,
+            port=settings.worker_health_port,
+        )
+        try:
+            await run_tenant_queue_worker(settings)
+        finally:
+            health_server.close()
+            await health_server.wait_closed()
         return
 
     runtime = build_runtime(settings)

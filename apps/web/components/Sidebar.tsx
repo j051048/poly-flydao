@@ -8,7 +8,9 @@ import { useEffect, useState } from "react";
 import { getSupabaseBrowserClient } from "../lib/supabase/browser";
 
 const NAV_ITEMS = [
+  { name: "新手向导", path: "/setup" },
   { name: "控制台", path: "/" },
+  { name: "AI 分析", path: "/analysis" },
   { name: "个人资产", path: "/assets" },
   { name: "凭证与钱包", path: "/settings" },
 ];
@@ -19,6 +21,7 @@ export default function Sidebar() {
   const isAuthPage =
     pathname === "/login" ||
     pathname === "/register" ||
+    pathname === "/diagnostics" ||
     pathname.startsWith("/auth/");
 
   useEffect(() => {

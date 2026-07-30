@@ -8,6 +8,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 
 from polybot.jobs import CycleJob, WorkerJobRepository
+from polybot.models import EngineCycleResult
 
 _ERROR_CODE = re.compile(r"[^a-z0-9_]+")
 
@@ -53,7 +54,10 @@ class JobLeaseGuard:
         await self._invalidated.wait()
 
 
-TenantJobExecutor = Callable[[CycleJob, JobLeaseGuard], Awaitable[None]]
+TenantJobExecutor = Callable[
+    [CycleJob, JobLeaseGuard],
+    Awaitable[EngineCycleResult | None],
+]
 DueJobScheduler = Callable[[], Awaitable[int]]
 
 
@@ -180,7 +184,7 @@ class TenantJobRunner:
                 self._maintain_heartbeat(lease),
                 name=f"tenant-cycle-heartbeat-{job.id}",
             )
-            await self.executor(running, lease)
+            result = await self.executor(running, lease)
             if not lease.is_valid:
                 self.logger.critical(
                     "cycle execution returned after its fencing lease was lost; "
@@ -192,6 +196,7 @@ class TenantJobRunner:
                 job_id=job.id,
                 claimed_by=self.owner_id,
                 fencing_token=job.fencing_token,
+                result_summary=_public_result_summary(result),
             )
             if completed is None:
                 lease.invalidate()
@@ -291,3 +296,22 @@ class TenantJobRunner:
 def _safe_error_code(value: str) -> str:
     normalized = _ERROR_CODE.sub("_", value.lower()).strip("_")
     return (normalized or "unknown_error")[:64]
+
+
+def _public_result_summary(result: EngineCycleResult | None) -> dict[str, object]:
+    if result is None:
+        return {}
+    return {
+        "run_id": result.run_id,
+        "mode": result.mode.value,
+        "markets_scanned": result.markets_scanned,
+        "forecasts_created": result.forecasts_created,
+        "candidates_created": result.candidates_created,
+        "intents_approved": result.intents_approved,
+        "executions": len(result.executions),
+        "skipped": dict(sorted(result.skipped.items())[:50]),
+        "started_at": result.started_at.isoformat(),
+        "completed_at": (
+            result.completed_at.isoformat() if result.completed_at is not None else None
+        ),
+    }

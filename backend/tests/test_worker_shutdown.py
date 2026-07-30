@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Iterator
 from datetime import timedelta
 
 from polybot.config import TradingMode
 from polybot.models import RuntimeControl, utc_now
-from polybot.worker import _shutdown_live_safely, _wait_for_store_startup
+from polybot.worker import (
+    _shutdown_live_safely,
+    _start_worker_health_server,
+    _wait_for_store_startup,
+)
 
 
 class ShutdownStore:
@@ -113,6 +118,29 @@ async def test_store_startup_preflight_is_bounded() -> None:
         retry_delay_seconds=0,
     )
     assert store.calls == 3
+
+
+async def test_worker_health_server_exposes_only_fixed_liveness() -> None:
+    server = await _start_worker_health_server(host="127.0.0.1", port=0)
+    try:
+        sockets = server.sockets
+        assert sockets is not None
+        port = sockets[0].getsockname()[1]
+
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET /livez HTTP/1.1\r\nHost: worker\r\n\r\n")
+        await writer.drain()
+        response = await reader.read()
+        writer.close()
+        await writer.wait_closed()
+
+        assert b"200 OK" in response
+        assert b'{"ok":true,"role":"worker"}' in response
+        assert b"account" not in response
+        assert b"credential" not in response
+    finally:
+        server.close()
+        await server.wait_closed()
 
 
 async def test_shutdown_disarms_then_retries_cancel_before_releasing_lease() -> None:

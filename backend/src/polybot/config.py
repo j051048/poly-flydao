@@ -88,6 +88,12 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     api_host: str = "0.0.0.0"
     api_port: int = 8000
+    worker_health_port: int = Field(
+        default=8080,
+        ge=1,
+        le=65535,
+        validation_alias=AliasChoices("PORT", "POLYBOT_WORKER_HEALTH_PORT"),
+    )
     scan_interval_seconds: int = Field(default=60, ge=10)
     reconcile_interval_seconds: int = Field(default=30, ge=10, le=300)
     market_limit: int = Field(default=20, ge=1, le=200)

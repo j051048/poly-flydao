@@ -3,7 +3,12 @@ import { NextResponse, type NextRequest } from "next/server";
 
 import { getPublicSupabaseConfig } from "./config";
 
-const PUBLIC_PATHS = new Set(["/login", "/register", "/auth/callback"]);
+const PUBLIC_PATHS = new Set([
+  "/login",
+  "/register",
+  "/diagnostics",
+  "/auth/callback",
+]);
 
 export function copyResponseCookies(
   source: NextResponse,

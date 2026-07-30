@@ -203,6 +203,8 @@ async def test_paper_job_builds_an_account_bound_validated_runtime(monkeypatch) 
     assert settings.account_id == str(profile.account_id)
     assert settings.max_order_usd == Decimal("2.50")
     assert settings.min_edge == Decimal("0.06")
+    assert settings.forecast_model == "gpt-5-mini"
+    assert settings.critic_model == "gpt-5-mini"
     assert settings.openai_api_key.get_secret_value() == "sk-tenant-only"
     assert stores.accounts == [str(profile.account_id)]
     assert decryptor.calls == 1
@@ -310,5 +312,7 @@ def test_tenant_runtime_maps_only_custom_provider_to_hardened_adapter() -> None:
 
     assert custom.ai_provider == "openai_compatible"
     assert custom.litellm_base_url == "https://relay.example.com/v1"
+    assert custom.forecast_model == custom.critic_model == "relay-model"
     assert openrouter.ai_provider == "litellm"
     assert openrouter.litellm_base_url == "https://openrouter.ai/api/v1"
+    assert openrouter.forecast_model == openrouter.critic_model == "relay-model"

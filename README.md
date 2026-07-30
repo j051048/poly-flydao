@@ -2,7 +2,7 @@
 
 面向 Polymarket 的 AI 辅助、多租户、风险受控自动化交易系统。仓库包含：
 
-- `apps/web/`：Vercel Next.js 控制台，Supabase Auth、会话恢复、TOTP MFA、凭证/钱包配置、任务与资产状态。
+- `apps/web/`：Vercel Next.js 控制台，Supabase Auth、会话恢复、TOTP MFA、新手向导、部署诊断、AI 判断解释、凭证/钱包配置、任务与资产状态。
 - `backend/`：Zeabur FastAPI Control API 与私有 Tenant Worker。
 - `backend/supabase/migrations/`：账户隔离、任务租约、风险快照、订单账本和配对策略持久层。
 - `docs/`：部署、安全和策略验证门槛。

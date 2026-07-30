@@ -182,6 +182,11 @@ def test_jobs_are_jwt_scoped_idempotent_and_never_execute_over_http() -> None:
         assert other.status_code == 404
         assert own.json()["account_id"] == ACCOUNT_A
 
+        status_response = client.get("/v1/status", headers=_auth("a-aal1"))
+        assert status_response.status_code == 200
+        assert status_response.json()["latest_job"]["id"] == str(job_id)
+        assert status_response.json()["latest_job"]["mode"] == "paper"
+
         removed = client.post("/v1/cycles/run", headers=_auth("a-aal1"))
         assert removed.status_code == 410
 
@@ -200,11 +205,25 @@ def test_status_disarm_and_portfolio_contracts_are_tenant_scoped() -> None:
         assert body["mode"] == "paper"
         assert body["ai_provider"] == "platform"
         assert body["risk_limits"]["max_bucket_exposure_pct"] == "0.05"
+        assert body["latest_job"] is None
 
         portfolio = client.get("/v1/me/portfolio", headers=_auth("a-aal1"))
         assert portfolio.status_code == 200
         assert portfolio.json()["orders"] == []
         assert portfolio.json()["summary"]["portfolio_value_usd"] is None
+
+        analysis = client.get(
+            "/v1/me/analysis?limit=10",
+            headers=_auth("a-aal1"),
+        )
+        assert analysis.status_code == 200
+        assert analysis.json() == {"items": []}
+        assert analysis.headers["cache-control"] == "no-store"
+        assert analysis.headers["x-content-type-options"] == "nosniff"
+        assert (
+            client.get("/v1/me/analysis", headers=_auth("missing")).status_code
+            == 401
+        )
 
         disarmed = client.post("/v1/control/disarm", headers=_auth("a-aal1"))
         assert disarmed.status_code == 202
