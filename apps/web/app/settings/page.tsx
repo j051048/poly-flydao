@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
@@ -15,9 +16,15 @@ import {
   type TenantAIProvider,
   validateCustomAIBaseUrl,
 } from "../../lib/ai-provider";
+import {
+  POLYBOT_TOTP_FRIENDLY_NAME,
+  readableMfaError,
+  selectTotpFactors,
+} from "../../lib/mfa";
 import { getSupabaseBrowserClient } from "../../lib/supabase/browser";
 
 type Notice = { tone: "success" | "error" | "info"; text: string };
+type MfaFactorStatus = "none" | "unverified" | "verified";
 
 const SECP256K1_ORDER = BigInt(
   "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141",
@@ -197,6 +204,8 @@ export default function SettingsPage() {
   const [cycleIntervalSeconds, setCycleIntervalSeconds] = useState(60);
   const [mfaLevel, setMfaLevel] = useState("aal1");
   const [mfaFactorId, setMfaFactorId] = useState<string | null>(null);
+  const [mfaFactorStatus, setMfaFactorStatus] =
+    useState<MfaFactorStatus>("none");
   const [mfaEnrollment, setMfaEnrollment] = useState<MfaEnrollment | null>(null);
   const [mfaCode, setMfaCode] = useState("");
   const [addressCopied, setAddressCopied] = useState(false);
@@ -268,25 +277,40 @@ export default function SettingsPage() {
       setDesiredMode(parsed.desiredMode);
       setAutoRunEnabled(parsed.autoRunEnabled);
       setCycleIntervalSeconds(parsed.cycleIntervalSeconds);
+    } catch (error) {
+      setNotice({ tone: "error", text: readableApiError(error) });
+    }
 
+    try {
       const supabase = getSupabaseBrowserClient();
       if (supabase) {
         const [assurance, factors] = await Promise.all([
           supabase.auth.mfa.getAuthenticatorAssuranceLevel(),
           supabase.auth.mfa.listFactors(),
         ]);
+        const mfaError = assurance.error ?? factors.error;
+        if (mfaError) throw mfaError;
         if (!assurance.error) {
           setMfaLevel(assurance.data.currentLevel ?? "aal1");
         }
         if (!factors.error) {
-          const verified = factors.data.totp.find(
-            (factor) => factor.status === "verified",
+          const selection = selectTotpFactors(factors.data.all);
+          const selected = selection.verified ?? selection.pending;
+          setMfaFactorId(selected?.id ?? null);
+          setMfaFactorStatus(
+            selected?.status === "verified"
+              ? "verified"
+              : selected?.status === "unverified"
+                ? "unverified"
+                : "none",
           );
-          setMfaFactorId(verified?.id ?? null);
+          setMfaEnrollment((current) =>
+            current && current.factorId === selected?.id ? current : null,
+          );
         }
       }
     } catch (error) {
-      setNotice({ tone: "error", text: readableApiError(error) });
+      setNotice({ tone: "error", text: readableMfaError(error) });
     } finally {
       setLoading(false);
     }
@@ -744,9 +768,28 @@ export default function SettingsPage() {
     if (!supabase) return;
     setBusy("mfa-enroll");
     try {
+      const factors = await supabase.auth.mfa.listFactors();
+      if (factors.error) throw factors.error;
+      const selection = selectTotpFactors(factors.data.all);
+      if (selection.verified) {
+        setMfaFactorId(selection.verified.id);
+        setMfaFactorStatus("verified");
+        setMfaEnrollment(null);
+        setNotice({
+          tone: "info",
+          text: "验证器已经绑定。请输入验证器中的 6 位动态码完成本次会话验证。",
+        });
+        return;
+      }
+
+      for (const factorId of selection.pendingIds) {
+        const removed = await supabase.auth.mfa.unenroll({ factorId });
+        if (removed.error) throw removed.error;
+      }
+
       const { data, error } = await supabase.auth.mfa.enroll({
         factorType: "totp",
-        friendlyName: "Polybot Control",
+        friendlyName: POLYBOT_TOTP_FRIENDLY_NAME,
       });
       if (error) throw error;
       setMfaEnrollment({
@@ -754,15 +797,20 @@ export default function SettingsPage() {
         qrCode: data.totp.qr_code,
         secret: data.totp.secret,
       });
+      setMfaFactorId(data.id);
+      setMfaFactorStatus("unverified");
       setMfaCode("");
       setNotice({
         tone: "info",
-        text: "请用验证器扫描二维码，再输入 6 位验证码完成绑定。",
+        text:
+          selection.pendingIds.length > 0
+            ? "上次未完成的绑定已清理。请扫描新二维码，再输入 6 位验证码。"
+            : "请用验证器扫描二维码，再输入 6 位验证码完成绑定。",
       });
     } catch (error) {
       setNotice({
         tone: "error",
-        text: error instanceof Error ? error.message : "无法开始 MFA 绑定。",
+        text: readableMfaError(error),
       });
     } finally {
       setBusy(null);
@@ -780,19 +828,22 @@ export default function SettingsPage() {
         code: mfaCode,
       });
       if (error) throw error;
-      await supabase.auth.refreshSession();
+      const refreshed = await supabase.auth.refreshSession();
+      if (refreshed.error) throw refreshed.error;
       setMfaLevel("aal2");
       setMfaFactorId(factorId);
+      setMfaFactorStatus("verified");
       setMfaEnrollment(null);
       setMfaCode("");
+      await refresh();
       setNotice({
         tone: "success",
-        text: "本次会话已提升到 AAL2，可以导入钱包和短时解锁实盘。",
+        text: "双因素验证完成。本次会话已解锁，可以继续配置 AI。",
       });
     } catch (error) {
       setNotice({
         tone: "error",
-        text: error instanceof Error ? error.message : "MFA 验证失败。",
+        text: readableMfaError(error),
       });
     } finally {
       setBusy(null);
@@ -1161,6 +1212,48 @@ export default function SettingsPage() {
           <p className="field-help">
             保存或撤销 AI Key、导入或撤销钱包、启用自动实盘和短时解锁都要求当前会话达到 AAL2。
           </p>
+
+          {mfaLevel === "aal2" && (
+            <div className="mfa-success-callout">
+              <div>
+                <strong>本次会话已经验证</strong>
+                <span>现在可以保存 AI Key，并继续完成新手向导。</span>
+              </div>
+              <div className="button-row">
+                <a className="primary-button" href="#ai">继续配置 AI</a>
+                <Link className="secondary-button" href="/setup">返回启动向导</Link>
+              </div>
+            </div>
+          )}
+
+          {mfaLevel !== "aal2" && mfaFactorStatus === "verified" && (
+            <div className="mfa-state-callout">
+              <strong>验证器已经绑定</strong>
+              <span>无需重复绑定，直接输入验证器里当前的 6 位动态码。</span>
+            </div>
+          )}
+
+          {mfaLevel !== "aal2" &&
+            mfaFactorStatus === "unverified" &&
+            !mfaEnrollment && (
+              <div className="mfa-recovery-callout">
+                <div>
+                  <strong>检测到上次未完成的绑定</strong>
+                  <span>
+                    如果你已经扫描过旧二维码，可以直接输入动态码；否则重新生成二维码。
+                  </span>
+                </div>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => void beginMfaEnrollment()}
+                  disabled={loading || busy !== null}
+                >
+                  {busy === "mfa-enroll" ? "正在重新生成…" : "重新生成二维码"}
+                </button>
+              </div>
+            )}
+
           {mfaEnrollment && (
             <div className="mfa-enrollment">
               {/* Supabase returns a data URL; CSP permits data images only. */}
@@ -1174,16 +1267,24 @@ export default function SettingsPage() {
               <p className="field-help">
                 无法扫码时手工输入：<code>{mfaEnrollment.secret}</code>
               </p>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => void beginMfaEnrollment()}
+                disabled={loading || busy !== null}
+              >
+                二维码失效？重新生成
+              </button>
             </div>
           )}
           {mfaLevel !== "aal2" && (
             <div className="form-stack">
-              {!mfaEnrollment && !mfaFactorId && (
+              {mfaFactorStatus === "none" && !mfaEnrollment && (
                 <button
                   className="secondary-button"
                   type="button"
                   onClick={() => void beginMfaEnrollment()}
-                  disabled={busy !== null}
+                  disabled={loading || busy !== null}
                 >
                   {busy === "mfa-enroll" ? "创建中…" : "绑定 TOTP 验证器"}
                 </button>
@@ -1210,7 +1311,11 @@ export default function SettingsPage() {
                     onClick={() => void verifyMfa()}
                     disabled={!/^\d{6}$/.test(mfaCode) || busy !== null}
                   >
-                    {busy === "mfa-verify" ? "验证中…" : "验证并提升会话"}
+                    {busy === "mfa-verify"
+                      ? "验证中…"
+                      : mfaFactorStatus === "verified"
+                        ? "验证当前会话"
+                        : "完成绑定并继续"}
                   </button>
                 </>
               )}
