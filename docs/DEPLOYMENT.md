@@ -193,8 +193,15 @@ PostgreSQL 解析、权限和事务验证。
 
 - Zeabur API：`/livez` 只表示进程存活，`/health` 还会检查 Supabase 控制面。
 - 私有 Worker：`/livez` 表示进程存活，`/readyz` 表示队列和依赖已完成初始化。
-- 前端“三端部署检查”会分别显示 API、Supabase 与 Worker 状态；认证后的 Worker
+- 前端“三端部署检查”通过 Vercel 同源服务端探针分别显示 API、浏览器 CORS、Supabase
+  与 Worker 状态；因此即使浏览器被 CORS 拦截，也能明确显示缺少的 origin、方法或请求头。
+  认证后的 Worker
   详情来自 `/v1/worker/status`，公开探针不会返回租户或任务数据。
+- 页面出现“浏览器无法连接 Zeabur 控制 API”时，先打开 `/diagnostics`。如果 API 正常但
+  CORS 未就绪，在 **Zeabur API 服务**（不是 Worker）设置精确值
+  `POLYBOT_DASHBOARD_ORIGINS=https://YOUR_VERCEL_DOMAIN`，不要带路径或末尾斜杠，然后重新部署。
+  保存 AI Key 使用 `PUT`，所以只放行 `GET/POST/OPTIONS` 的旧镜像仍会失败；Zeabur API
+  必须部署包含 `PUT/DELETE` 与 `Idempotency-Key` CORS 配置的最新 `main` 分支。
 - 每个 API 响应都带 `X-Request-ID`。排障时用它匹配 Zeabur 的结构化请求日志，日志中不应出现
   Bearer token、API Key 或钱包私钥。
 - 钱包首次导入只验证 signer、网络和入金地址。入金后，首次短时 arm 的 Canary/Live

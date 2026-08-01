@@ -30,7 +30,9 @@ def _principal(account_id: str, *, aal: str) -> AuthPrincipal:
     )
 
 
-def _test_app() -> tuple[object, InMemoryCredentialRepository, InMemoryJobRepository]:
+def _test_app(
+    *, dashboard_origins: str = ""
+) -> tuple[object, InMemoryCredentialRepository, InMemoryJobRepository]:
     credentials = InMemoryCredentialRepository()
     jobs = InMemoryJobRepository()
     writer = CredentialService(
@@ -52,6 +54,7 @@ def _test_app() -> tuple[object, InMemoryCredentialRepository, InMemoryJobReposi
         litellm_api_key=None,
         polymarket_private_key=None,
         signed_payload_key=None,
+        dashboard_origins=dashboard_origins,
     )
     return (
         create_app(
@@ -68,6 +71,36 @@ def _test_app() -> tuple[object, InMemoryCredentialRepository, InMemoryJobReposi
 
 def _auth(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
+
+
+def test_cors_allows_authenticated_dashboard_mutations() -> None:
+    dashboard_origin = "https://dashboard.example"
+    app, _, _ = _test_app(dashboard_origins=dashboard_origin)
+
+    with TestClient(app) as client:
+        response = client.options(
+            "/v1/me/credentials/ai",
+            headers={
+                "Origin": dashboard_origin,
+                "Access-Control-Request-Method": "PUT",
+                "Access-Control-Request-Headers": (
+                    "authorization,content-type,idempotency-key"
+                ),
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == dashboard_origin
+    methods = {
+        item.strip().upper()
+        for item in response.headers["access-control-allow-methods"].split(",")
+    }
+    allowed_headers = {
+        item.strip().lower()
+        for item in response.headers["access-control-allow-headers"].split(",")
+    }
+    assert {"GET", "POST", "PUT", "DELETE", "OPTIONS"} <= methods
+    assert {"authorization", "content-type", "idempotency-key"} <= allowed_headers
 
 
 def test_secret_enrollment_never_reflects_or_transports_plaintext() -> None:

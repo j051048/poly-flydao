@@ -887,8 +887,18 @@ export default function SettingsPage() {
       </section>
 
       {notice && (
-        <div className={`notice ${notice.tone} page-notice`} role="status">
+        <div
+          className={`notice ${notice.tone} page-notice`}
+          role={notice.tone === "error" ? "alert" : "status"}
+        >
           {notice.text}
+          {notice.tone === "error" &&
+            notice.text.includes("三端部署检查") && (
+              <>
+                {" "}
+                <Link href="/diagnostics">打开三端部署检查 →</Link>
+              </>
+            )}
         </div>
       )}
 

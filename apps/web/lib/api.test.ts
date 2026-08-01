@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { buildApiHeaders, validatedApiBaseUrl } from "./api";
+import {
+  ApiError,
+  buildApiHeaders,
+  isApiNetworkError,
+  readableApiError,
+  validatedApiBaseUrl,
+} from "./api";
 
 describe("buildApiHeaders", () => {
   it("uses only the session token and non-secret request metadata", () => {
@@ -47,5 +53,26 @@ describe("validatedApiBaseUrl", () => {
     "not-a-url",
   ])("rejects an unsafe API target: %s", (value) => {
     expect(validatedApiBaseUrl(value)).toBeNull();
+  });
+});
+
+describe("readableApiError", () => {
+  it.each([
+    "Failed to fetch",
+    "NetworkError when attempting to fetch resource.",
+    "Load failed",
+  ])("turns an opaque browser network failure into an actionable message: %s", (message) => {
+    const error = new TypeError(message);
+
+    expect(isApiNetworkError(error)).toBe(true);
+    expect(readableApiError(error)).toContain("三端部署检查");
+    expect(readableApiError(error)).not.toContain(message);
+  });
+
+  it("preserves safe API response messages", () => {
+    const error = new ApiError(403, "需要双因素验证");
+
+    expect(isApiNetworkError(error)).toBe(false);
+    expect(readableApiError(error)).toBe("需要双因素验证");
   });
 });
