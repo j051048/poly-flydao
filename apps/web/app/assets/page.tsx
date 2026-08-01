@@ -16,6 +16,7 @@ interface Position {
 }
 
 interface Portfolio {
+  mode: string;
   totalEquityUsd?: number;
   availableBalanceUsd?: number;
   grossExposurePct?: number;
@@ -53,11 +54,8 @@ function parsePortfolio(payload: unknown): Portfolio {
   const summary = record(root.summary);
   const wallet = record(root.wallet);
   const positions = Array.isArray(root.positions) ? root.positions : [];
-  const openOrders = Array.isArray(root.orders)
-    ? root.orders.filter((item) => {
-        const status = stringValue(record(item).status);
-        return !status || ["open", "live", "pending"].includes(status);
-      }).length
+  const openOrders = Array.isArray(root.open_orders)
+    ? root.open_orders.length
     : numberValue(
         root.active_orders,
         root.open_orders_count,
@@ -65,6 +63,7 @@ function parsePortfolio(payload: unknown): Portfolio {
       ) ?? 0;
 
   return {
+    mode: stringValue(root.mode) ?? "paper",
     totalEquityUsd: numberValue(
       summary.total_equity_usd,
       summary.portfolio_value_usd,
@@ -88,6 +87,7 @@ function parsePortfolio(payload: unknown): Portfolio {
     ),
     walletAddress: stringValue(
       wallet.address,
+      wallet.deposit_wallet_address,
       root.wallet_address,
       root.deposit_wallet_address,
     ),
@@ -101,9 +101,13 @@ function parsePortfolio(payload: unknown): Portfolio {
         market: stringValue(item.market, item.market_title, item.question) ?? "未知市场",
         outcome: stringValue(item.outcome, item.side) ?? "—",
         size: numberValue(item.size, item.quantity, item.shares) ?? 0,
-        averagePrice: numberValue(item.average_price, item.avg_price),
+        averagePrice: numberValue(
+          item.average_entry_price,
+          item.average_price,
+          item.avg_price,
+        ),
         currentPrice: numberValue(item.current_price, item.mark_price),
-        valueUsd: numberValue(item.value_usd, item.current_value),
+        valueUsd: numberValue(item.value_pusd, item.value_usd, item.current_value),
         pnlUsd: numberValue(item.pnl_usd, item.unrealized_pnl_usd),
       };
     }),
@@ -155,6 +159,13 @@ export default function AssetsPage() {
         <div>
           <p className="eyebrow">TENANT PORTFOLIO</p>
           <h1>个人资产</h1>
+          <p className="muted">
+            {portfolio?.mode === "paper"
+              ? "当前显示模拟盘资产；未结算仓位按成本记账，不代表真实钱包余额或市场盈利。"
+              : portfolio?.mode === "shadow"
+                ? "Shadow 只记录决策意图，不创建仓位或计算资产收益。"
+                : "当前显示已对账的真实钱包资产。"}
+          </p>
         </div>
         <button
           className="secondary-button"
@@ -176,7 +187,13 @@ export default function AssetsPage() {
         <article className="summary-card">
           <div className="card-heading">
             <span>总资产</span>
-            <span className="pill online">USD</span>
+            <span className="pill online">
+              {portfolio?.mode === "paper"
+                ? "PAPER"
+                : portfolio?.mode === "shadow"
+                  ? "SHADOW"
+                  : "pUSD"}
+            </span>
           </div>
           <div className="primary-value">
             {loading ? "读取中…" : money(portfolio?.totalEquityUsd)}
@@ -265,7 +282,13 @@ export default function AssetsPage() {
           <div className="empty-state">
             <span aria-hidden="true">◎</span>
             <p>{error ? "资产读取失败。" : "当前租户暂无开放仓位。"}</p>
-            <p>完成机器人钱包配置并入金后，资产会从后端实时同步。</p>
+            <p>
+              {portfolio?.mode === "paper"
+                ? "先运行一次 Paper 周期，模拟成交后会在这里显示。"
+                : portfolio?.mode === "shadow"
+                  ? "Shadow 的决策轨迹请在“判断分析”页面查看。"
+                  : "完成机器人钱包配置并入金后，资产会从后端同步。"}
+            </p>
           </div>
         )}
 

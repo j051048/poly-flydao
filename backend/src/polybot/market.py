@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Protocol
 
-from polybot.models import BookLevel, MarketSpec, OrderBookSnapshot, utc_now
+from polybot.models import BookLevel, MarketSpec, OrderBookSnapshot, Outcome, utc_now
 
 
 class MarketData(Protocol):
@@ -48,6 +48,45 @@ def _datetime(value: Any) -> datetime | None:
         return datetime.fromtimestamp(epoch, tz=UTC)
     parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _resolved_outcome(raw: Any, yes: Any, no: Any, *, closed: bool) -> Outcome | None:
+    """Read an explicit Gamma resolution without guessing from question text."""
+
+    if not closed:
+        return None
+    yes_label = str(_get(yes, "label", default="Yes") or "Yes").casefold()
+    no_label = str(_get(no, "label", default="No") or "No").casefold()
+    resolution = _get(raw, "resolution", default={})
+    candidates = (
+        _get(resolution, "outcome"),
+        _get(resolution, "result"),
+        _get(resolution, "winning_outcome"),
+        _get(raw, "resolved_outcome"),
+        _get(raw, "winning_outcome"),
+    )
+    for value in candidates:
+        normalized = str(value or "").strip().casefold()
+        if normalized in {"yes", yes_label}:
+            return Outcome.YES
+        if normalized in {"no", no_label}:
+            return Outcome.NO
+    yes_winner = _get(yes, "winner")
+    no_winner = _get(no, "winner")
+    if yes_winner is True and no_winner is not True:
+        return Outcome.YES
+    if no_winner is True and yes_winner is not True:
+        return Outcome.NO
+    try:
+        yes_price = _decimal(_get(yes, "price"), "-1")
+        no_price = _decimal(_get(no, "price"), "-1")
+    except Exception:
+        return None
+    if yes_price == 1 and no_price == 0:
+        return Outcome.YES
+    if no_price == 1 and yes_price == 0:
+        return Outcome.NO
+    return None
 
 
 class PolymarketMarketData:
@@ -148,6 +187,7 @@ class PolymarketMarketData:
             raise ValueError("binary market is missing an id or outcome token")
         market_id = str(raw_market_id)
         description = str(_get(raw, "description", default=""))
+        closed = bool(_get(state, "closed", default=False))
         return MarketSpec(
             id=market_id,
             condition_id=_get(raw, "condition_id"),
@@ -167,15 +207,14 @@ class PolymarketMarketData:
                 if (value := (_get(tag, "label") or _get(tag, "slug"))) is not None
             ),
             resolution_rules=str(_get(raw, "rules", default=description)),
-            resolution_source=(
-                _get(resolution, "source") or _get(raw, "resolution_source")
-            ),
+            resolution_source=(_get(resolution, "source") or _get(raw, "resolution_source")),
             yes_token_id=str(yes_token_id),
             no_token_id=str(no_token_id),
             yes_label=str(_get(yes, "label", default="Yes") or "Yes"),
             no_label=str(_get(no, "label", default="No") or "No"),
             active=bool(_get(state, "active", default=True)),
-            closed=bool(_get(state, "closed", default=False)),
+            closed=closed,
+            resolved_outcome=_resolved_outcome(raw, yes, no, closed=closed),
             accepting_orders=bool(_get(state, "accepting_orders", default=True)),
             neg_risk=bool(_get(state, "neg_risk", default=False)),
             liquidity_usd=_decimal(_get(metrics, "liquidity")),

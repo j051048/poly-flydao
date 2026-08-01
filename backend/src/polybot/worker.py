@@ -17,6 +17,13 @@ from polybot.runtime import build_runtime
 from polybot.security_logging import configure_secure_logging, safe_json
 from polybot.stores.base import StateStore
 
+_WORKER_READY = False
+
+
+def _set_worker_ready(value: bool) -> None:
+    global _WORKER_READY
+    _WORKER_READY = value
+
 
 @dataclass(frozen=True)
 class ShutdownSafetyResult:
@@ -52,6 +59,13 @@ async def _handle_worker_health_request(
         if len(parts) == 3 and parts[0] in {"GET", "HEAD"} and parts[1] == "/livez":
             status = "200 OK"
             body = b'{"ok":true,"role":"worker"}'
+        elif len(parts) == 3 and parts[0] in {"GET", "HEAD"} and parts[1] == "/readyz":
+            if _WORKER_READY:
+                status = "200 OK"
+                body = b'{"ok":true,"role":"worker","ready":true}'
+            else:
+                status = "503 Service Unavailable"
+                body = b'{"ok":false,"role":"worker","ready":false}'
         if len(parts) == 3 and parts[0] == "HEAD":
             body = b""
     except (TimeoutError, ValueError):

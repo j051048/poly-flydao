@@ -51,6 +51,19 @@ class FakeJobs:
     async def get_worker_wallet(self, *, account_id: str, wallet_id):
         return None
 
+    async def consume_ai_budget(self, *, account_id: str, units: int = 1):
+        assert account_id == str(self.profile.account_id)
+        return True, units, 100
+
+    async def load_paper_state(self, account_id: str):
+        assert account_id == str(self.profile.account_id)
+        return None
+
+    async def save_paper_state(self, *, job, state):
+        assert job.account_id == self.profile.account_id
+        assert state["schema_version"] == 1
+        return True
+
 
 class FakeCredentials:
     def __init__(self, credential: WorkerCredential | None):
@@ -179,9 +192,10 @@ async def test_paper_job_builds_an_account_bound_validated_runtime(monkeypatch) 
 
     runtime = Runtime()
 
-    def fake_build(settings, *, store_override):
+    def fake_build(settings, *, store_override, broker_override):
         captured["settings"] = settings
         captured["store"] = store_override
+        captured["broker"] = broker_override
         return runtime
 
     monkeypatch.setattr("polybot.tenant_execution.build_runtime", fake_build)

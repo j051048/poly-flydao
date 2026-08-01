@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from datetime import timedelta
+from decimal import Decimal
 from uuid import uuid4
 
 import pytest
@@ -23,10 +24,40 @@ from polybot.jobs import (
     InMemoryJobRepository,
     RuntimeProfilePatch,
     SupabaseJobRepository,
+    _performance_snapshot,
 )
 from polybot.models import utc_now
 
 ACCOUNT = "11111111-1111-4111-8111-111111111111"
+
+
+def test_performance_snapshot_builds_calibration_without_claiming_profitability() -> None:
+    snapshot = _performance_snapshot(
+        [
+            {
+                "market_id": "m1",
+                "probability_yes": "0.70",
+                "resolved_yes": True,
+                "brier_score": "0.09",
+                "log_loss": "0.356674944",
+            },
+            {
+                "market_id": "m2",
+                "probability_yes": "0.20",
+                "resolved_yes": False,
+                "brier_score": "0.04",
+                "log_loss": "0.223143551",
+            },
+        ],
+        ai_usage_used=8,
+        ai_usage_limit=100,
+    )
+
+    assert snapshot.sample_size == 2
+    assert snapshot.resolved_markets == 2
+    assert snapshot.brier_score == Decimal("0.065")
+    assert snapshot.research_only
+    assert snapshot.strategy_validation == "insufficient_data"
 
 
 @pytest.mark.asyncio
@@ -319,6 +350,9 @@ class _AnalysisClient:
             "forecasts": [],
             "markets": [],
             "evidence": [],
+            "order_intents": [],
+            "risk_events": [],
+            "orders": [],
         }
         self.rows = {
             "forecasts": [
@@ -344,6 +378,9 @@ class _AnalysisClient:
                     "summary": "Evidence summary",
                 }
             ],
+            "order_intents": [],
+            "risk_events": [],
+            "orders": [],
         }
 
     def table(self, name: str) -> _AnalysisBuilder:
@@ -352,8 +389,8 @@ class _AnalysisClient:
 
 @pytest.mark.asyncio
 async def test_supabase_health_requires_latest_schema_sentinel() -> None:
-    assert await SupabaseJobRepository(_HealthClient(14)).health()
-    assert not await SupabaseJobRepository(_HealthClient(13)).health()
+    assert await SupabaseJobRepository(_HealthClient(15)).health()
+    assert not await SupabaseJobRepository(_HealthClient(14)).health()
 
 
 @pytest.mark.asyncio

@@ -160,7 +160,72 @@ class PortfolioSnapshot(BaseModel):
     open_orders: list[dict[str, Any]]
     orders: list[dict[str, Any]]
     recent_fills: list[dict[str, Any]]
-    summary: dict[str, int | str | None]
+    summary: dict[str, Any]
+    wallet: dict[str, Any] | None = None
+    mode: TradingMode = TradingMode.PAPER
+
+
+class WorkerStatusSnapshot(BaseModel):
+    online: bool
+    ready: bool
+    owner_id: str | None = None
+    release: str | None = None
+    status: str = "offline"
+    active_jobs: int = 0
+    queue_lag_seconds: Decimal | None = None
+    started_at: datetime | None = None
+    last_seen_at: datetime | None = None
+
+
+class RiskPresetRequest(BaseModel):
+    expected_profile_version: int = Field(ge=1)
+    preset: str = Field(pattern=r"^(conservative|balanced|advanced)$")
+
+
+class AIBudgetRequest(BaseModel):
+    request_limit: int = Field(ge=20, le=10000)
+
+
+class AIDiagnosticJob(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: UUID
+    account_id: UUID
+    credential_id: UUID
+    provider: AIProvider
+    ai_base_url: str | None = None
+    model: str
+    status: str
+    claimed_by: str | None = None
+    fencing_token: int = 0
+    lease_expires_at: datetime | None = None
+    result_summary: dict[str, Any] | None = None
+    error_code: str | None = None
+    created_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    updated_at: datetime
+
+
+class CalibrationBin(BaseModel):
+    lower: Decimal
+    upper: Decimal
+    samples: int
+    mean_forecast: Decimal | None = None
+    observed_frequency: Decimal | None = None
+
+
+class PerformanceSnapshot(BaseModel):
+    sample_size: int = 0
+    resolved_markets: int = 0
+    brier_score: Decimal | None = None
+    log_loss: Decimal | None = None
+    calibration: list[CalibrationBin] = Field(default_factory=list)
+    ai_usage_used: int = 0
+    ai_usage_limit: int = 0
+    strategy_validation: str = "insufficient_data"
+    research_only: bool = True
+    warning: str = "校准样本和历史结果不保证未来盈利；P2 微结构策略仍保持 research-only。"
 
 
 class JobRepository(Protocol):
@@ -208,9 +273,33 @@ class JobRepository(Protocol):
         limit: int = 20,
     ) -> list[dict[str, Any]]: ...
 
-    async def get_active_risk_policy(
-        self, account_id: str
-    ) -> RiskPolicySnapshot | None: ...
+    async def get_active_risk_policy(self, account_id: str) -> RiskPolicySnapshot | None: ...
+
+    async def create_risk_policy_preset(
+        self,
+        *,
+        account_id: str,
+        expected_profile_version: int,
+        preset: str,
+    ) -> RiskPolicySnapshot: ...
+
+    async def worker_status(self) -> WorkerStatusSnapshot: ...
+
+    async def load_paper_state(self, account_id: str) -> dict[str, Any] | None: ...
+
+    async def enqueue_ai_diagnostic(self, account_id: str) -> AIDiagnosticJob: ...
+
+    async def get_ai_diagnostic(
+        self, *, account_id: str, job_id: UUID
+    ) -> AIDiagnosticJob | None: ...
+
+    async def notifications(self, account_id: str, *, limit: int = 20) -> list[dict[str, Any]]: ...
+
+    async def mark_notification_read(self, *, account_id: str, notification_id: int) -> bool: ...
+
+    async def performance(self, account_id: str) -> PerformanceSnapshot: ...
+
+    async def set_ai_budget_limit(self, *, account_id: str, request_limit: int) -> int: ...
 
 
 class WorkerJobRepository(Protocol):
@@ -285,6 +374,45 @@ class WorkerJobRepository(Protocol):
         expected_version: int,
     ) -> RiskPolicySnapshot | None: ...
 
+    async def save_paper_state(
+        self,
+        *,
+        job: CycleJob,
+        state: dict[str, Any],
+    ) -> bool: ...
+
+    async def record_worker_heartbeat(
+        self,
+        *,
+        owner_id: str,
+        release: str,
+        status: str,
+        active_jobs: int,
+        queue_lag_seconds: Decimal | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None: ...
+
+    async def claim_ai_diagnostic(
+        self, *, claimed_by: str, lease_seconds: int
+    ) -> AIDiagnosticJob | None: ...
+
+    async def finish_ai_diagnostic(
+        self,
+        *,
+        job: AIDiagnosticJob,
+        ok: bool,
+        result_summary: dict[str, Any],
+        error_code: str | None = None,
+    ) -> AIDiagnosticJob | None: ...
+
+    async def consume_ai_budget(
+        self, *, account_id: str, units: int = 1
+    ) -> tuple[bool, int, int]: ...
+
+    async def unresolved_market_conditions(self, *, limit: int = 100) -> list[str]: ...
+
+    async def record_market_resolution(self, *, condition_id: str, outcome: str) -> int: ...
+
 
 def _profile_from_row(row: dict[str, Any]) -> RuntimeProfile:
     return RuntimeProfile.model_validate(row)
@@ -292,6 +420,115 @@ def _profile_from_row(row: dict[str, Any]) -> RuntimeProfile:
 
 def _job_from_row(row: dict[str, Any]) -> CycleJob:
     return CycleJob.model_validate(row)
+
+
+def _decimal_or_none(value: Any) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except Exception:
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def _decimal_or_zero(value: Any) -> Decimal:
+    return _decimal_or_none(value) or Decimal("0")
+
+
+def _decimal_text(value: Decimal | None) -> str | None:
+    return str(value) if value is not None else None
+
+
+def _ratio_text(numerator: Decimal, denominator: Decimal | None) -> str | None:
+    if denominator is None or denominator <= 0:
+        return None
+    return str(numerator / denominator)
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _inside_window(
+    value: Any,
+    start: datetime | None,
+    end: datetime | None,
+) -> bool:
+    candidate = _parse_datetime(value)
+    return bool(candidate and start and end and start <= candidate <= end)
+
+
+def _performance_snapshot(
+    rows: list[dict[str, Any]],
+    *,
+    ai_usage_used: int,
+    ai_usage_limit: int,
+) -> PerformanceSnapshot:
+    valid: list[tuple[Decimal, Decimal, Decimal, bool, str]] = []
+    for row in rows:
+        probability = _decimal_or_none(row.get("probability_yes"))
+        brier = _decimal_or_none(row.get("brier_score"))
+        log_loss = _decimal_or_none(row.get("log_loss"))
+        if probability is None or brier is None or log_loss is None:
+            continue
+        if not 0 <= probability <= 1 or brier < 0 or log_loss < 0:
+            continue
+        valid.append(
+            (
+                probability,
+                brier,
+                log_loss,
+                bool(row.get("resolved_yes")),
+                str(row.get("market_id") or ""),
+            )
+        )
+    bins: list[CalibrationBin] = []
+    for index in range(10):
+        lower = Decimal(index) / Decimal(10)
+        upper = Decimal(index + 1) / Decimal(10)
+        selected = [
+            item for item in valid if lower <= item[0] <= upper and (index == 9 or item[0] < upper)
+        ]
+        bins.append(
+            CalibrationBin(
+                lower=lower,
+                upper=upper,
+                samples=len(selected),
+                mean_forecast=(
+                    sum((item[0] for item in selected), Decimal("0")) / Decimal(len(selected))
+                    if selected
+                    else None
+                ),
+                observed_frequency=(
+                    Decimal(sum(1 for item in selected if item[3])) / Decimal(len(selected))
+                    if selected
+                    else None
+                ),
+            )
+        )
+    count = len(valid)
+    return PerformanceSnapshot(
+        sample_size=count,
+        resolved_markets=len({item[4] for item in valid if item[4]}),
+        brier_score=(
+            sum((item[1] for item in valid), Decimal("0")) / Decimal(count) if count else None
+        ),
+        log_loss=(
+            sum((item[2] for item in valid), Decimal("0")) / Decimal(count) if count else None
+        ),
+        calibration=bins,
+        ai_usage_used=ai_usage_used,
+        ai_usage_limit=ai_usage_limit,
+        strategy_validation="calibrating" if count >= 30 else "insufficient_data",
+    )
 
 
 class SupabaseJobRepository:
@@ -323,9 +560,7 @@ class SupabaseJobRepository:
             await self._execute(
                 self._client.table("cycle_jobs").select("id,result_summary").limit(1)
             )
-            version_response = await self._execute(
-                self._client.rpc("polybot_schema_version", {})
-            )
+            version_response = await self._execute(self._client.rpc("polybot_schema_version", {}))
             version_data = getattr(version_response, "data", None)
             if isinstance(version_data, list):
                 version_data = version_data[0] if version_data else None
@@ -334,7 +569,7 @@ class SupabaseJobRepository:
                     "polybot_schema_version",
                     version_data.get("version"),
                 )
-            return version_data == 14
+            return version_data == 15
         except Exception:
             return False
 
@@ -350,9 +585,7 @@ class SupabaseJobRepository:
             raise AccountNotReadyError("runtime profile is unavailable")
         return _profile_from_row(row)
 
-    async def update_profile(
-        self, account_id: str, patch: RuntimeProfilePatch
-    ) -> RuntimeProfile:
+    async def update_profile(self, account_id: str, patch: RuntimeProfilePatch) -> RuntimeProfile:
         response = await self._execute(
             self._client.rpc(
                 "update_account_runtime_profile",
@@ -405,9 +638,7 @@ class SupabaseJobRepository:
                     "p_risk_policy_id": (
                         str(request.risk_policy_id) if request.risk_policy_id else None
                     ),
-                    "p_run_after": (
-                        request.run_after.isoformat() if request.run_after else None
-                    ),
+                    "p_run_after": (request.run_after.isoformat() if request.run_after else None),
                 },
             )
         )
@@ -451,10 +682,7 @@ class SupabaseJobRepository:
     async def get_runtime_control(self, account_id: str) -> RuntimeControl:
         await self.get_or_create_profile(account_id)
         response = await self._execute(
-            self._client.table("runtime_controls")
-            .select("*")
-            .eq("account_id", account_id)
-            .limit(1)
+            self._client.table("runtime_controls").select("*").eq("account_id", account_id).limit(1)
         )
         row = self._first(response)
         if row is None:
@@ -518,7 +746,7 @@ class SupabaseJobRepository:
             ),
             self._execute(
                 self._client.table("trading_wallets")
-                .select("id")
+                .select("id,chain_id,collateral_token")
                 .eq("account_id", account_id)
                 .eq("id", str(profile.trading_wallet_id))
                 .eq("status", "active")
@@ -533,22 +761,36 @@ class SupabaseJobRepository:
                 .limit(1)
             ),
         )
-        if not all(
-            self._first(response)
-            for response in (credential_response, wallet_response, risk_response)
+        credential = self._first(credential_response)
+        wallet = self._first(wallet_response)
+        risk = self._first(risk_response)
+        if (
+            credential is None
+            or risk is None
+            or wallet is None
+            or not wallet.get("chain_id")
+            or not wallet.get("collateral_token")
         ):
             raise AccountNotReadyError(
-                "active tenant AI credential, verified wallet, and risk policy are required"
+                "active AI credential, verified wallet, and risk policy are required"
             )
 
     async def portfolio(self, account_id: str) -> PortfolioSnapshot:
-        positions_response, orders_response, fills_response = await asyncio.gather(
+        (
+            positions_response,
+            orders_response,
+            fills_response,
+            risk_state_response,
+            wallet_response,
+            profile_response,
+            paper_state_response,
+        ) = await asyncio.gather(
             self._execute(
                 self._client.table("positions")
                 .select(
                     "id,market_id,outcome_token_id,outcome,shares,average_entry_price,"
                     "cost_basis_pusd,realized_pnl_pusd,mark_price,unrealized_pnl_pusd,"
-                    "as_of,version,updated_at"
+                    "as_of,version,updated_at,markets(question,slug,end_at)"
                 )
                 .eq("account_id", account_id)
                 .order("updated_at", desc=True)
@@ -557,26 +799,11 @@ class SupabaseJobRepository:
             self._execute(
                 self._client.table("orders")
                 .select(
-                    "id,order_intent_id,clob_order_id,outcome_token_id,side,order_type,"
+                    "id,order_intent_id,clob_order_id,environment,outcome_token_id,side,order_type,"
                     "limit_price,original_size,filled_size,remaining_size,status,"
                     "submitted_at,updated_at"
                 )
                 .eq("account_id", account_id)
-                .in_(
-                    "status",
-                    [
-                        "created",
-                        "signed",
-                        "submitting",
-                        "submitted",
-                        "live",
-                        "unknown",
-                        "partially_filled",
-                        "cancel_pending",
-                        "matched",
-                        "mined",
-                    ],
-                )
                 .order("updated_at", desc=True)
                 .limit(250)
             ),
@@ -591,40 +818,244 @@ class SupabaseJobRepository:
                 .order("matched_at", desc=True)
                 .limit(100)
             ),
+            self._execute(
+                self._client.table("account_risk_state")
+                .select(
+                    "peak_equity_pusd,latest_equity_pusd,day_start_equity_pusd,risk_day,updated_at"
+                )
+                .eq("account_id", account_id)
+                .limit(1)
+            ),
+            self._execute(
+                self._client.table("trading_wallets")
+                .select(
+                    "id,label,deposit_wallet_address,signer_address,chain_id,"
+                    "signature_type,status,collateral_balance_pusd,allowances_ready,"
+                    "readiness_checked_at,updated_at"
+                )
+                .eq("account_id", account_id)
+                .in_("status", ["active", "pending_verification"])
+                .order("updated_at", desc=True)
+                .limit(1)
+            ),
+            self._execute(
+                self._client.table("account_runtime_profiles")
+                .select("desired_mode,trading_wallet_id")
+                .eq("account_id", account_id)
+                .limit(1)
+            ),
+            self._execute(
+                self._client.table("paper_account_states")
+                .select("state,version,updated_at")
+                .eq("account_id", account_id)
+                .limit(1)
+            ),
         )
         positions = [
             row
             for row in (getattr(positions_response, "data", None) or [])
             if isinstance(row, dict)
         ]
-        open_orders = [
-            row
-            for row in (getattr(orders_response, "data", None) or [])
-            if isinstance(row, dict)
+        orders = [
+            row for row in (getattr(orders_response, "data", None) or []) if isinstance(row, dict)
         ]
+        open_statuses = {
+            "created",
+            "signed",
+            "submitting",
+            "submitted",
+            "live",
+            "unknown",
+            "partially_filled",
+            "cancel_pending",
+        }
+        open_orders = [row for row in orders if str(row.get("status")) in open_statuses]
         recent_fills = [
-            row
-            for row in (getattr(fills_response, "data", None) or [])
-            if isinstance(row, dict)
+            row for row in (getattr(fills_response, "data", None) or []) if isinstance(row, dict)
         ]
+        risk_state = self._first(risk_state_response) or {}
+        wallet = self._first(wallet_response)
+        profile = self._first(profile_response) or {}
+        paper_row = self._first(paper_state_response) or {}
+        paper_state = paper_row.get("state")
+        if not isinstance(paper_state, dict):
+            paper_state = {}
+
+        for position in positions:
+            market = position.pop("markets", None)
+            if isinstance(market, dict):
+                position["market"] = market.get("question")
+                position["market_slug"] = market.get("slug")
+                position["market_end_at"] = market.get("end_at")
+            shares = _decimal_or_zero(position.get("shares"))
+            mark = _decimal_or_none(position.get("mark_price"))
+            if mark is None:
+                mark = _decimal_or_none(position.get("average_entry_price"))
+            position["value_pusd"] = str(shares * mark) if mark is not None else None
+
+        paper_positions_raw = paper_state.get("positions", [])
+        paper_market_ids = {
+            str(item.get("market_id"))
+            for item in paper_positions_raw
+            if isinstance(item, dict) and item.get("market_id")
+        }
+        paper_market_map: dict[str, dict[str, Any]] = {}
+        if paper_market_ids:
+            market_response = await self._execute(
+                self._client.table("markets")
+                .select("id,gamma_market_id,question,slug,end_at")
+                .in_("gamma_market_id", sorted(paper_market_ids))
+            )
+            for row in getattr(market_response, "data", None) or []:
+                if isinstance(row, dict):
+                    for key in (row.get("gamma_market_id"), row.get("id")):
+                        if key:
+                            paper_market_map[str(key)] = row
+        paper_positions: list[dict[str, Any]] = []
+        for index, raw in enumerate(paper_positions_raw):
+            if not isinstance(raw, dict):
+                continue
+            shares = _decimal_or_zero(raw.get("shares"))
+            cost = _decimal_or_zero(raw.get("cost"))
+            average = cost / shares if shares > 0 else None
+            market_id = str(raw.get("market_id") or "")
+            market = paper_market_map.get(market_id, {})
+            paper_positions.append(
+                {
+                    "id": f"paper-{raw.get('token_id') or index}",
+                    "market_id": market_id,
+                    "market": market.get("question") or market_id,
+                    "market_slug": market.get("slug"),
+                    "market_end_at": market.get("end_at"),
+                    "outcome_token_id": raw.get("token_id"),
+                    "outcome": raw.get("outcome"),
+                    "shares": str(shares),
+                    "average_entry_price": str(average) if average is not None else None,
+                    "mark_price": str(average) if average is not None else None,
+                    "cost_basis_pusd": str(cost),
+                    "value_pusd": str(cost),
+                    "realized_pnl_pusd": "0",
+                    "unrealized_pnl_pusd": "0",
+                    "updated_at": paper_row.get("updated_at"),
+                }
+            )
+
+        live_position_value = sum(
+            (_decimal_or_zero(position.get("value_pusd")) for position in positions),
+            Decimal("0"),
+        )
+        live_realized = sum(
+            (_decimal_or_zero(position.get("realized_pnl_pusd")) for position in positions),
+            Decimal("0"),
+        )
+        live_unrealized = sum(
+            (_decimal_or_zero(position.get("unrealized_pnl_pusd")) for position in positions),
+            Decimal("0"),
+        )
+        wallet_cash = _decimal_or_none(wallet.get("collateral_balance_pusd")) if wallet else None
+        live_equity = _decimal_or_none(risk_state.get("latest_equity_pusd"))
+        if live_equity is None and wallet_cash is not None:
+            live_equity = wallet_cash + live_position_value
+        live_cash = wallet_cash
+        if live_cash is None and live_equity is not None:
+            live_cash = max(Decimal("0"), live_equity - live_position_value)
+        live_summary: dict[str, Any] = {
+            "position_count": len(positions),
+            "open_order_count": len(open_orders),
+            "recent_fill_count": len(recent_fills),
+            "cash_usd": _decimal_text(live_cash),
+            "available_balance_usd": _decimal_text(live_cash),
+            "portfolio_value_usd": _decimal_text(live_equity),
+            "total_equity_usd": _decimal_text(live_equity),
+            "gross_exposure_usd": str(live_position_value),
+            "gross_exposure_pct": _ratio_text(live_position_value, live_equity),
+            "realized_pnl_usd": str(live_realized),
+            "unrealized_pnl_usd": str(live_unrealized),
+            "pnl_usd": str(live_realized + live_unrealized),
+            "updated_at": risk_state.get("updated_at"),
+        }
+        paper_cash = _decimal_or_none(paper_state.get("cash"))
+        paper_exposure = sum(
+            (_decimal_or_zero(position.get("cost_basis_pusd")) for position in paper_positions),
+            Decimal("0"),
+        )
+        paper_equity = paper_cash + paper_exposure if paper_cash is not None else None
+        paper_realized = _decimal_or_none(paper_state.get("realized_pnl"))
+        paper_summary: dict[str, Any] = {
+            "position_count": len(paper_positions),
+            "open_order_count": len(
+                [row for row in open_orders if row.get("environment") == "paper"]
+            ),
+            "recent_fill_count": len(
+                [
+                    row
+                    for row in orders
+                    if row.get("environment") == "paper" and row.get("status") == "simulated"
+                ]
+            ),
+            "cash_usd": _decimal_text(paper_cash),
+            "available_balance_usd": _decimal_text(paper_cash),
+            "portfolio_value_usd": _decimal_text(paper_equity),
+            "total_equity_usd": _decimal_text(paper_equity),
+            "gross_exposure_usd": str(paper_exposure),
+            "gross_exposure_pct": _ratio_text(paper_exposure, paper_equity),
+            "realized_pnl_usd": _decimal_text(paper_realized),
+            "unrealized_pnl_usd": "0" if paper_equity is not None else None,
+            "pnl_usd": _decimal_text(paper_realized),
+            "updated_at": paper_row.get("updated_at"),
+        }
+        try:
+            mode = TradingMode(str(profile.get("desired_mode") or "paper"))
+        except ValueError:
+            mode = TradingMode.PAPER
+        shadow_summary: dict[str, Any] = {
+            "position_count": 0,
+            "open_order_count": 0,
+            "recent_fill_count": 0,
+            "cash_usd": None,
+            "available_balance_usd": None,
+            "portfolio_value_usd": None,
+            "total_equity_usd": None,
+            "gross_exposure_usd": "0",
+            "gross_exposure_pct": None,
+            "realized_pnl_usd": None,
+            "unrealized_pnl_usd": None,
+            "pnl_usd": None,
+            "updated_at": None,
+        }
+        if mode is TradingMode.PAPER:
+            selected_positions = paper_positions
+            selected_summary = paper_summary
+        elif mode is TradingMode.SHADOW:
+            selected_positions = []
+            selected_summary = shadow_summary
+        else:
+            selected_positions = positions
+            selected_summary = live_summary
+        selected_open_orders = [
+            row
+            for row in open_orders
+            if row.get("environment") == mode.value
+            or (
+                mode in {TradingMode.CANARY, TradingMode.LIVE}
+                and row.get("environment") in {"canary", "live"}
+            )
+        ]
+        combined_summary = {
+            **selected_summary,
+            "paper": paper_summary,
+            "live": live_summary,
+            "shadow": shadow_summary,
+        }
         return PortfolioSnapshot(
             account_id=account_id,
-            positions=positions,
-            open_orders=open_orders,
-            orders=open_orders,
+            positions=selected_positions,
+            open_orders=selected_open_orders,
+            orders=orders,
             recent_fills=recent_fills,
-            summary={
-                "position_count": len(positions),
-                "open_order_count": len(open_orders),
-                "recent_fill_count": len(recent_fills),
-                "cash_usd": None,
-                "portfolio_value_usd": None,
-                "total_equity_usd": None,
-                "gross_exposure_usd": None,
-                "realized_pnl_usd": None,
-                "unrealized_pnl_usd": None,
-                "pnl_usd": None,
-            },
+            summary=combined_summary,
+            wallet=wallet,
+            mode=mode,
         )
 
     async def recent_analysis(
@@ -654,67 +1085,173 @@ class SupabaseJobRepository:
             return []
 
         market_ids = sorted(
-            {
-                str(row["market_id"])
-                for row in forecast_rows
-                if row.get("market_id") is not None
-            }
+            {str(row["market_id"]) for row in forecast_rows if row.get("market_id") is not None}
         )
         evidence_ids = sorted(
             {
                 str(evidence_id)
                 for row in forecast_rows
                 for evidence_id in (
-                    row.get("evidence_ids")
-                    if isinstance(row.get("evidence_ids"), list)
-                    else []
+                    row.get("evidence_ids") if isinstance(row.get("evidence_ids"), list) else []
                 )
             }
         )
         market_rows: list[dict[str, Any]] = []
         evidence_rows: list[dict[str, Any]] = []
+        intent_rows: list[dict[str, Any]] = []
+        risk_rows: list[dict[str, Any]] = []
+        order_rows: list[dict[str, Any]] = []
         if market_ids:
-            response = await self._execute(
-                self._client.table("markets")
-                .select("id,question,slug,end_at,active,closed")
-                .in_("id", market_ids)
+            market_response, intent_response, risk_response = await asyncio.gather(
+                self._execute(
+                    self._client.table("markets")
+                    .select("id,question,slug,end_at,active,closed")
+                    .in_("id", market_ids)
+                ),
+                self._execute(
+                    self._client.table("order_intents")
+                    .select(
+                        "id,market_id,intent_hash,outcome,side,price,size,notional_usd,"
+                        "edge_after_costs,status,created_at"
+                    )
+                    .eq("account_id", account_id)
+                    .in_("market_id", market_ids)
+                    .order("created_at", desc=True)
+                    .limit(200)
+                ),
+                self._execute(
+                    self._client.table("risk_events")
+                    .select("id,market_id,order_intent_id,severity,code,action,details,occurred_at")
+                    .eq("account_id", account_id)
+                    .in_("market_id", market_ids)
+                    .order("occurred_at", desc=True)
+                    .limit(300)
+                ),
             )
             market_rows = [
                 row
-                for row in (getattr(response, "data", None) or [])
+                for row in (getattr(market_response, "data", None) or [])
                 if isinstance(row, dict)
             ]
+            intent_rows = [
+                row
+                for row in (getattr(intent_response, "data", None) or [])
+                if isinstance(row, dict)
+            ]
+            risk_rows = [
+                row for row in (getattr(risk_response, "data", None) or []) if isinstance(row, dict)
+            ]
+            intent_ids = [str(row["id"]) for row in intent_rows if row.get("id")]
+            if intent_ids:
+                response = await self._execute(
+                    self._client.table("orders")
+                    .select(
+                        "id,order_intent_id,environment,side,order_type,limit_price,"
+                        "original_size,filled_size,remaining_size,average_fill_price,"
+                        "status,submitted_at,updated_at"
+                    )
+                    .eq("account_id", account_id)
+                    .in_("order_intent_id", intent_ids)
+                    .order("updated_at", desc=True)
+                    .limit(200)
+                )
+                order_rows = [
+                    item
+                    for item in (getattr(response, "data", None) or [])
+                    if isinstance(item, dict)
+                ]
         if evidence_ids:
             response = await self._execute(
                 self._client.table("evidence")
                 .select(
-                    "id,source_url,source_title,published_at,summary,"
-                    "reliability_score,fetched_at"
+                    "id,source_url,source_title,published_at,summary,reliability_score,fetched_at"
                 )
                 .eq("account_id", account_id)
                 .in_("id", evidence_ids)
                 .limit(200)
             )
             evidence_rows = [
-                row
-                for row in (getattr(response, "data", None) or [])
-                if isinstance(row, dict)
+                row for row in (getattr(response, "data", None) or []) if isinstance(row, dict)
             ]
 
         markets = {str(row.get("id")): row for row in market_rows}
         evidence = {str(row.get("id")): row for row in evidence_rows}
+        orders_by_intent: dict[str, list[dict[str, Any]]] = {}
+        for order in order_rows:
+            orders_by_intent.setdefault(str(order.get("order_intent_id")), []).append(order)
         result: list[dict[str, Any]] = []
         for row in forecast_rows:
             market = markets.get(str(row.get("market_id")), {})
             selected_evidence = [
                 evidence[str(evidence_id)]
                 for evidence_id in (
-                    row.get("evidence_ids")
-                    if isinstance(row.get("evidence_ids"), list)
-                    else []
+                    row.get("evidence_ids") if isinstance(row.get("evidence_ids"), list) else []
                 )
                 if str(evidence_id) in evidence
             ]
+            forecast_time = _parse_datetime(row.get("created_at") or row.get("as_of"))
+            window_end = forecast_time + timedelta(minutes=15) if forecast_time else None
+            selected_intents = [
+                intent
+                for intent in intent_rows
+                if str(intent.get("market_id")) == str(row.get("market_id"))
+                and _inside_window(intent.get("created_at"), forecast_time, window_end)
+            ]
+            intent_hashes = {str(item.get("intent_hash")) for item in selected_intents}
+            selected_risks = [
+                risk
+                for risk in risk_rows
+                if str(risk.get("market_id")) == str(row.get("market_id"))
+                and (
+                    str((risk.get("details") or {}).get("intent_hash")) in intent_hashes
+                    or _inside_window(risk.get("occurred_at"), forecast_time, window_end)
+                )
+            ]
+            timeline: list[dict[str, Any]] = [
+                {
+                    "kind": "forecast",
+                    "at": row.get("created_at") or row.get("as_of"),
+                    "status": row.get("status"),
+                    "probability_yes": row.get("p_yes"),
+                    "confidence": row.get("confidence"),
+                }
+            ]
+            timeline.extend(
+                {
+                    "kind": "risk",
+                    "at": item.get("occurred_at"),
+                    "status": item.get("action"),
+                    "code": item.get("code"),
+                    "severity": item.get("severity"),
+                }
+                for item in selected_risks
+            )
+            for intent in selected_intents:
+                timeline.append(
+                    {
+                        "kind": "intent",
+                        "at": intent.get("created_at"),
+                        "status": intent.get("status"),
+                        "outcome": intent.get("outcome"),
+                        "side": intent.get("side"),
+                        "price": intent.get("price"),
+                        "size": intent.get("size"),
+                        "notional_usd": intent.get("notional_usd"),
+                        "edge_after_costs": intent.get("edge_after_costs"),
+                    }
+                )
+                timeline.extend(
+                    {
+                        "kind": "order",
+                        "at": order.get("updated_at"),
+                        "status": order.get("status"),
+                        "environment": order.get("environment"),
+                        "filled_size": order.get("filled_size"),
+                        "average_fill_price": order.get("average_fill_price"),
+                    }
+                    for order in orders_by_intent.get(str(intent.get("id")), [])
+                )
+            timeline.sort(key=lambda item: str(item.get("at") or ""))
             result.append(
                 {
                     "id": row.get("id"),
@@ -733,13 +1270,12 @@ class SupabaseJobRepository:
                     "invalidation_conditions": row.get("invalidation_conditions"),
                     "status": row.get("status"),
                     "evidence": selected_evidence,
+                    "timeline": timeline,
                 }
             )
         return result
 
-    async def get_active_risk_policy(
-        self, account_id: str
-    ) -> RiskPolicySnapshot | None:
+    async def get_active_risk_policy(self, account_id: str) -> RiskPolicySnapshot | None:
         profile = await self.get_or_create_profile(account_id)
         if profile.risk_policy_id is None:
             return None
@@ -757,6 +1293,285 @@ class SupabaseJobRepository:
         )
         row = self._first(response)
         return RiskPolicySnapshot.model_validate(row) if row else None
+
+    async def create_risk_policy_preset(
+        self,
+        *,
+        account_id: str,
+        expected_profile_version: int,
+        preset: str,
+    ) -> RiskPolicySnapshot:
+        response = await self._execute(
+            self._client.rpc(
+                "create_risk_policy_preset",
+                {
+                    "p_account_id": account_id,
+                    "p_expected_profile_version": expected_profile_version,
+                    "p_preset": preset,
+                },
+            )
+        )
+        row = self._first(response)
+        if row is None:
+            raise JobConflictError("risk policy preset was not saved")
+        return RiskPolicySnapshot.model_validate(row)
+
+    async def worker_status(self) -> WorkerStatusSnapshot:
+        response = await self._execute(
+            self._client.table("worker_heartbeats")
+            .select("owner_id,release,status,active_jobs,queue_lag_seconds,started_at,last_seen_at")
+            .order("last_seen_at", desc=True)
+            .limit(1)
+        )
+        row = self._first(response)
+        if row is None:
+            return WorkerStatusSnapshot(online=False, ready=False)
+        last_seen = datetime.fromisoformat(str(row["last_seen_at"]).replace("Z", "+00:00"))
+        online = last_seen >= utc_now() - timedelta(seconds=30)
+        return WorkerStatusSnapshot(
+            online=online,
+            ready=online and row.get("status") == "ready",
+            **row,
+        )
+
+    async def load_paper_state(self, account_id: str) -> dict[str, Any] | None:
+        response = await self._execute(
+            self._client.table("paper_account_states")
+            .select("state")
+            .eq("account_id", account_id)
+            .limit(1)
+        )
+        row = self._first(response)
+        state = row.get("state") if row else None
+        return state if isinstance(state, dict) else None
+
+    async def enqueue_ai_diagnostic(self, account_id: str) -> AIDiagnosticJob:
+        response = await self._execute(
+            self._client.rpc(
+                "enqueue_ai_diagnostic",
+                {"p_account_id": account_id},
+            )
+        )
+        row = self._first(response)
+        if row is None:
+            raise JobConflictError("AI diagnostic could not be queued")
+        return AIDiagnosticJob.model_validate(row)
+
+    async def get_ai_diagnostic(self, *, account_id: str, job_id: UUID) -> AIDiagnosticJob | None:
+        response = await self._execute(
+            self._client.table("ai_diagnostic_jobs")
+            .select("*")
+            .eq("account_id", account_id)
+            .eq("id", str(job_id))
+            .limit(1)
+        )
+        row = self._first(response)
+        return AIDiagnosticJob.model_validate(row) if row else None
+
+    async def notifications(self, account_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        response = await self._execute(
+            self._client.table("account_notifications")
+            .select("id,severity,code,title,message,details,read_at,created_at")
+            .eq("account_id", account_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+        )
+        return [row for row in (getattr(response, "data", None) or []) if isinstance(row, dict)]
+
+    async def mark_notification_read(self, *, account_id: str, notification_id: int) -> bool:
+        response = await self._execute(
+            self._client.table("account_notifications")
+            .update({"read_at": utc_now().isoformat()})
+            .eq("account_id", account_id)
+            .eq("id", notification_id)
+            .is_("read_at", "null")
+            .select("id")
+        )
+        return self._first(response) is not None
+
+    async def performance(self, account_id: str) -> PerformanceSnapshot:
+        outcomes_response, usage_response = await asyncio.gather(
+            self._execute(
+                self._client.table("forecast_outcomes")
+                .select("market_id,probability_yes,resolved_yes,brier_score,log_loss,resolved_at")
+                .eq("account_id", account_id)
+                .order("resolved_at", desc=True)
+                .limit(5000)
+            ),
+            self._execute(
+                self._client.table("ai_usage_daily")
+                .select("request_units,request_limit")
+                .eq("account_id", account_id)
+                .eq("usage_day", utc_now().date().isoformat())
+                .limit(1)
+            ),
+        )
+        rows = [
+            row for row in (getattr(outcomes_response, "data", None) or []) if isinstance(row, dict)
+        ]
+        usage = self._first(usage_response) or {}
+        return _performance_snapshot(
+            rows,
+            ai_usage_used=int(usage.get("request_units") or 0),
+            ai_usage_limit=int(usage.get("request_limit") or 100),
+        )
+
+    async def set_ai_budget_limit(self, *, account_id: str, request_limit: int) -> int:
+        response = await self._execute(
+            self._client.rpc(
+                "set_ai_budget_limit",
+                {
+                    "p_account_id": account_id,
+                    "p_request_limit": request_limit,
+                },
+            )
+        )
+        data = getattr(response, "data", None)
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if isinstance(data, dict):
+            data = data.get("set_ai_budget_limit", data.get("request_limit"))
+        if data is None:
+            raise JobConflictError("AI budget limit was not saved")
+        return int(data)
+
+    async def save_paper_state(
+        self,
+        *,
+        job: CycleJob,
+        state: dict[str, Any],
+    ) -> bool:
+        if job.claimed_by is None:
+            return False
+        response = await self._execute(
+            self._client.rpc(
+                "save_paper_account_state",
+                {
+                    "p_account_id": str(job.account_id),
+                    "p_job_id": str(job.id),
+                    "p_claimed_by": job.claimed_by,
+                    "p_fencing_token": job.fencing_token,
+                    "p_state": state,
+                },
+            )
+        )
+        data = getattr(response, "data", False)
+        if isinstance(data, list):
+            data = data[0] if data else False
+        if isinstance(data, dict):
+            data = data.get("save_paper_account_state", data.get("ok", False))
+        return data is True
+
+    async def record_worker_heartbeat(
+        self,
+        *,
+        owner_id: str,
+        release: str,
+        status: str,
+        active_jobs: int,
+        queue_lag_seconds: Decimal | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        await self._execute(
+            self._client.rpc(
+                "record_worker_heartbeat",
+                {
+                    "p_owner_id": owner_id,
+                    "p_release": release,
+                    "p_status": status,
+                    "p_active_jobs": active_jobs,
+                    "p_queue_lag_seconds": (
+                        str(queue_lag_seconds) if queue_lag_seconds is not None else None
+                    ),
+                    "p_details": details or {},
+                },
+            )
+        )
+
+    async def claim_ai_diagnostic(
+        self, *, claimed_by: str, lease_seconds: int
+    ) -> AIDiagnosticJob | None:
+        response = await self._execute(
+            self._client.rpc(
+                "claim_ai_diagnostic",
+                {
+                    "p_claimed_by": claimed_by,
+                    "p_lease_seconds": lease_seconds,
+                },
+            )
+        )
+        row = self._first(response)
+        return AIDiagnosticJob.model_validate(row) if row else None
+
+    async def finish_ai_diagnostic(
+        self,
+        *,
+        job: AIDiagnosticJob,
+        ok: bool,
+        result_summary: dict[str, Any],
+        error_code: str | None = None,
+    ) -> AIDiagnosticJob | None:
+        if job.claimed_by is None:
+            return None
+        response = await self._execute(
+            self._client.rpc(
+                "finish_ai_diagnostic",
+                {
+                    "p_account_id": str(job.account_id),
+                    "p_job_id": str(job.id),
+                    "p_claimed_by": job.claimed_by,
+                    "p_fencing_token": job.fencing_token,
+                    "p_ok": ok,
+                    "p_result_summary": result_summary,
+                    "p_error_code": error_code,
+                },
+            )
+        )
+        row = self._first(response)
+        return AIDiagnosticJob.model_validate(row) if row else None
+
+    async def consume_ai_budget(self, *, account_id: str, units: int = 1) -> tuple[bool, int, int]:
+        response = await self._execute(
+            self._client.rpc(
+                "consume_ai_budget",
+                {"p_account_id": account_id, "p_units": units},
+            )
+        )
+        row = self._first(response) or {}
+        return (
+            bool(row.get("allowed", False)),
+            int(row.get("used", 0)),
+            int(row.get("daily_limit", 0)),
+        )
+
+    async def unresolved_market_conditions(self, *, limit: int = 100) -> list[str]:
+        response = await self._execute(
+            self._client.table("markets")
+            .select("condition_id")
+            .is_("resolved_outcome", "null")
+            .lt("end_at", utc_now().isoformat())
+            .order("end_at")
+            .limit(limit)
+        )
+        return [
+            str(row["condition_id"])
+            for row in (getattr(response, "data", None) or [])
+            if isinstance(row, dict) and row.get("condition_id")
+        ]
+
+    async def record_market_resolution(self, *, condition_id: str, outcome: str) -> int:
+        response = await self._execute(
+            self._client.rpc(
+                "record_market_resolution",
+                {"p_condition_id": condition_id, "p_outcome": outcome},
+            )
+        )
+        data = getattr(response, "data", 0)
+        if isinstance(data, list):
+            data = data[0] if data else 0
+        if isinstance(data, dict):
+            data = data.get("record_market_resolution", data.get("count", 0))
+        return int(data or 0)
 
     async def enqueue_due_jobs(self, *, limit: int = 100) -> int:
         response = await self._execute(
@@ -907,7 +1722,25 @@ class SupabaseJobRepository:
             )
         )
         row = self._first(response)
-        return _job_from_row(row) if row else None
+        saved = _job_from_row(row) if row else None
+        if saved is not None and saved.status is CycleJobStatus.FAILED:
+            await self._execute(
+                self._client.table("account_notifications").insert(
+                    {
+                        "account_id": account_id,
+                        "severity": "critical" if not retryable else "warning",
+                        "code": "cycle_failed",
+                        "title": "自动交易周期失败",
+                        "message": "Worker 已停止本次周期，没有继续提交新订单。",
+                        "details": {
+                            "job_id": str(job_id),
+                            "error_code": error_code,
+                            "retryable": retryable,
+                        },
+                    }
+                )
+            )
+        return saved
 
     async def _transition(
         self,
@@ -981,6 +1814,11 @@ class InMemoryJobRepository:
         self._jobs: dict[UUID, CycleJob] = {}
         self._controls: dict[str, RuntimeControl] = {}
         self._risks: dict[str, RiskPolicySnapshot] = {}
+        self._paper_states: dict[str, dict[str, Any]] = {}
+        self._ai_diagnostics: dict[UUID, AIDiagnosticJob] = {}
+        self._ai_usage: dict[str, int] = {}
+        self._notifications: dict[str, list[dict[str, Any]]] = {}
+        self._worker_status = WorkerStatusSnapshot(online=False, ready=False)
         self.live_ready_accounts: set[str] = set()
 
     async def health(self) -> bool:
@@ -1016,9 +1854,7 @@ class InMemoryJobRepository:
             self._controls[account_id] = RuntimeControl(account_id=account_id)
         return profile
 
-    async def update_profile(
-        self, account_id: str, patch: RuntimeProfilePatch
-    ) -> RuntimeProfile:
+    async def update_profile(self, account_id: str, patch: RuntimeProfilePatch) -> RuntimeProfile:
         previous = await self.get_or_create_profile(account_id)
         if previous.version != patch.expected_version:
             raise JobConflictError("runtime profile changed concurrently")
@@ -1057,8 +1893,7 @@ class InMemoryJobRepository:
             (
                 job
                 for job in self._jobs.values()
-                if str(job.account_id) == account_id
-                and job.idempotency_key == idempotency_key
+                if str(job.account_id) == account_id and job.idempotency_key == idempotency_key
             ),
             None,
         )
@@ -1074,9 +1909,7 @@ class InMemoryJobRepository:
                 or existing.risk_policy_id != expected_risk
                 or existing.requested_run_after != request.run_after
             ):
-                raise JobConflictError(
-                    "cycle idempotency key was reused with different input"
-                )
+                raise JobConflictError("cycle idempotency key was reused with different input")
             return existing.model_copy(update={"deduplicated": True})
         if request.mode in {TradingMode.CANARY, TradingMode.LIVE}:
             await self.assert_live_ready(account_id)
@@ -1090,9 +1923,7 @@ class InMemoryJobRepository:
             trading_wallet_id=request.trading_wallet_id or profile.trading_wallet_id,
             ai_credential_id=request.ai_credential_id or profile.ai_credential_id,
             risk_policy_id=selected_risk_id,
-            risk_policy_version=(
-                risk.version if risk and risk.id == selected_risk_id else None
-            ),
+            risk_policy_version=(risk.version if risk and risk.id == selected_risk_id else None),
             mode=request.mode,
             idempotency_key=idempotency_key,
             status=CycleJobStatus.QUEUED,
@@ -1111,9 +1942,7 @@ class InMemoryJobRepository:
         return job
 
     async def get_latest_job(self, *, account_id: str) -> CycleJob | None:
-        jobs = [
-            job for job in self._jobs.values() if str(job.account_id) == account_id
-        ]
+        jobs = [job for job in self._jobs.values() if str(job.account_id) == account_id]
         return max(jobs, key=lambda job: job.created_at) if jobs else None
 
     async def get_runtime_control(self, account_id: str) -> RuntimeControl:
@@ -1167,24 +1996,40 @@ class InMemoryJobRepository:
             )
 
     async def portfolio(self, account_id: str) -> PortfolioSnapshot:
+        profile = await self.get_or_create_profile(account_id)
+        state = self._paper_states.get(account_id, {})
+        cash = _decimal_or_none(state.get("cash"))
+        paper_positions = state.get("positions", [])
+        exposure = sum(
+            (
+                _decimal_or_zero(item.get("cost"))
+                for item in paper_positions
+                if isinstance(item, dict)
+            ),
+            Decimal("0"),
+        )
+        equity = cash + exposure if cash is not None else None
         return PortfolioSnapshot(
             account_id=account_id,
-            positions=[],
+            positions=[item for item in paper_positions if isinstance(item, dict)],
             open_orders=[],
             orders=[],
             recent_fills=[],
             summary={
-                "position_count": 0,
+                "position_count": len(paper_positions),
                 "open_order_count": 0,
                 "recent_fill_count": 0,
-                "cash_usd": None,
-                "portfolio_value_usd": None,
-                "total_equity_usd": None,
-                "gross_exposure_usd": None,
-                "realized_pnl_usd": None,
-                "unrealized_pnl_usd": None,
-                "pnl_usd": None,
+                "cash_usd": _decimal_text(cash),
+                "available_balance_usd": _decimal_text(cash),
+                "portfolio_value_usd": _decimal_text(equity),
+                "total_equity_usd": _decimal_text(equity),
+                "gross_exposure_usd": str(exposure),
+                "gross_exposure_pct": _ratio_text(exposure, equity),
+                "realized_pnl_usd": state.get("realized_pnl"),
+                "unrealized_pnl_usd": "0" if equity is not None else None,
+                "pnl_usd": state.get("realized_pnl"),
             },
+            mode=profile.desired_mode,
         )
 
     async def recent_analysis(
@@ -1198,11 +2043,240 @@ class InMemoryJobRepository:
             raise ValueError("analysis limit must be between 1 and 50")
         return []
 
-    async def get_active_risk_policy(
-        self, account_id: str
-    ) -> RiskPolicySnapshot | None:
+    async def get_active_risk_policy(self, account_id: str) -> RiskPolicySnapshot | None:
         await self.get_or_create_profile(account_id)
         return self._risks.get(account_id)
+
+    async def create_risk_policy_preset(
+        self,
+        *,
+        account_id: str,
+        expected_profile_version: int,
+        preset: str,
+    ) -> RiskPolicySnapshot:
+        profile = await self.get_or_create_profile(account_id)
+        if profile.version != expected_profile_version:
+            raise JobConflictError("runtime profile changed concurrently")
+        values = {
+            "conservative": ("2", "0.0025", "0.01", "0.025", "0.05", "0.01", "0.04", "0.06"),
+            "balanced": ("5", "0.005", "0.02", "0.05", "0.10", "0.02", "0.08", "0.04"),
+            "advanced": ("10", "0.01", "0.03", "0.08", "0.15", "0.03", "0.10", "0.03"),
+        }
+        if preset not in values:
+            raise ValueError("unsupported risk preset")
+        previous = self._risks[account_id]
+        amount, trade, event, bucket, gross, loss, drawdown, edge = values[preset]
+        risk = RiskPolicySnapshot(
+            id=uuid4(),
+            account_id=account_id,
+            version=previous.version + 1,
+            status="active",
+            max_order_usd=Decimal(amount),
+            max_trade_risk_pct=Decimal(trade),
+            max_event_exposure_pct=Decimal(event),
+            max_bucket_exposure_pct=Decimal(bucket),
+            max_gross_exposure_pct=Decimal(gross),
+            daily_loss_limit_pct=Decimal(loss),
+            max_drawdown_pct=Decimal(drawdown),
+            min_edge=Decimal(edge),
+            created_at=utc_now(),
+        )
+        self._risks[account_id] = risk
+        self._profiles[account_id] = profile.model_copy(
+            update={
+                "risk_policy_id": risk.id,
+                "version": profile.version + 1,
+                "updated_at": utc_now(),
+            }
+        )
+        return risk
+
+    async def worker_status(self) -> WorkerStatusSnapshot:
+        return self._worker_status
+
+    async def load_paper_state(self, account_id: str) -> dict[str, Any] | None:
+        return self._paper_states.get(account_id)
+
+    async def enqueue_ai_diagnostic(self, account_id: str) -> AIDiagnosticJob:
+        profile = await self.get_or_create_profile(account_id)
+        if profile.ai_credential_id is None or profile.ai_provider in {
+            AIProvider.PLATFORM,
+            AIProvider.MOCK,
+        }:
+            raise ValueError("active AI credential is required")
+        existing = next(
+            (
+                job
+                for job in self._ai_diagnostics.values()
+                if str(job.account_id) == account_id
+                and job.status in {"queued", "claimed", "running"}
+            ),
+            None,
+        )
+        if existing:
+            return existing
+        now = utc_now()
+        job = AIDiagnosticJob(
+            id=uuid4(),
+            account_id=account_id,
+            credential_id=profile.ai_credential_id,
+            provider=profile.ai_provider,
+            ai_base_url=profile.ai_base_url,
+            model=profile.forecast_model,
+            status="queued",
+            created_at=now,
+            updated_at=now,
+        )
+        self._ai_diagnostics[job.id] = job
+        return job
+
+    async def get_ai_diagnostic(self, *, account_id: str, job_id: UUID) -> AIDiagnosticJob | None:
+        job = self._ai_diagnostics.get(job_id)
+        return job if job and str(job.account_id) == account_id else None
+
+    async def notifications(self, account_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        return list(reversed(self._notifications.get(account_id, [])))[:limit]
+
+    async def mark_notification_read(self, *, account_id: str, notification_id: int) -> bool:
+        for item in self._notifications.get(account_id, []):
+            if item.get("id") == notification_id:
+                item["read_at"] = utc_now().isoformat()
+                return True
+        return False
+
+    async def performance(self, account_id: str) -> PerformanceSnapshot:
+        return _performance_snapshot(
+            [],
+            ai_usage_used=self._ai_usage.get(account_id, 0),
+            ai_usage_limit=self._ai_usage.get(f"{account_id}:limit", 100),
+        )
+
+    async def set_ai_budget_limit(self, *, account_id: str, request_limit: int) -> int:
+        if not 20 <= request_limit <= 10000:
+            raise ValueError("AI request limit out of range")
+        self._ai_usage.setdefault(f"{account_id}:limit", request_limit)
+        self._ai_usage[f"{account_id}:limit"] = request_limit
+        return request_limit
+
+    async def save_paper_state(
+        self,
+        *,
+        job: CycleJob,
+        state: dict[str, Any],
+    ) -> bool:
+        current = self._jobs.get(job.id)
+        if (
+            current is None
+            or current.status is not CycleJobStatus.RUNNING
+            or current.claimed_by != job.claimed_by
+            or current.fencing_token != job.fencing_token
+        ):
+            return False
+        self._paper_states[str(job.account_id)] = state
+        return True
+
+    async def record_worker_heartbeat(
+        self,
+        *,
+        owner_id: str,
+        release: str,
+        status: str,
+        active_jobs: int,
+        queue_lag_seconds: Decimal | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        del details
+        now = utc_now()
+        self._worker_status = WorkerStatusSnapshot(
+            online=status != "stopping",
+            ready=status == "ready",
+            owner_id=owner_id,
+            release=release,
+            status=status,
+            active_jobs=active_jobs,
+            queue_lag_seconds=queue_lag_seconds,
+            started_at=self._worker_status.started_at or now,
+            last_seen_at=now,
+        )
+
+    async def claim_ai_diagnostic(
+        self, *, claimed_by: str, lease_seconds: int
+    ) -> AIDiagnosticJob | None:
+        now = utc_now()
+        job = next(
+            (
+                item
+                for item in sorted(
+                    self._ai_diagnostics.values(), key=lambda value: value.created_at
+                )
+                if item.status == "queued"
+                or (
+                    item.status in {"claimed", "running"}
+                    and item.lease_expires_at is not None
+                    and item.lease_expires_at <= now
+                )
+            ),
+            None,
+        )
+        if job is None:
+            return None
+        claimed = job.model_copy(
+            update={
+                "status": "claimed",
+                "claimed_by": claimed_by,
+                "fencing_token": job.fencing_token + 1,
+                "lease_expires_at": now + timedelta(seconds=lease_seconds),
+                "started_at": job.started_at or now,
+                "updated_at": now,
+            }
+        )
+        self._ai_diagnostics[job.id] = claimed
+        return claimed
+
+    async def finish_ai_diagnostic(
+        self,
+        *,
+        job: AIDiagnosticJob,
+        ok: bool,
+        result_summary: dict[str, Any],
+        error_code: str | None = None,
+    ) -> AIDiagnosticJob | None:
+        current = self._ai_diagnostics.get(job.id)
+        if (
+            current is None
+            or current.claimed_by != job.claimed_by
+            or current.fencing_token != job.fencing_token
+        ):
+            return None
+        saved = current.model_copy(
+            update={
+                "status": "succeeded" if ok else "failed",
+                "result_summary": result_summary,
+                "error_code": None if ok else error_code,
+                "lease_expires_at": None,
+                "completed_at": utc_now(),
+                "updated_at": utc_now(),
+            }
+        )
+        self._ai_diagnostics[job.id] = saved
+        return saved
+
+    async def consume_ai_budget(self, *, account_id: str, units: int = 1) -> tuple[bool, int, int]:
+        used = self._ai_usage.get(account_id, 0)
+        limit = self._ai_usage.get(f"{account_id}:limit", 100)
+        if used + units > limit:
+            return False, used, limit
+        used += units
+        self._ai_usage[account_id] = used
+        return True, used, limit
+
+    async def unresolved_market_conditions(self, *, limit: int = 100) -> list[str]:
+        del limit
+        return []
+
+    async def record_market_resolution(self, *, condition_id: str, outcome: str) -> int:
+        del condition_id, outcome
+        return 0
 
     async def enqueue_due_jobs(self, *, limit: int = 100) -> int:
         if not 1 <= limit <= 500:
@@ -1236,8 +2310,7 @@ class InMemoryJobRepository:
                 if not control.is_live_armed:
                     self._profiles[account_id] = profile.model_copy(
                         update={
-                            "next_run_at": now
-                            + timedelta(seconds=profile.cycle_interval_seconds),
+                            "next_run_at": now + timedelta(seconds=profile.cycle_interval_seconds),
                             "updated_at": now,
                         }
                     )
@@ -1255,8 +2328,7 @@ class InMemoryJobRepository:
             )
             self._profiles[account_id] = profile.model_copy(
                 update={
-                    "next_run_at": now
-                    + timedelta(seconds=profile.cycle_interval_seconds),
+                    "next_run_at": now + timedelta(seconds=profile.cycle_interval_seconds),
                     "updated_at": now,
                 }
             )
@@ -1429,9 +2501,7 @@ class InMemoryJobRepository:
         will_retry = retryable and job.attempt_count < job.max_attempts
         saved = job.model_copy(
             update={
-                "status": (
-                    CycleJobStatus.QUEUED if will_retry else CycleJobStatus.FAILED
-                ),
+                "status": (CycleJobStatus.QUEUED if will_retry else CycleJobStatus.FAILED),
                 "claimed_by": None if will_retry else job.claimed_by,
                 "lease_expires_at": None,
                 "run_after": now + timedelta(seconds=30) if will_retry else job.run_after,

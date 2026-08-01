@@ -15,6 +15,19 @@ interface EvidenceView {
   reliability?: number;
 }
 
+interface TimelineEvent {
+  kind: string;
+  at?: string;
+  status?: string;
+  code?: string;
+  outcome?: string;
+  side?: string;
+  price?: number;
+  size?: number;
+  edge?: number;
+  filledSize?: number;
+}
+
 interface AnalysisView {
   id: string;
   question: string;
@@ -31,6 +44,7 @@ interface AnalysisView {
   assumptions: string[];
   invalidationConditions: string[];
   evidence: EvidenceView[];
+  timeline: TimelineEvent[];
 }
 
 function record(value: unknown): JsonRecord {
@@ -75,6 +89,7 @@ function parseAnalysis(payload: unknown): AnalysisView[] {
     const item = record(value);
     const rationale = record(item.rationale);
     const evidence = Array.isArray(item.evidence) ? item.evidence : [];
+    const timeline = Array.isArray(item.timeline) ? item.timeline : [];
     return {
       id: text(item.id) ?? `analysis-${index}`,
       question: text(item.question) ?? "市场问题暂未同步",
@@ -99,6 +114,21 @@ function parseAnalysis(payload: unknown): AnalysisView[] {
           url: safeSourceUrl(row.source_url),
           publishedAt: text(row.published_at, row.fetched_at),
           reliability: numberValue(row.reliability_score),
+        };
+      }),
+      timeline: timeline.map((event) => {
+        const row = record(event);
+        return {
+          kind: text(row.kind) ?? "event",
+          at: text(row.at),
+          status: text(row.status),
+          code: text(row.code),
+          outcome: text(row.outcome),
+          side: text(row.side),
+          price: numberValue(row.price),
+          size: numberValue(row.size),
+          edge: numberValue(row.edge_after_costs),
+          filledSize: numberValue(row.filled_size),
         };
       }),
     };
@@ -146,6 +176,18 @@ function BulletList({
       </ul>
     </div>
   );
+}
+
+function timelineLabel(event: TimelineEvent): string {
+  if (event.kind === "forecast") return "AI 概率判断";
+  if (event.kind === "risk") return event.code ? `风控：${event.code}` : "确定性风控";
+  if (event.kind === "intent") {
+    return `${event.side ?? "交易"} ${event.outcome ?? ""} · ${event.size ?? "—"} 份 @ ${event.price ?? "—"}`;
+  }
+  if (event.kind === "order") {
+    return `订单 ${event.status ?? "更新"} · 已成交 ${event.filledSize ?? 0}`;
+  }
+  return event.status ?? "状态更新";
 }
 
 export default function AnalysisPage() {
@@ -284,6 +326,22 @@ export default function AnalysisPage() {
                     items={item.invalidationConditions}
                     tone="negative"
                   />
+                </div>
+
+                <div className="decision-timeline" aria-label="决策执行时间线">
+                  <strong>从判断到执行</strong>
+                  {item.timeline.map((event, index) => (
+                    <div className={`timeline-event ${event.kind}`} key={`${item.id}-timeline-${index}`}>
+                      <span className="timeline-dot" aria-hidden="true" />
+                      <div>
+                        <b>{timelineLabel(event)}</b>
+                        <small>
+                          {formatDate(event.at)} · {event.status ?? "已记录"}
+                          {event.edge === undefined ? "" : ` · 费用后优势 ${percent(event.edge, 2)}`}
+                        </small>
+                      </div>
+                    </div>
+                  ))}
                 </div>
 
                 <details className="source-disclosure">

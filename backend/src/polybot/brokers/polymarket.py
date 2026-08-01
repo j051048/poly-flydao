@@ -57,7 +57,7 @@ class PolymarketBroker:
 
         self._lease_guard = guard
 
-    async def ensure_trading_approvals(self) -> None:
+    async def ensure_trading_approvals(self) -> tuple[Decimal, bool]:
         """Initialize standard allowances only after the imported wallet is funded.
 
         Wallet import first derives the deposit address so the user can fund it.
@@ -84,7 +84,7 @@ class PolymarketBroker:
             )
         allowances = [Decimal(str(value)) for value in balance.allowances.values()]
         if allowances and min(allowances) > 0:
-            return
+            return collateral / Decimal("1000000"), True
 
         control_version = control.version
         fresh_fencing_token = await self._lease_guard()
@@ -120,6 +120,7 @@ class PolymarketBroker:
         ]
         if not verified_allowances or min(verified_allowances) <= 0:
             raise RuntimeError("Polymarket trading approvals could not be verified")
+        return Decimal(str(verified.balance)) / Decimal("1000000"), True
 
     async def portfolio_state(self) -> PortfolioState:
         now = datetime.now(UTC)

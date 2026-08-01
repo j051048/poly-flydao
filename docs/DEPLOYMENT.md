@@ -30,6 +30,7 @@ uv run --frozen polybot generate-secrets
 backend/supabase/migrations/0001_initial.sql
 ...
 backend/supabase/migrations/0014_custom_ai_credential.sql
+backend/supabase/migrations/0015_product_operations.sql
 ```
 
 4. 在 Auth 中配置站点 URL、Vercel 登录回调 URL和邮件验证回调：
@@ -184,8 +185,22 @@ npm test
 npm run build
 ```
 
-还必须在临时 Supabase 项目实际执行一次完整 migration reset；纯字符串单测不能替代 PostgreSQL 解析、权限和事务验证。
+仓库 CI 的 `Supabase / migration-reset` 会启动全新本地 Supabase，应用全部迁移并再执行一次
+`supabase db reset --local`。合并前必须等待这项检查通过；纯字符串单测不能替代
+PostgreSQL 解析、权限和事务验证。
 
-## 8. P2 上线门槛
+## 8. 运行监控与故障定位
+
+- Zeabur API：`/livez` 只表示进程存活，`/health` 还会检查 Supabase 控制面。
+- 私有 Worker：`/livez` 表示进程存活，`/readyz` 表示队列和依赖已完成初始化。
+- 前端“三端部署检查”会分别显示 API、Supabase 与 Worker 状态；认证后的 Worker
+  详情来自 `/v1/worker/status`，公开探针不会返回租户或任务数据。
+- 每个 API 响应都带 `X-Request-ID`。排障时用它匹配 Zeabur 的结构化请求日志，日志中不应出现
+  Bearer token、API Key 或钱包私钥。
+- 钱包首次导入只验证 signer、网络和入金地址。入金后，首次短时 arm 的 Canary/Live
+  周期才会在租约与地域检查有效时初始化标准 allowance，并在真正提交订单前把最新资金与
+  allowance 状态写回数据库；未入金不会发起 approval。
+
+## 9. P2 上线门槛
 
 P2 配对策略当前 `research_only=true` 且 `execution_enabled=false`。不能通过环境变量直接解除。只有满足 [策略验证门槛](STRATEGY_VALIDATION.md)，完成单独代码审查和小额 canary 后，才能设计后续 live migration；目前交付不声明可持续优势或保证盈利。

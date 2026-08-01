@@ -11,6 +11,7 @@ const NAV_ITEMS = [
   { name: "新手向导", path: "/setup" },
   { name: "控制台", path: "/" },
   { name: "AI 分析", path: "/analysis" },
+  { name: "效果校准", path: "/performance" },
   { name: "个人资产", path: "/assets" },
   { name: "凭证与钱包", path: "/settings" },
 ];

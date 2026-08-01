@@ -25,7 +25,11 @@ uv run --frozen --extra dev polybot pair-replay --input examples/pair_replay_sam
 
 ## Supabase
 
-按文件名顺序应用 `supabase/migrations/0001_initial.sql` 至 `0014_custom_ai_credential.sql`。`0007` 引入多租户凭证、钱包生命周期、风险快照和任务队列；`0008`–`0009` 是默认关闭的配对微结构研究账本；`0010` 是真实订单提交前的原子授权闸门；`0011`–`0012` 加固自定义 AI 中转站；`0013` 保存不含秘密的任务结果摘要；`0014` 接通自定义中转站凭证并加入 schema readiness 标记。
+按文件名顺序应用 `supabase/migrations/0001_initial.sql` 至 `0015_product_operations.sql`。`0007` 引入多租户凭证、钱包生命周期、风险快照和任务队列；`0008`–`0009` 是默认关闭的配对微结构研究账本；`0010` 是真实订单提交前的原子授权闸门；`0011`–`0012` 加固自定义 AI 中转站；`0013`–`0014` 保存任务摘要并接通自定义中转站；`0015` 增加持久 Paper 账户、Worker 心跳、钱包就绪闸门、AI 诊断/预算、通知和预测校准闭环。
+
+GitHub CI 使用固定版本的官方 Supabase CLI，在全新本地数据库应用所有迁移并执行一次
+完整 reset。新增或修改 SQL 后，`Supabase / migration-reset` 是必需检查，不要只依赖
+`tests/test_schema.py` 的静态约束断言。
 
 上线配置与操作顺序见 [部署手册](../docs/DEPLOYMENT.md)，安全边界见 [安全说明](../docs/SECURITY.md)。
 

@@ -103,6 +103,33 @@ jobs:
       - name: Build Zeabur image
         run: docker build --tag polybot-ci ./backend
 
+  database:
+    name: Supabase / migration-reset
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Supabase CLI
+        uses: supabase/setup-cli@3c2f5e2ae34c34e428e8e206e2c4d21fa2d20fbf # v2.1.1
+        with:
+          version: "2.101.0"
+          github-token: ${{ github.token }}
+
+      - name: Apply every migration to a fresh local database
+        run: supabase db start
+
+      - name: Rebuild the database from migrations
+        run: supabase db reset --local
+
+      - name: Stop local database
+        if: always()
+        run: supabase stop --no-backup
+
   required:
     name: CI / required
     if: always()
@@ -110,6 +137,7 @@ jobs:
       - backend
       - frontend
       - container
+      - database
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -118,7 +146,9 @@ jobs:
           BACKEND_RESULT: ${{ needs.backend.result }}
           FRONTEND_RESULT: ${{ needs.frontend.result }}
           CONTAINER_RESULT: ${{ needs.container.result }}
+          DATABASE_RESULT: ${{ needs.database.result }}
         run: |
           test "$BACKEND_RESULT" = "success"
           test "$FRONTEND_RESULT" = "success"
           test "$CONTAINER_RESULT" = "success"
+          test "$DATABASE_RESULT" = "success"

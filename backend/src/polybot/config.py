@@ -100,6 +100,7 @@ class Settings(BaseSettings):
     max_ai_markets_per_cycle: int = Field(default=3, ge=1, le=20)
     ai_timeout_seconds: int = Field(default=45, ge=10, le=180)
     forecast_cooldown_seconds: int = Field(default=900, ge=60, le=86400)
+    resolution_poll_seconds: int = Field(default=300, ge=30, le=3600)
 
     bankroll_usd: Decimal = Field(default=Decimal("1000"), gt=0)
     min_liquidity_usd: Decimal = Field(default=Decimal("10000"), ge=0)
@@ -174,9 +175,7 @@ class Settings(BaseSettings):
                 "POLYMARKET_PRIVATE_KEY": self.polymarket_private_key,
                 "POLYBOT_SIGNED_PAYLOAD_KEY": self.signed_payload_key,
                 "POLYBOT_CREDENTIAL_PRIVATE_KEY_PEM": self.credential_private_key_pem,
-                "POLYBOT_CREDENTIAL_PRIVATE_KEYS_JSON": (
-                    self.credential_private_keys_json
-                ),
+                "POLYBOT_CREDENTIAL_PRIVATE_KEYS_JSON": (self.credential_private_keys_json),
                 "OPENAI_API_KEY": self.openai_api_key,
                 "LITELLM_API_KEY": self.litellm_api_key,
             }

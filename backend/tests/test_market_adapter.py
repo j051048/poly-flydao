@@ -79,3 +79,21 @@ def test_market_discovery_uses_keyset_numeric_liquidity_sort() -> None:
         "ascending": False,
         "page_size": 25,
     }
+
+
+def test_closed_market_requires_an_explicit_winner() -> None:
+    raw = SimpleNamespace(
+        id="resolved",
+        condition_id="condition-resolved",
+        question="Resolved?",
+        state=SimpleNamespace(closed=True, active=False, accepting_orders=False),
+        outcomes=SimpleNamespace(
+            yes=SimpleNamespace(token_id="yes", label="Up", winner=True),
+            no=SimpleNamespace(token_id="no", label="Down", winner=False),
+        ),
+    )
+
+    market = PolymarketMarketData._map_market(raw)
+
+    assert market.closed
+    assert market.resolved_outcome == "YES"

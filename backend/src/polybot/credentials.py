@@ -9,6 +9,7 @@ import os
 import re
 from collections.abc import Mapping
 from datetime import datetime, timedelta
+from decimal import Decimal
 from enum import StrEnum
 from typing import Any, Protocol
 from uuid import UUID, uuid4
@@ -94,6 +95,9 @@ class TradingWalletMetadata(BaseModel):
     signature_type: int = 3
     status: str
     signer_credential_id: UUID | None = None
+    collateral_balance_pusd: Decimal | None = None
+    allowances_ready: bool = False
+    readiness_checked_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -330,10 +334,7 @@ class RSAEnvelopeDecryptor:
         kind: SecretKind,
         provider: str,
     ) -> bytes:
-        if (
-            envelope.algorithm != "RSA-OAEP-256+A256GCM"
-            or envelope.encrypted_data_key is None
-        ):
+        if envelope.algorithm != "RSA-OAEP-256+A256GCM" or envelope.encrypted_data_key is None:
             raise CredentialConfigurationError("unsupported credential envelope")
         try:
             private_key = self._private_keys[envelope.key_version]
@@ -386,10 +387,14 @@ def generate_rsa_credential_keypair(*, key_size: int = 3072) -> tuple[str, str]:
         format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=serialization.NoEncryption(),
     ).decode("ascii")
-    public_pem = private_key.public_key().public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo,
-    ).decode("ascii")
+    public_pem = (
+        private_key.public_key()
+        .public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        .decode("ascii")
+    )
     return public_pem, private_pem
 
 
@@ -466,14 +471,10 @@ def build_worker_decryptor_from_environment() -> EnvelopeDecryptor:
             }
             return RSAEnvelopeDecryptor(keys)
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise CredentialConfigurationError(
-                "invalid credential private keyring"
-            ) from exc
+            raise CredentialConfigurationError("invalid credential private keyring") from exc
     if private_pem:
         try:
-            return RSAEnvelopeDecryptor(
-                {version: private_pem.replace("\\n", "\n").encode()}
-            )
+            return RSAEnvelopeDecryptor({version: private_pem.replace("\\n", "\n").encode()})
         except (TypeError, ValueError) as exc:
             raise CredentialConfigurationError("invalid credential private key") from exc
     encoded_master = os.getenv("POLYBOT_CREDENTIAL_MASTER_KEY")
@@ -627,6 +628,15 @@ class WorkerCredentialRepository(Protocol):
         fencing_token: int,
     ) -> TradingWalletMetadata | None: ...
 
+    async def record_wallet_readiness(
+        self,
+        *,
+        account_id: str,
+        wallet_id: UUID,
+        collateral_balance_pusd: Decimal,
+        allowances_ready: bool,
+    ) -> TradingWalletMetadata | None: ...
+
 
 def _credential_from_row(row: Mapping[str, Any]) -> CredentialMetadata:
     return CredentialMetadata(
@@ -656,6 +666,9 @@ def _wallet_from_row(row: Mapping[str, Any]) -> TradingWalletMetadata:
         signature_type=row["signature_type"],
         status=row["status"],
         signer_credential_id=row.get("signer_credential_id"),
+        collateral_balance_pusd=row.get("collateral_balance_pusd"),
+        allowances_ready=bool(row.get("allowances_ready", False)),
+        readiness_checked_at=row.get("readiness_checked_at"),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -700,7 +713,8 @@ class SupabaseCredentialRepository:
                 .select(
                     "id,label,owner_address,deposit_wallet_address,signer_address,"
                     "chain_id,collateral_token,signature_type,status,"
-                    "signer_credential_id,created_at,updated_at"
+                    "signer_credential_id,collateral_balance_pusd,allowances_ready,"
+                    "readiness_checked_at,created_at,updated_at"
                 )
                 .eq("account_id", account_id)
                 .order("created_at", desc=True)
@@ -714,9 +728,7 @@ class SupabaseCredentialRepository:
                 for row in credential_rows
                 if isinstance(row, dict) and row.get("kind") == SecretKind.AI_API_KEY
             ],
-            wallets=[
-                _wallet_from_row(row) for row in wallet_rows if isinstance(row, dict)
-            ],
+            wallets=[_wallet_from_row(row) for row in wallet_rows if isinstance(row, dict)],
         )
 
     async def claim_wallet_lifecycle(
@@ -906,6 +918,28 @@ class SupabaseCredentialRepository:
                     "p_wallet_id": str(wallet_id),
                     "p_claimed_by": claimed_by,
                     "p_fencing_token": fencing_token,
+                },
+            )
+        )
+        row = self._first(response)
+        return _wallet_from_row(row) if row else None
+
+    async def record_wallet_readiness(
+        self,
+        *,
+        account_id: str,
+        wallet_id: UUID,
+        collateral_balance_pusd: Decimal,
+        allowances_ready: bool,
+    ) -> TradingWalletMetadata | None:
+        response = await self._execute(
+            self._client.rpc(
+                "record_wallet_readiness",
+                {
+                    "p_account_id": account_id,
+                    "p_wallet_id": str(wallet_id),
+                    "p_balance_pusd": str(collateral_balance_pusd),
+                    "p_allowances_ready": allowances_ready,
                 },
             )
         )
@@ -1208,8 +1242,7 @@ class InMemoryCredentialRepository:
                 for row in self._wallets.values()
                 if row["account_id"] == account_id
                 and row.get("signer_credential_id") in self._credentials
-                and self._credentials[row["signer_credential_id"]]["fingerprint"]
-                == fingerprint
+                and self._credentials[row["signer_credential_id"]]["fingerprint"] == fingerprint
                 and row["status"]
                 in {
                     "pending_verification",
@@ -1458,9 +1491,7 @@ class InMemoryCredentialRepository:
         )
         if wallet is None or not 10 <= lease_seconds <= 300:
             return False
-        wallet["lifecycle_lease_expires_at"] = utc_now() + timedelta(
-            seconds=lease_seconds
-        )
+        wallet["lifecycle_lease_expires_at"] = utc_now() + timedelta(seconds=lease_seconds)
         wallet["updated_at"] = utc_now()
         return True
 
@@ -1568,6 +1599,23 @@ class InMemoryCredentialRepository:
             credential["revoked_at"] = now
         return _wallet_from_row(wallet)
 
+    async def record_wallet_readiness(
+        self,
+        *,
+        account_id: str,
+        wallet_id: UUID,
+        collateral_balance_pusd: Decimal,
+        allowances_ready: bool,
+    ) -> TradingWalletMetadata | None:
+        wallet = self._wallets.get(wallet_id)
+        if wallet is None or wallet["account_id"] != account_id or wallet["status"] != "active":
+            return None
+        wallet["collateral_balance_pusd"] = collateral_balance_pusd
+        wallet["allowances_ready"] = allowances_ready
+        wallet["readiness_checked_at"] = utc_now()
+        wallet["updated_at"] = utc_now()
+        return _wallet_from_row(wallet)
+
 
 class CredentialService:
     def __init__(
@@ -1649,9 +1697,7 @@ class CredentialService:
             last_four=normalized[-4:],
         )
 
-    async def revoke_ai(
-        self, *, account_id: str, provider: AIProvider
-    ) -> CredentialMetadata:
+    async def revoke_ai(self, *, account_id: str, provider: AIProvider) -> CredentialMetadata:
         record = await self._repository.revoke_ai(account_id=account_id, provider=provider)
         if record is None:
             raise CredentialNotFoundError("credential not found")
@@ -1716,9 +1762,7 @@ class CredentialService:
             last_four="****",
         )
 
-    async def revoke_wallet(
-        self, *, account_id: str, wallet_id: UUID
-    ) -> TradingWalletMetadata:
+    async def revoke_wallet(self, *, account_id: str, wallet_id: UUID) -> TradingWalletMetadata:
         record = await self._repository.request_wallet_revoke(
             account_id=account_id,
             wallet_id=wallet_id,
