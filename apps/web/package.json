@@ -10,11 +10,11 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@supabase/ssr": "^0.7.0",
+    "@supabase/ssr": "^0.12.4",
     "@supabase/supabase-js": "^2.110.8",
     "next": "^15.5.21",
-    "react": "19.1.1",
-    "react-dom": "19.1.1"
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^6.6.3",
