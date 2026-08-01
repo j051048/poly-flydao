@@ -1242,6 +1242,79 @@ footer {
   margin-top: 14px;
 }
 
+.mfa-success-callout,
+.mfa-state-callout,
+.mfa-recovery-callout {
+  display: grid;
+  gap: 11px;
+  margin-top: 16px;
+  padding: 13px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(3, 13, 10, 0.34);
+}
+
+.mfa-success-callout {
+  border-color: rgba(83, 242, 167, 0.22);
+  background: var(--green-soft);
+}
+
+.mfa-recovery-callout {
+  border-color: rgba(255, 209, 102, 0.24);
+  background: var(--yellow-soft);
+}
+
+.mfa-success-callout > div:first-child,
+.mfa-recovery-callout > div,
+.mfa-state-callout {
+  display: grid;
+  gap: 4px;
+}
+
+.mfa-success-callout strong,
+.mfa-state-callout strong,
+.mfa-recovery-callout strong {
+  color: #d5e9df;
+  font-size: 0.74rem;
+}
+
+.mfa-success-callout span,
+.mfa-state-callout span,
+.mfa-recovery-callout span {
+  color: var(--muted);
+  font-size: 0.67rem;
+  line-height: 1.5;
+}
+
+.mfa-recovery-callout .secondary-button {
+  justify-self: start;
+}
+
+.mfa-enrollment {
+  display: grid;
+  justify-items: start;
+  gap: 10px;
+  margin-top: 16px;
+  padding: 14px;
+  border: 1px solid rgba(83, 242, 167, 0.18);
+  border-radius: 12px;
+  background: rgba(3, 13, 10, 0.34);
+}
+
+.mfa-enrollment img {
+  padding: 7px;
+  border-radius: 10px;
+  background: #ffffff;
+}
+
+.mfa-enrollment code {
+  overflow-wrap: anywhere;
+}
+
+#mfa > .form-stack {
+  margin-top: 16px;
+}
+
 .button-row {
   display: flex;
   flex-wrap: wrap;
