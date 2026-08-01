@@ -1,38 +1,9 @@
 "use client";
 
+import { API_BASE_URL } from "./api-config";
 import { getSupabaseBrowserClient } from "./supabase/browser";
 
-export function validatedApiBaseUrl(
-  value: string | undefined,
-  allowLocalHttp = process.env.NODE_ENV === "development",
-): string | null {
-  if (!value) return null;
-  try {
-    const parsed = new URL(value);
-    const loopback =
-      parsed.hostname === "localhost" ||
-      parsed.hostname === "127.0.0.1" ||
-      parsed.hostname === "[::1]";
-    if (
-      (parsed.protocol !== "https:" &&
-        !(allowLocalHttp && parsed.protocol === "http:" && loopback)) ||
-      parsed.username ||
-      parsed.password ||
-      parsed.search ||
-      parsed.hash ||
-      !["", "/"].includes(parsed.pathname)
-    ) {
-      return null;
-    }
-    return parsed.origin;
-  } catch {
-    return null;
-  }
-}
-
-export const API_BASE_URL = validatedApiBaseUrl(
-  process.env.NEXT_PUBLIC_API_BASE_URL,
-) ?? "";
+export { API_BASE_URL, validatedApiBaseUrl } from "./api-config";
 
 export type ApiBody = Record<string, unknown>;
 
@@ -163,6 +134,16 @@ export async function apiRequest<T>(
 
 export function readableApiError(error: unknown): string {
   if (error instanceof ApiError) return error.message;
+  if (isApiNetworkError(error)) {
+    return "浏览器无法连接 Zeabur 控制 API。服务可能离线，或当前 Vercel 域名未加入 CORS；请打开三端部署检查。";
+  }
   if (error instanceof Error && error.message) return error.message;
   return "无法连接控制 API，请检查 HTTPS、CORS 和 Zeabur 服务状态。";
+}
+
+export function isApiNetworkError(error: unknown): boolean {
+  if (!(error instanceof Error) || error instanceof ApiError) return false;
+  return /failed to fetch|network\s*error|network request failed|load failed/i.test(
+    error.message,
+  );
 }
