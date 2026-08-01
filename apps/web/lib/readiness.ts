@@ -7,6 +7,7 @@ export interface SetupStep {
   state: SetupStepState;
   actionLabel: string;
   href: string;
+  optional?: boolean;
 }
 
 interface ReadinessInput {
@@ -125,13 +126,17 @@ export function buildSetupSteps(input: ReadinessInput): SetupStep[] {
             : "todo",
       actionLabel: "配置专属钱包",
       href: "/settings#wallet",
+      optional: true,
     },
   ];
 }
 
 export function setupProgress(steps: SetupStep[]): number {
-  if (steps.length === 0) return 0;
+  const requiredSteps = steps.filter((step) => !step.optional);
+  if (requiredSteps.length === 0) return 0;
   return Math.round(
-    (steps.filter((step) => step.state === "done").length / steps.length) * 100,
+    (requiredSteps.filter((step) => step.state === "done").length /
+      requiredSteps.length) *
+      100,
   );
 }
