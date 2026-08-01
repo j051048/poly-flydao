@@ -50,6 +50,7 @@ class MarketSpec(BaseModel):
     no_label: str = Field(default="No", min_length=1)
     active: bool = True
     closed: bool = False
+    resolved_outcome: Outcome | None = None
     accepting_orders: bool = True
     neg_risk: bool = False
     liquidity_usd: Decimal = Field(default=Decimal("0"), ge=0)
@@ -75,6 +76,8 @@ class MarketSpec(BaseModel):
             raise ValueError("binary outcome labels must differ")
         if self.start_at and self.end_at and self.start_at >= self.end_at:
             raise ValueError("market start_at must precede end_at")
+        if self.resolved_outcome is not None and not self.closed:
+            raise ValueError("a resolved market must be closed")
         return self
 
 

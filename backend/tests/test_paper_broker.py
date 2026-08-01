@@ -73,3 +73,36 @@ async def test_paper_sell_releases_basis_and_records_realized_pnl(yes_book) -> N
     assert state.cash_usd == Decimal("1000.18")
     assert state.token_positions["yes-1"] == 0
     assert state.realized_pnl_today_usd == Decimal("0.18")
+
+
+async def test_paper_state_round_trip_preserves_cash_positions_and_idempotency(
+    yes_book,
+) -> None:
+    broker = PaperBroker(Decimal("100"))
+    intent = TradeIntent(
+        intent_hash="f" * 64,
+        account_id="account",
+        run_id="run",
+        mode=TradingMode.PAPER,
+        market_id="m1",
+        event_id="e1",
+        bucket="crypto",
+        token_id="yes-1",
+        outcome=Outcome.YES,
+        side=Side.BUY,
+        price=Decimal("0.41"),
+        size=Decimal("2"),
+        notional_usd=Decimal("0.82"),
+        edge_after_costs=Decimal("0.1"),
+        forecast_id=None,
+        strategy="test",
+    )
+    await broker.submit(intent, yes_book)
+
+    restored = PaperBroker.from_state(Decimal("100"), broker.export_state())
+    portfolio = await restored.portfolio_state()
+    duplicate = await restored.submit(intent, yes_book)
+
+    assert portfolio.cash_usd == Decimal("99.18")
+    assert portfolio.token_positions["yes-1"] == Decimal("2")
+    assert duplicate.status is ExecutionStatus.DUPLICATE

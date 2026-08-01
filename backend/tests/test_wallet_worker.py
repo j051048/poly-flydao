@@ -29,9 +29,20 @@ class Client:
         self.approved = False
         self.cancelled = False
         self.closed = False
+        self.environment = SimpleNamespace(
+            chain_id=137,
+            collateral_token="0x" + "33" * 20,
+        )
 
     def setup_trading_approvals(self):
         self.approved = True
+
+    def get_balance_allowance(self, *, asset_type):
+        assert asset_type == "COLLATERAL"
+        return SimpleNamespace(
+            balance=12_500_000,
+            allowances={"exchange": 1, "neg_risk": 1},
+        )
 
     def cancel_all(self):
         self.cancelled = True
@@ -57,6 +68,7 @@ class Repository:
         self.verified = None
         self.revoked = False
         self.failed = None
+        self.readiness = None
 
     async def get_pending_envelope_for_worker(self, **kwargs):
         return self.credential
@@ -73,6 +85,10 @@ class Repository:
 
     async def fail_wallet_verification(self, **kwargs):
         self.failed = kwargs
+        return SimpleNamespace()
+
+    async def record_wallet_readiness(self, **kwargs):
+        self.readiness = kwargs
         return SimpleNamespace()
 
     async def complete_wallet_revocation(self, **kwargs):
@@ -101,9 +117,7 @@ def _claim(status: str = "pending_verification"):
         kind=SecretKind.EVM_SIGNER_KEY,
         provider="polymarket",
         status=(
-            "pending_verification"
-            if status == "pending_verification"
-            else "revocation_pending"
+            "pending_verification" if status == "pending_verification" else "revocation_pending"
         ),
         version=1,
         envelope=EncryptedEnvelope(
@@ -134,6 +148,9 @@ async def test_wallet_verification_derives_addresses_before_funding_or_approvals
     assert client.closed
     assert repository.verified["signer_address"] == client.signer
     assert repository.verified["deposit_wallet_address"] == client.wallet
+    assert repository.verified["chain_id"] == 137
+    assert repository.readiness["collateral_balance_pusd"] == 12.5
+    assert repository.readiness["allowances_ready"] is True
     assert repository.failed is None
 
 

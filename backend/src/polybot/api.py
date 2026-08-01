@@ -3,10 +3,12 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
+from hashlib import sha256
 from typing import Annotated, Any, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import (
     Depends,
@@ -47,15 +49,21 @@ from polybot.credentials import (
 )
 from polybot.jobs import (
     AccountNotReadyError,
+    AIBudgetRequest,
+    AIDiagnosticJob,
     CycleJob,
     CycleJobRequest,
     InMemoryJobRepository,
     JobConflictError,
     JobRepository,
+    PerformanceSnapshot,
     PortfolioSnapshot,
+    RiskPolicySnapshot,
+    RiskPresetRequest,
     RuntimeProfile,
     RuntimeProfilePatch,
     SupabaseJobRepository,
+    WorkerStatusSnapshot,
     arm_expiry,
 )
 from polybot.security_logging import configure_secure_logging, safe_json
@@ -71,6 +79,36 @@ _LEGACY_SECRET_HEADERS = frozenset(
     }
 )
 _IDEMPOTENCY_KEY = re.compile(r"^[A-Za-z0-9._:@+-]{16,128}$")
+
+
+class RequestRateLimiter:
+    """Small per-process abuse brake; Supabase Auth remains the identity authority."""
+
+    def __init__(self) -> None:
+        self._windows: dict[str, tuple[float, int]] = {}
+
+    def allow(self, key: str, *, limit: int, window_seconds: int = 60) -> tuple[bool, int]:
+        now = time.monotonic()
+        started, hits = self._windows.get(key, (0.0, 0))
+        if now - started >= window_seconds:
+            started, hits = now, 0
+        hits += 1
+        self._windows[key] = (started, hits)
+        if len(self._windows) > 8192:
+            cutoff = now - window_seconds
+            self._windows = {
+                item_key: value for item_key, value in self._windows.items() if value[0] >= cutoff
+            }
+        retry_after = max(1, int(window_seconds - (now - started)))
+        return hits <= limit, retry_after
+
+
+def _rate_limit_identity(request: Request) -> str:
+    authorization = request.headers.get("authorization", "")
+    source = authorization if authorization.startswith("Bearer ") else ""
+    if not source:
+        source = request.client.host if request.client else "unknown"
+    return sha256(source.encode("utf-8", errors="ignore")).hexdigest()
 
 
 class AIKeyPutRequest(BaseModel):
@@ -298,9 +336,7 @@ def create_app(
     selected_credentials = credentials or default_credentials
     credential_error: str | None = None
     if credential_writer is None:
-        credential_writer, credential_error = _build_credential_service(
-            selected_credentials
-        )
+        credential_writer, credential_error = _build_credential_service(selected_credentials)
     selected_verifier = auth_verifier or _build_verifier(api_settings)
 
     @asynccontextmanager
@@ -311,21 +347,14 @@ def create_app(
             "signed_payload_key": api_settings.signed_payload_key,
             "openai_api_key": api_settings.openai_api_key,
             "litellm_api_key": api_settings.litellm_api_key,
-            "credential_private_key": os.getenv(
-                "POLYBOT_CREDENTIAL_PRIVATE_KEY_PEM"
-            ),
-            "credential_private_keyring": os.getenv(
-                "POLYBOT_CREDENTIAL_PRIVATE_KEYS_JSON"
-            ),
-            "credential_symmetric_key": os.getenv(
-                "POLYBOT_CREDENTIAL_MASTER_KEY"
-            ),
+            "credential_private_key": os.getenv("POLYBOT_CREDENTIAL_PRIVATE_KEY_PEM"),
+            "credential_private_keyring": os.getenv("POLYBOT_CREDENTIAL_PRIVATE_KEYS_JSON"),
+            "credential_symmetric_key": os.getenv("POLYBOT_CREDENTIAL_MASTER_KEY"),
         }
         present = [name for name, value in forbidden_api_secrets.items() if value]
         if present:
             raise RuntimeError(
-                "the public API process received worker-only secret material: "
-                + ", ".join(present)
+                "the public API process received worker-only secret material: " + ", ".join(present)
             )
         if credential_error:
             LOGGER.warning(
@@ -354,12 +383,42 @@ def create_app(
     application.state.job_repository = selected_jobs
     application.state.credential_repository = selected_credentials
     application.state.credential_service = credential_writer
+    application.state.rate_limiter = RequestRateLimiter()
 
     @application.middleware("http")
     async def reject_legacy_secret_transport(
         request: Request,
         call_next: Any,
     ) -> Response:
+        request_id = str(uuid4())
+        request.state.request_id = request_id
+        request_started = time.monotonic()
+        if request.method != "OPTIONS":
+            sensitive = request.url.path.startswith(
+                (
+                    "/v1/me/credentials",
+                    "/v1/me/wallets",
+                    "/v1/me/risk-policy",
+                    "/v1/control",
+                    "/v1/jobs/cycles",
+                )
+            )
+            limit = 30 if sensitive else 240 if request.url.path.startswith("/v1/") else 120
+            identity = _rate_limit_identity(request)
+            allowed, retry_after = application.state.rate_limiter.allow(
+                f"{identity}:{'sensitive' if sensitive else 'general'}",
+                limit=limit,
+            )
+            if not allowed:
+                return JSONResponse(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    content={"detail": "request rate limit exceeded"},
+                    headers={
+                        "Cache-Control": "no-store",
+                        "Retry-After": str(retry_after),
+                        "X-Request-ID": request_id,
+                    },
+                )
         if _LEGACY_SECRET_HEADERS.intersection(request.headers.keys()):
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -369,15 +428,37 @@ def create_app(
                         "authenticated credential enrollment"
                     )
                 },
-                headers={"Cache-Control": "no-store"},
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Request-ID": request_id,
+                },
             )
         response = await call_next(request)
         if request.url.path.startswith(
-            ("/v1/me", "/v1/status", "/v1/jobs", "/v1/control")
+            (
+                "/v1/me",
+                "/v1/status",
+                "/v1/jobs",
+                "/v1/control",
+                "/v1/worker",
+            )
         ):
             response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Request-ID"] = request_id
+        LOGGER.info(
+            safe_json(
+                {
+                    "event": "http_request",
+                    "request_id": request_id,
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status": response.status_code,
+                    "duration_ms": int((time.monotonic() - request_started) * 1000),
+                }
+            )
+        )
         return response
 
     if api_settings.allowed_dashboard_origins:
@@ -387,6 +468,7 @@ def create_app(
             allow_credentials=False,
             allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
             allow_headers=["Authorization", "Content-Type", "Idempotency-Key"],
+            expose_headers=["X-Request-ID", "Retry-After"],
             max_age=600,
         )
 
@@ -475,11 +557,19 @@ def create_app(
             status_code=200 if store_ok else 503,
             content={
                 "ok": store_ok,
-                "mode": api_settings.mode.value,
                 "control_plane": "healthy" if store_ok else "unhealthy",
-                "real_money": api_settings.mode in {TradingMode.CANARY, TradingMode.LIVE},
-                "execution": "worker_only",
             },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @application.get("/worker-health")
+    async def public_worker_health(repo: JobRepositoryDep) -> JSONResponse:
+        snapshot = await repo.worker_status()
+        ready = snapshot.online and snapshot.ready
+        return JSONResponse(
+            status_code=200 if ready else 503,
+            content={"ok": ready},
+            headers={"Cache-Control": "no-store"},
         )
 
     @application.get("/v1/me", response_model=MeResponse)
@@ -528,9 +618,7 @@ def create_app(
         effective = body.model_copy(
             update={
                 "risk_policy_id": (
-                    body.risk_policy_id
-                    if "risk_policy_id" in fields
-                    else current.risk_policy_id
+                    body.risk_policy_id if "risk_policy_id" in fields else current.risk_policy_id
                 ),
                 "trading_wallet_id": (
                     body.trading_wallet_id
@@ -593,6 +681,37 @@ def create_app(
         if record is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "credential not found")
         return record
+
+    @application.post(
+        "/v1/me/credentials/ai/check",
+        response_model=AIDiagnosticJob,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def enqueue_ai_check(
+        principal: AAL2PrincipalDep,
+        repo: JobRepositoryDep,
+    ) -> AIDiagnosticJob:
+        try:
+            return await repo.enqueue_ai_diagnostic(principal.account_id)
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+
+    @application.get(
+        "/v1/me/credentials/ai/check/{job_id}",
+        response_model=AIDiagnosticJob,
+    )
+    async def get_ai_check(
+        job_id: UUID,
+        principal: PrincipalDep,
+        repo: JobRepositoryDep,
+    ) -> AIDiagnosticJob:
+        job = await repo.get_ai_diagnostic(
+            account_id=principal.account_id,
+            job_id=job_id,
+        )
+        if job is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "AI diagnostic not found")
+        return job
 
     @application.post("/v1/me/wallets/provision")
     async def provision_wallet(
@@ -662,6 +781,50 @@ def create_app(
     ) -> PortfolioSnapshot:
         return await repo.portfolio(principal.account_id)
 
+    @application.get("/v1/me/notifications")
+    async def list_notifications(
+        principal: PrincipalDep,
+        repo: JobRepositoryDep,
+        limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    ) -> dict[str, object]:
+        return {"items": await repo.notifications(principal.account_id, limit=limit)}
+
+    @application.put("/v1/me/notifications/{notification_id}/read")
+    async def read_notification(
+        notification_id: int,
+        principal: PrincipalDep,
+        repo: JobRepositoryDep,
+    ) -> dict[str, bool]:
+        if notification_id < 1:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "notification not found")
+        saved = await repo.mark_notification_read(
+            account_id=principal.account_id,
+            notification_id=notification_id,
+        )
+        if not saved:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "notification not found")
+        return {"ok": True}
+
+    @application.put("/v1/me/risk-policy", response_model=RiskPolicySnapshot)
+    async def update_risk_policy(
+        body: RiskPresetRequest,
+        principal: AAL2PrincipalDep,
+        repo: JobRepositoryDep,
+    ) -> RiskPolicySnapshot:
+        return await repo.create_risk_policy_preset(
+            account_id=principal.account_id,
+            expected_profile_version=body.expected_profile_version,
+            preset=body.preset,
+        )
+
+    @application.get("/v1/worker/status", response_model=WorkerStatusSnapshot)
+    async def worker_status(
+        principal: PrincipalDep,
+        repo: JobRepositoryDep,
+    ) -> WorkerStatusSnapshot:
+        del principal
+        return await repo.worker_status()
+
     @application.get("/v1/me/analysis")
     async def recent_analysis(
         principal: PrincipalDep,
@@ -674,6 +837,25 @@ def create_app(
                 limit=limit,
             )
         }
+
+    @application.get("/v1/me/performance", response_model=PerformanceSnapshot)
+    async def performance(
+        principal: PrincipalDep,
+        repo: JobRepositoryDep,
+    ) -> PerformanceSnapshot:
+        return await repo.performance(principal.account_id)
+
+    @application.put("/v1/me/ai-budget")
+    async def update_ai_budget(
+        body: AIBudgetRequest,
+        principal: AAL2PrincipalDep,
+        repo: JobRepositoryDep,
+    ) -> dict[str, int]:
+        saved = await repo.set_ai_budget_limit(
+            account_id=principal.account_id,
+            request_limit=body.request_limit,
+        )
+        return {"request_limit": saved}
 
     @application.post(
         "/v1/jobs/cycles",
@@ -741,21 +923,15 @@ def create_app(
                     "max_order_usd": str(risk.max_order_usd),
                     "max_trade_risk_pct": str(risk.max_trade_risk_pct),
                     "max_event_exposure_pct": str(risk.max_event_exposure_pct),
-                    "max_bucket_exposure_pct": str(
-                        risk.max_bucket_exposure_pct
-                    ),
-                    "max_gross_exposure_pct": str(
-                        risk.max_gross_exposure_pct
-                    ),
+                    "max_bucket_exposure_pct": str(risk.max_bucket_exposure_pct),
+                    "max_gross_exposure_pct": str(risk.max_gross_exposure_pct),
                     "daily_loss_limit_pct": str(risk.daily_loss_limit_pct),
                     "max_drawdown_pct": str(risk.max_drawdown_pct),
                 }
                 if risk
                 else None
             ),
-            "latest_job": (
-                latest_job.model_dump(mode="json") if latest_job is not None else None
-            ),
+            "latest_job": (latest_job.model_dump(mode="json") if latest_job is not None else None),
             "execution": "leased_worker_only",
         }
 

@@ -15,6 +15,7 @@ type CheckState = "checking" | "ok" | "error";
 interface RemoteChecks {
   api: CheckState;
   database: CheckState;
+  worker: CheckState;
   message?: string;
 }
 
@@ -29,6 +30,7 @@ export default function DiagnosticsPage() {
   const [remote, setRemote] = useState<RemoteChecks>({
     api: "checking",
     database: "checking",
+    worker: "checking",
   });
 
   const runChecks = useCallback(async () => {
@@ -36,27 +38,34 @@ export default function DiagnosticsPage() {
       setRemote({
         api: "error",
         database: "error",
+        worker: "error",
         message: "NEXT_PUBLIC_API_BASE_URL 缺失或不是安全的 HTTPS origin。",
       });
       return;
     }
-    setRemote({ api: "checking", database: "checking" });
-    const [live, health] = await Promise.allSettled([
+    setRemote({ api: "checking", database: "checking", worker: "checking" });
+    const [live, health, worker] = await Promise.allSettled([
       apiRequest<unknown>("/livez", { authenticated: false }),
       apiRequest<{ ok?: boolean }>("/health", { authenticated: false }),
+      apiRequest<{ ok?: boolean }>("/worker-health", { authenticated: false }),
     ]);
     const apiOk = live.status === "fulfilled";
     const databaseOk =
       health.status === "fulfilled" && health.value.data?.ok === true;
+    const workerOk =
+      worker.status === "fulfilled" && worker.value.data?.ok === true;
     const failure =
       live.status === "rejected"
         ? live.reason
         : health.status === "rejected"
           ? health.reason
-          : null;
+          : worker.status === "rejected"
+            ? worker.reason
+            : null;
     setRemote({
       api: apiOk ? "ok" : "error",
       database: databaseOk ? "ok" : "error",
+      worker: workerOk ? "ok" : "error",
       message: failure ? readableApiError(failure) : undefined,
     });
   }, [apiConfigured]);
@@ -69,7 +78,8 @@ export default function DiagnosticsPage() {
     supabaseReady &&
     apiConfigured &&
     remote.api === "ok" &&
-    remote.database === "ok";
+    remote.database === "ok" &&
+    remote.worker === "ok";
 
   return (
     <main className="auth-shell diagnostics-shell">
@@ -118,10 +128,10 @@ export default function DiagnosticsPage() {
             <div>
               <strong>Zeabur 私有 Worker</strong>
               <p>
-                Worker 不应绑定公网域名；登录后可通过任务是否被领取和完成来确认运行状态。
+                API 通过数据库心跳确认 Worker 已完成迁移预检且持续消费队列；Worker 本身仍不绑定公网域名。
               </p>
             </div>
-            <span className="pill diagnostic-checking">登录后验证</span>
+            <CheckBadge state={remote.worker} />
           </article>
         </div>
 

@@ -163,5 +163,6 @@ export async function apiRequest<T>(
 
 export function readableApiError(error: unknown): string {
   if (error instanceof ApiError) return error.message;
+  if (error instanceof Error && error.message) return error.message;
   return "无法连接控制 API，请检查 HTTPS、CORS 和 Zeabur 服务状态。";
 }

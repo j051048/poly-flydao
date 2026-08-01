@@ -11,6 +11,10 @@ import { getSupabaseBrowserClient } from "../../lib/supabase/browser";
 
 type Notice = { tone: "success" | "error" | "info"; text: string };
 
+const SECP256K1_ORDER = BigInt(
+  "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141",
+);
+
 interface CredentialStatus {
   aiConfigured: boolean;
   aiCredentialId?: string;
@@ -26,6 +30,11 @@ interface CredentialStatus {
   walletStatus?: string;
   chainId?: number;
   collateralToken?: string;
+  collateralBalance?: number;
+  allowancesReady?: boolean;
+  readinessCheckedAt?: string;
+  aiUsageUsed?: number;
+  aiUsageLimit?: number;
   riskPolicyId?: string;
   desiredMode?: string;
   autoRunEnabled: boolean;
@@ -125,6 +134,11 @@ function parseCredentialStatus(
       ? Number(wallet.chain_id)
       : undefined,
     collateralToken: stringValue(wallet.collateral_token),
+    collateralBalance: Number.isFinite(Number(wallet.collateral_balance_pusd))
+      ? Number(wallet.collateral_balance_pusd)
+      : undefined,
+    allowancesReady: booleanValue(wallet.allowances_ready),
+    readinessCheckedAt: stringValue(wallet.readiness_checked_at),
     autoRunEnabled: false,
     cycleIntervalSeconds: 60,
     expectedVersion: 1,
@@ -161,8 +175,11 @@ export default function SettingsPage() {
   const [provider, setProvider] = useState("openrouter");
   const [baseUrl, setBaseUrl] = useState("");
   const [model, setModel] = useState("");
+  const [aiBudgetLimit, setAiBudgetLimit] = useState(100);
   const [showAdvancedImport, setShowAdvancedImport] = useState(false);
   const [importConfirmed, setImportConfirmed] = useState(false);
+  const [generatedWallet, setGeneratedWallet] = useState(false);
+  const [backupConfirmed, setBackupConfirmed] = useState(false);
   const importIdempotencyKey = useRef<string | null>(null);
   const [desiredMode, setDesiredMode] = useState("paper");
   const [autoRunEnabled, setAutoRunEnabled] = useState(false);
@@ -180,9 +197,10 @@ export default function SettingsPage() {
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const [credentialsResult, meResult] = await Promise.all([
+      const [credentialsResult, meResult, performanceResult] = await Promise.all([
         apiRequest<unknown>("/v1/me/credentials/status"),
         apiRequest<unknown>("/v1/me"),
+        apiRequest<unknown>("/v1/me/performance"),
       ]);
       const me = record(meResult.data);
       const runtimeProfile = record(me.runtime_profile);
@@ -211,10 +229,14 @@ export default function SettingsPage() {
         Number(runtimeProfile.cycle_interval_seconds) || 60;
       parsed.expectedVersion =
         Number(runtimeProfile.version) || 1;
+      const performance = record(performanceResult.data);
+      parsed.aiUsageUsed = Number(performance.ai_usage_used) || 0;
+      parsed.aiUsageLimit = Number(performance.ai_usage_limit) || 100;
       setStatus(parsed);
       if (parsed.provider) setProvider(parsed.provider);
       if (parsed.aiBaseUrl) setBaseUrl(parsed.aiBaseUrl);
       if (parsed.model) setModel(parsed.model);
+      setAiBudgetLimit(parsed.aiUsageLimit ?? 100);
       setDesiredMode(parsed.desiredMode);
       setAutoRunEnabled(parsed.autoRunEnabled);
       setCycleIntervalSeconds(parsed.cycleIntervalSeconds);
@@ -371,6 +393,26 @@ export default function SettingsPage() {
     }
   }
 
+  async function saveAiBudget() {
+    if (mfaLevel !== "aal2") {
+      setNotice({ tone: "error", text: "修改 AI 预算前必须完成 TOTP 双因素验证。" });
+      return;
+    }
+    setBusy("ai-budget");
+    try {
+      await apiRequest("/v1/me/ai-budget", {
+        method: "PUT",
+        body: { request_limit: aiBudgetLimit },
+      });
+      setNotice({ tone: "success", text: "每日 AI 请求预算已更新。" });
+      await refresh();
+    } catch (error) {
+      setNotice({ tone: "error", text: readableApiError(error) });
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function importWallet() {
     const secret = privateKey.trim();
     if (!secret || !importConfirmed) return;
@@ -397,6 +439,8 @@ export default function SettingsPage() {
       });
       importIdempotencyKey.current = null;
       setImportConfirmed(false);
+      setGeneratedWallet(false);
+      setBackupConfirmed(false);
       setShowAdvancedImport(false);
       setNotice({
         tone: "success",
@@ -409,6 +453,42 @@ export default function SettingsPage() {
       setPrivateKey("");
       setBusy(null);
     }
+  }
+
+  function generateDedicatedWallet() {
+    let secret = "";
+    do {
+      const bytes = crypto.getRandomValues(new Uint8Array(32));
+      secret = `0x${Array.from(bytes, (value) =>
+        value.toString(16).padStart(2, "0"),
+      ).join("")}`;
+    } while (BigInt(secret) === BigInt(0) || BigInt(secret) >= SECP256K1_ORDER);
+    setPrivateKey(secret);
+    setGeneratedWallet(true);
+    setBackupConfirmed(false);
+    setImportConfirmed(false);
+    setShowAdvancedImport(true);
+    setNotice({
+      tone: "info",
+      text: "专用钱包已在本浏览器内生成。请先下载离线备份，再加密导入。",
+    });
+  }
+
+  function downloadWalletBackup() {
+    if (!generatedWallet || !privateKey) return;
+    const content = [
+      "Polybot dedicated trading wallet backup",
+      "Never share this key. Never deposit funds you cannot afford to lose.",
+      "",
+      privateKey,
+      "",
+    ].join("\n");
+    const url = URL.createObjectURL(new Blob([content], { type: "text/plain" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `polybot-wallet-backup-${new Date().toISOString().slice(0, 10)}.txt`;
+    link.click();
+    URL.revokeObjectURL(url);
   }
 
   async function revokeWallet() {
@@ -512,6 +592,43 @@ export default function SettingsPage() {
     }
   }
 
+  async function testAiCredential() {
+    if (!status?.aiConfigured || mfaLevel !== "aal2") return;
+    setBusy("ai-check");
+    setNotice({ tone: "info", text: "Worker 正在验证 Key、模型和结构化输出…" });
+    try {
+      const queued = await apiRequest<unknown>("/v1/me/credentials/ai/check", {
+        method: "POST",
+      });
+      const jobId = stringValue(record(queued.data).id);
+      if (!jobId) throw new Error("诊断任务没有返回 ID");
+      for (let attempt = 0; attempt < 45; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 2000));
+        const response = await apiRequest<unknown>(
+          `/v1/me/credentials/ai/check/${jobId}`,
+        );
+        const job = record(response.data);
+        const jobStatus = stringValue(job.status);
+        if (jobStatus === "succeeded") {
+          const result = record(job.result_summary);
+          setNotice({
+            tone: "success",
+            text: `AI 连接正常，结构化输出验证通过，耗时 ${Number(result.latency_ms) || 0} ms。`,
+          });
+          return;
+        }
+        if (jobStatus === "failed") {
+          throw new Error(`AI 检查失败：${stringValue(job.error_code) ?? "unknown"}`);
+        }
+      }
+      throw new Error("AI 检查仍在排队，请确认私有 Worker 在线后重试。 ");
+    } catch (error) {
+      setNotice({ tone: "error", text: readableApiError(error) });
+    } finally {
+      setBusy(null);
+    }
+  }
+
   function applySafePaperPreset() {
     setDesiredMode("paper");
     setCycleIntervalSeconds(300);
@@ -520,6 +637,34 @@ export default function SettingsPage() {
       tone: "info",
       text: "已套用推荐值：Paper 模拟盘、每 5 分钟运行。请点击“保存自动运行设置”确认。",
     });
+  }
+
+  async function applyRiskPreset(
+    preset: "conservative" | "balanced" | "advanced",
+  ) {
+    if (!status || mfaLevel !== "aal2") {
+      setNotice({ tone: "error", text: "修改资金风控前请先完成 TOTP 验证。" });
+      return;
+    }
+    setBusy(`risk-${preset}`);
+    try {
+      await apiRequest("/v1/me/risk-policy", {
+        method: "PUT",
+        body: {
+          expected_profile_version: status.expectedVersion,
+          preset,
+        },
+      });
+      setNotice({
+        tone: "success",
+        text: `已启用${{ conservative: "保守", balanced: "均衡", advanced: "进阶" }[preset]}风控，新任务将使用新版本。`,
+      });
+      await refresh();
+    } catch (error) {
+      setNotice({ tone: "error", text: readableApiError(error) });
+    } finally {
+      setBusy(null);
+    }
   }
 
   async function copyWalletAddress() {
@@ -761,6 +906,14 @@ export default function SettingsPage() {
                     保存模型设置
                   </button>
                   <button
+                    className="secondary-button"
+                    type="button"
+                    onClick={() => void testAiCredential()}
+                    disabled={mfaLevel !== "aal2" || busy !== null}
+                  >
+                    {busy === "ai-check" ? "检查中…" : "测试 AI 连接"}
+                  </button>
+                  <button
                     className="danger-button"
                     type="button"
                     onClick={() => void revokeAiCredential()}
@@ -772,8 +925,35 @@ export default function SettingsPage() {
               )}
             </div>
             <p className="field-help">
-              保存只代表密钥已安全入库；真实可用性会在下一次 Paper 任务调用模型时确认。
+              保存后请点击“测试 AI 连接”；诊断只验证模型输出，不扫描市场或创建订单。
             </p>
+            <div className="budget-control">
+              <label className="form-field" htmlFor="ai-budget">
+                <span className="field-label">每日 AI 请求预算</span>
+                <select
+                  id="ai-budget"
+                  value={aiBudgetLimit}
+                  onChange={(event) => setAiBudgetLimit(Number(event.target.value))}
+                >
+                  <option value={100}>100 · 低成本试用</option>
+                  <option value={500}>500 · Paper 观察</option>
+                  <option value={2000}>2,000 · 高频自动周期</option>
+                  <option value={5000}>5,000 · 高额度（谨慎）</option>
+                </select>
+              </label>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => void saveAiBudget()}
+                disabled={mfaLevel !== "aal2" || busy !== null}
+              >
+                {busy === "ai-budget" ? "保存中…" : "保存 AI 预算"}
+              </button>
+              <p className="field-help">
+                今日已预留 {status?.aiUsageUsed ?? 0} / {status?.aiUsageLimit ?? 100}
+                请求单位；达到上限后自动停止新 AI 分析，不会绕过预算。
+              </p>
+            </div>
           </div>
         </section>
 
@@ -845,6 +1025,30 @@ export default function SettingsPage() {
               )}
             </div>
           )}
+        </section>
+
+        <section className="panel" id="risk">
+          <div className="section-heading">
+            <div>
+              <p className="eyebrow">RISK PRESETS</p>
+              <h2>选择能承受的风险</h2>
+            </div>
+            <span className="pill degraded">版本化保存</span>
+          </div>
+          <p className="field-help">
+            每次切换都会创建不可篡改的新风控版本；已有任务仍使用入队时的旧快照。
+          </p>
+          <div className="risk-preset-grid">
+            <button type="button" className="secondary-button" disabled={busy !== null || mfaLevel !== "aal2"} onClick={() => void applyRiskPreset("conservative")}>
+              保守：单笔 $2 / 最小优势 6%
+            </button>
+            <button type="button" className="secondary-button" disabled={busy !== null || mfaLevel !== "aal2"} onClick={() => void applyRiskPreset("balanced")}>
+              均衡：单笔 $5 / 最小优势 4%
+            </button>
+            <button type="button" className="warning-button" disabled={busy !== null || mfaLevel !== "aal2"} onClick={() => void applyRiskPreset("advanced")}>
+              进阶：单笔 $10 / 最小优势 3%
+            </button>
+          </div>
         </section>
 
         <section className="panel" id="automation">
@@ -952,19 +1156,22 @@ export default function SettingsPage() {
             <div><dt>状态</dt><dd>{walletStatusLabel(status?.walletStatus, status?.walletConfigured)}</dd></div>
             <div><dt>网络 Chain ID</dt><dd>{status?.chainId ?? "等待 Worker 返回"}</dd></div>
             <div><dt>抵押资产合约</dt><dd title={status?.collateralToken}>{status?.collateralToken ?? "等待 Worker 返回"}</dd></div>
+            <div><dt>pUSD 可用余额</dt><dd>{status?.collateralBalance === undefined ? "等待 Worker 检查" : `$${status.collateralBalance.toFixed(2)}`}</dd></div>
+            <div><dt>交易授权</dt><dd>{status?.allowancesReady ? "已就绪" : "入金后由实盘 Worker 安全初始化"}</dd></div>
           </dl>
 
           {!status?.walletConfigured && (
             <div className="wallet-actions">
               <button
-                className="secondary-button full-width"
+                className="primary-button full-width"
                 type="button"
-                disabled
+                onClick={generateDedicatedWallet}
+                disabled={busy !== null}
               >
-                服务端生成钱包尚未启用
+                一键生成全新专用钱包
               </button>
               <p className="field-help">
-                当前请展开下方高级选项，导入一个全新、小额、专用的钱包。
+                私钥只在当前页面内存中生成；下载一次离线备份后再加密提交。
               </p>
             </div>
           )}
@@ -988,13 +1195,37 @@ export default function SettingsPage() {
                   id="private-key"
                   type="password"
                   value={privateKey}
-                  onChange={(event) => setPrivateKey(event.target.value)}
+                  onChange={(event) => {
+                    setPrivateKey(event.target.value);
+                    setGeneratedWallet(false);
+                    setBackupConfirmed(false);
+                  }}
                   placeholder="0x…（提交后立即清空）"
                   autoComplete="off"
                   autoCapitalize="off"
                   spellCheck={false}
                 />
               </label>
+              {generatedWallet && (
+                <div className="deposit-callout generated-wallet-backup">
+                  <strong>只显示这一次：先保存离线备份</strong>
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    onClick={downloadWalletBackup}
+                  >
+                    下载私钥备份
+                  </button>
+                  <label className="confirm-row">
+                    <input
+                      type="checkbox"
+                      checked={backupConfirmed}
+                      onChange={(event) => setBackupConfirmed(event.target.checked)}
+                    />
+                    <span>我已把备份保存在离线安全位置，并理解丢失后无法恢复。</span>
+                  </label>
+                </div>
+              )}
               <label className="confirm-row">
                 <input
                   type="checkbox"
@@ -1013,6 +1244,7 @@ export default function SettingsPage() {
                 disabled={
                   !privateKey.trim() ||
                   !importConfirmed ||
+                  (generatedWallet && !backupConfirmed) ||
                   mfaLevel !== "aal2" ||
                   busy !== null
                 }

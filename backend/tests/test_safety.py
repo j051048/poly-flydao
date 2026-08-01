@@ -235,8 +235,10 @@ async def test_live_approval_setup_waits_for_funding_and_verifies_allowance() ->
         geoblock=AllowedChecker(),
     )
     funded.set_execution_guard(lease_guard)
-    await funded.ensure_trading_approvals()
+    balance_pusd, allowances_ready = await funded.ensure_trading_approvals()
     assert funded_client.approval_calls == 1
+    assert balance_pusd == Decimal("10")
+    assert allowances_ready is True
 
 
 async def test_live_approval_setup_obeys_official_geoblock() -> None:

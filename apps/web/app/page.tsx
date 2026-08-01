@@ -55,6 +55,15 @@ interface JobView {
   message?: string;
 }
 
+interface NotificationView {
+  id: number;
+  severity: string;
+  title: string;
+  message: string;
+  createdAt?: string;
+  read: boolean;
+}
+
 const RISK_LIMITS = [
   { key: "min_edge", label: "最小净优势", format: "percent" },
   { key: "max_order_usd", label: "单笔订单上限", format: "usd" },
@@ -227,6 +236,7 @@ export default function HomePage() {
   const [riskConfirmed, setRiskConfirmed] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [now, setNow] = useState(0);
+  const [notifications, setNotifications] = useState<NotificationView[]>([]);
   const cycleIdempotencyKey = useRef<string | null>(null);
 
   const refresh = useCallback(async () => {
@@ -252,7 +262,26 @@ export default function HomePage() {
       })
       .catch((error) => setStatusError(readableApiError(error)));
 
-    await Promise.allSettled([healthPromise, statusPromise]);
+    const notificationsPromise = apiRequest<unknown>("/v1/me/notifications?limit=8")
+      .then(({ data }) => {
+        const rows = asRecord(data).items;
+        setNotifications(
+          (Array.isArray(rows) ? rows : []).map((value) => {
+            const row = asRecord(value);
+            return {
+              id: Number(row.id),
+              severity: asString(row.severity) ?? "info",
+              title: asString(row.title) ?? "系统通知",
+              message: asString(row.message) ?? "",
+              createdAt: asString(row.created_at),
+              read: Boolean(row.read_at),
+            };
+          }),
+        );
+      })
+      .catch(() => undefined);
+
+    await Promise.allSettled([healthPromise, statusPromise, notificationsPromise]);
     setRefreshing(false);
   }, []);
 
@@ -317,6 +346,21 @@ export default function HomePage() {
       globalThis.clearInterval(timer);
     };
   }, [lastJob?.id, lastJob?.status]);
+
+  async function markNotificationRead(notificationId: number) {
+    try {
+      await apiRequest(`/v1/me/notifications/${notificationId}/read`, {
+        method: "PUT",
+      });
+      setNotifications((current) =>
+        current.map((row) =>
+          row.id === notificationId ? { ...row, read: true } : row,
+        ),
+      );
+    } catch (error) {
+      setNotice({ tone: "error", text: readableApiError(error) });
+    }
+  }
 
   const configuredMode = status?.configuredMode ?? health.mode;
   const armableMode: LiveMode | null =
@@ -546,6 +590,38 @@ export default function HomePage() {
           </p>
         </article>
       </section>
+
+      {notifications.some((item) => !item.read) && (
+        <section className="panel notification-panel" aria-label="系统提醒">
+          <div className="section-heading">
+            <div>
+              <p className="eyebrow">ATTENTION</p>
+              <h2>需要关注</h2>
+            </div>
+            <span className="pill degraded">
+              {notifications.filter((item) => !item.read).length} 条未读
+            </span>
+          </div>
+          <div className="notification-list">
+            {notifications.filter((item) => !item.read).map((item) => (
+              <article className={`notification-item ${item.severity}`} key={item.id}>
+                <div>
+                  <strong>{item.title}</strong>
+                  <p>{item.message}</p>
+                  <small>{formatDate(item.createdAt)}</small>
+                </div>
+                <button
+                  type="button"
+                  className="text-button"
+                  onClick={() => void markNotificationRead(item.id)}
+                >
+                  已处理
+                </button>
+              </article>
+            ))}
+          </div>
+        </section>
+      )}
 
       <div className="main-grid">
         <section className="panel controls-panel">

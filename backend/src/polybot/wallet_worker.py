@@ -4,6 +4,7 @@ import asyncio
 import logging
 from collections.abc import Callable
 from contextlib import suppress
+from decimal import Decimal
 from typing import Any
 
 from polybot.credentials import (
@@ -105,6 +106,16 @@ class WalletLifecycleWorker:
             client = await asyncio.to_thread(self.client_factory, "0x" + secret.hex())
             signer_address = str(client.signer)
             wallet_address = str(client.wallet)
+            environment = client.environment
+            chain_id = int(environment.chain_id)
+            collateral_token = str(environment.collateral_token)
+            balance = await asyncio.to_thread(
+                client.get_balance_allowance,
+                asset_type="COLLATERAL",
+            )
+            collateral_balance = Decimal(str(balance.balance)) / Decimal("1000000")
+            allowances = [Decimal(str(value)) for value in balance.allowances.values()]
+            allowances_ready = bool(allowances) and min(allowances) > 0
             if not lease_valid.is_set():
                 return
             saved = await self.repository.complete_wallet_verification(
@@ -114,10 +125,19 @@ class WalletLifecycleWorker:
                 fencing_token=claim.lifecycle_fencing_token,
                 signer_address=signer_address,
                 deposit_wallet_address=wallet_address,
+                chain_id=chain_id,
+                collateral_token=collateral_token,
             )
             if saved is None:
                 self.logger.critical(
                     "wallet verification completion was rejected by its fencing token"
+                )
+            else:
+                await self.repository.record_wallet_readiness(
+                    account_id=str(claim.account_id),
+                    wallet_id=claim.id,
+                    collateral_balance_pusd=collateral_balance,
+                    allowances_ready=allowances_ready,
                 )
         except Exception as exc:
             self.logger.warning(

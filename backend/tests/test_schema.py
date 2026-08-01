@@ -92,11 +92,7 @@ def test_upgrade_migration_makes_arm_expiry_atomic() -> None:
 
 
 def test_upgrade_migration_adds_exchange_side_order_expiry() -> None:
-    sql = (
-        Path("supabase/migrations/0006_order_expiry.sql")
-        .read_text(encoding="utf-8")
-        .lower()
-    )
+    sql = Path("supabase/migrations/0006_order_expiry.sql").read_text(encoding="utf-8").lower()
     assert "add column if not exists expires_at" in sql
     assert "orders_gtd_has_expiry" in sql
     assert "order_type <> 'gtd' or expires_at is not null" in sql
@@ -106,9 +102,7 @@ def test_upgrade_migration_adds_exchange_side_order_expiry() -> None:
 
 def test_secure_multitenant_migration_is_fenced_and_service_role_only() -> None:
     sql = (
-        Path("supabase/migrations/0007_secure_multitenant.sql")
-        .read_text(encoding="utf-8")
-        .lower()
+        Path("supabase/migrations/0007_secure_multitenant.sql").read_text(encoding="utf-8").lower()
     )
     for table in (
         "account_runtime_profiles",
@@ -138,9 +132,9 @@ def test_secure_multitenant_migration_is_fenced_and_service_role_only() -> None:
     assert "from service_role;" in sql
     assert "to service_role;" in sql
 
-    credential_grant = sql.split(
-        "-- authenticated dashboards receive metadata only.", 1
-    )[1].split(") on public.credential_refs to authenticated;", 1)[0]
+    credential_grant = sql.split("-- authenticated dashboards receive metadata only.", 1)[1].split(
+        ") on public.credential_refs to authenticated;", 1
+    )[0]
     assert "fingerprint" not in credential_grant
     assert "last_four" not in credential_grant
 
@@ -149,9 +143,7 @@ def test_secure_multitenant_migration_is_fenced_and_service_role_only() -> None:
     for segment in function_segments:
         name = re.match(r"([a-z0-9_]+)", segment)
         assert name is not None
-        if "security definer" in segment.split(
-            "create or replace function public.", 1
-        )[0]:
+        if "security definer" in segment.split("create or replace function public.", 1)[0]:
             security_definers.add(name.group(1))
     assert security_definers
     for function in security_definers:
@@ -184,9 +176,7 @@ def test_p2_migration_persists_non_atomic_groups_and_pair_inventory() -> None:
 
 def test_p2_transaction_rpcs_are_service_role_only_and_append_only() -> None:
     sql = (
-        Path("supabase/migrations/0009_pair_execution_rpcs.sql")
-        .read_text(encoding="utf-8")
-        .lower()
+        Path("supabase/migrations/0009_pair_execution_rpcs.sql").read_text(encoding="utf-8").lower()
     )
     for table in (
         "order_groups",
@@ -251,9 +241,7 @@ def test_atomic_tenant_submission_gate_checks_every_live_authority() -> None:
 
 def test_custom_ai_provider_migrations_are_https_and_service_role_only() -> None:
     initial = (
-        Path("supabase/migrations/0011_custom_ai_provider.sql")
-        .read_text(encoding="utf-8")
-        .lower()
+        Path("supabase/migrations/0011_custom_ai_provider.sql").read_text(encoding="utf-8").lower()
     )
     hardening = (
         Path("supabase/migrations/0012_harden_custom_ai_provider.sql")
@@ -264,9 +252,7 @@ def test_custom_ai_provider_migrations_are_https_and_service_role_only() -> None
         assert "ai_base_url" in sql
         assert "^https://" in sql
         assert "^https?://" not in sql
-        grant = sql.split(
-            "grant execute on function public.update_account_runtime_profile", 1
-        )[1]
+        grant = sql.split("grant execute on function public.update_account_runtime_profile", 1)[1]
         assert "to service_role;" in grant
         assert "to authenticated" not in grant
     assert "from public, anon, authenticated, service_role;" in hardening
@@ -304,3 +290,38 @@ def test_custom_ai_credential_rpc_and_schema_sentinel_are_service_role_only() ->
     assert "select 14;" in sql
     assert "from public, anon, authenticated, service_role;" in sql
     assert "to service_role;" in sql
+
+
+def test_product_operations_migration_closes_readiness_and_calibration_loops() -> None:
+    sql = (
+        Path("supabase/migrations/0015_product_operations.sql")
+        .read_text(encoding="utf-8")
+        .lower()
+    )
+    for required in (
+        "create table public.worker_heartbeats",
+        "create table public.paper_account_states",
+        "create table public.ai_diagnostic_jobs",
+        "create table public.ai_budget_settings",
+        "create table public.forecast_outcomes",
+        "create or replace function public.save_paper_account_state",
+        "create or replace function public.consume_ai_budget",
+        "create or replace function public.set_ai_budget_limit",
+        "create or replace function public.record_market_resolution",
+        "create trigger cycle_jobs_live_wallet_ready",
+        "create trigger orders_live_wallet_ready",
+        "wallet.collateral_balance_pusd > 0",
+        "wallet.allowances_ready",
+        "wallet.readiness_checked_at > now() - interval '15 minutes'",
+        "select 15;",
+    ):
+        assert required in sql
+    assert "set search_path = ''" in sql
+    assert "from public, anon, authenticated, service_role" in sql
+    assert "to service_role;" in sql
+    enqueue_gate = sql.split(
+        "create or replace function public.enforce_live_wallet_readiness()", 1
+    )[1].split("create trigger cycle_jobs_live_wallet_ready", 1)[0]
+    assert "wallet.chain_id is not null" in enqueue_gate
+    assert "wallet.collateral_balance_pusd > 0" not in enqueue_gate
+    assert "wallet.allowances_ready" not in enqueue_gate

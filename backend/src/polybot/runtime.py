@@ -119,14 +119,10 @@ def _evidence_collector(
     if name == "none":
         return NoopEvidenceCollector()
     if name == "gdelt":
-        return GDELTNewsEvidenceCollector(
-            timeout_seconds=min(settings.ai_timeout_seconds, 30)
-        )
+        return GDELTNewsEvidenceCollector(timeout_seconds=min(settings.ai_timeout_seconds, 30))
     if name == "openai_web":
         if settings.openai_api_key is None:
-            raise ValueError(
-                "OPENAI_API_KEY is required for POLYBOT_EVIDENCE_PROVIDER=openai_web"
-            )
+            raise ValueError("OPENAI_API_KEY is required for POLYBOT_EVIDENCE_PROVIDER=openai_web")
         return OpenAIWebEvidenceCollector(
             settings.openai_api_key.get_secret_value(),
             model=settings.forecast_model,
@@ -139,6 +135,7 @@ def build_runtime(
     settings: Settings | None = None,
     *,
     store_override: StateStore | None = None,
+    broker_override: Broker | None = None,
 ) -> Runtime:
     settings = settings or get_settings()
     store = store_override or _store(settings)
@@ -150,7 +147,9 @@ def build_runtime(
     )
     market_data = StreamingPolymarketMarketData(max_cache_age_seconds=settings.max_book_age_seconds)
     reconciler: OrderReconciler | None = None
-    if settings.mode is TradingMode.PAPER:
+    if broker_override is not None:
+        broker = broker_override
+    elif settings.mode is TradingMode.PAPER:
         broker: Broker = PaperBroker(settings.bankroll_usd)
     elif settings.mode is TradingMode.SHADOW:
         broker = ShadowBroker(settings.bankroll_usd)

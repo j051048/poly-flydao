@@ -101,6 +101,10 @@ class TenantJobRunner:
         self._tasks: set[asyncio.Task[None]] = set()
         self._active_accounts: set[str] = set()
 
+    @property
+    def active_job_count(self) -> int:
+        return len(self._tasks)
+
     async def serve(self, stop: asyncio.Event) -> None:
         """Claim and execute jobs until stopped, then run executor cleanup."""
 

@@ -228,11 +228,14 @@ class TenantExecutionFence:
     def __post_init__(self) -> None:
         if not self.job_id or not self.claimed_by or not self.risk_policy_id:
             raise ValueError("tenant execution fence identifiers are required")
-        if min(
-            self.job_fencing_token,
-            self.profile_version,
-            self.risk_policy_version,
-        ) <= 0:
+        if (
+            min(
+                self.job_fencing_token,
+                self.profile_version,
+                self.risk_policy_version,
+            )
+            <= 0
+        ):
             raise ValueError("tenant execution fence versions must be positive")
         if self.mode not in {TradingMode.CANARY, TradingMode.LIVE}:
             raise ValueError("tenant execution fence is only valid for live modes")
@@ -354,9 +357,7 @@ class SupabaseStore:
                             "p_claimed_by": "schema-preflight",
                             "p_job_fencing_token": 0,
                             "p_profile_version": 0,
-                            "p_risk_policy_id": (
-                                "00000000-0000-0000-0000-000000000000"
-                            ),
+                            "p_risk_policy_id": ("00000000-0000-0000-0000-000000000000"),
                             "p_risk_policy_version": 0,
                             "p_mode": "paper",
                         },
@@ -402,6 +403,9 @@ class SupabaseStore:
                 "maker_rebate_rate": str(market.maker_rebate_rate),
             },
         }
+        if market.resolved_outcome is not None:
+            payload["resolved_outcome"] = market.resolved_outcome.value
+            payload["resolution_confirmed_at"] = market.updated_at.isoformat()
         response = await self._execute(
             self.client.table("markets").upsert(payload, on_conflict="condition_id").select("id")
         )

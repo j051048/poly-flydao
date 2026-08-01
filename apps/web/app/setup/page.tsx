@@ -28,6 +28,8 @@ export default function SetupPage() {
   const [snapshot, setSnapshot] = useState<Snapshot>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [firstRunBusy, setFirstRunBusy] = useState(false);
+  const [firstRunMessage, setFirstRunMessage] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -63,6 +65,61 @@ export default function SetupPage() {
   const steps = useMemo(() => buildSetupSteps(snapshot), [snapshot]);
   const progress = setupProgress(steps);
   const nextStep = steps.find((step) => step.state !== "done");
+  const aiReady = steps.some((step) => step.key === "ai" && step.state === "done");
+
+  async function runFirstPaperCycle() {
+    const me = snapshot.me as Record<string, unknown> | undefined;
+    const profile = me?.runtime_profile as Record<string, unknown> | undefined;
+    if (!profile) {
+      setError("请先完成登录并刷新状态。");
+      return;
+    }
+    setFirstRunBusy(true);
+    setFirstRunMessage("正在切换安全模拟模式并创建首次任务…");
+    try {
+      await apiRequest("/v1/me/runtime-profile", {
+        method: "PUT",
+        body: {
+          expected_version: Number(profile.version) || 1,
+          ai_provider: String(profile.ai_provider || "mock"),
+          ai_base_url: profile.ai_base_url ?? null,
+          forecast_model: String(profile.forecast_model || "gpt-5.6-terra"),
+          ai_credential_id: profile.ai_credential_id ?? null,
+          trading_wallet_id: profile.trading_wallet_id ?? null,
+          risk_policy_id: profile.risk_policy_id ?? null,
+          desired_mode: "paper",
+          auto_run_enabled: true,
+          cycle_interval_seconds: 300,
+        },
+      });
+      const queued = await apiRequest<unknown>("/v1/jobs/cycles", {
+        method: "POST",
+        body: { mode: "paper" },
+        idempotencyKey: `setup-paper:${crypto.randomUUID()}`,
+      });
+      const jobId = String((queued.data as Record<string, unknown>).id || "");
+      if (!jobId) throw new Error("任务创建成功但没有返回 ID。");
+      for (let attempt = 0; attempt < 60; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 2000));
+        const response = await apiRequest<unknown>(`/v1/jobs/${jobId}`);
+        const job = response.data as Record<string, unknown>;
+        if (job.status === "succeeded") {
+          setFirstRunMessage("首次 Paper 周期完成。现在可以查看分析与模拟资产。");
+          await refresh();
+          return;
+        }
+        if (job.status === "failed") {
+          throw new Error(`首次任务失败：${String(job.error_code || "unknown")}`);
+        }
+      }
+      throw new Error("任务仍在排队，请到部署诊断检查 Worker 心跳。");
+    } catch (caught) {
+      setError(readableApiError(caught));
+      setFirstRunMessage(null);
+    } finally {
+      setFirstRunBusy(false);
+    }
+  }
 
   return (
     <main className="page-shell">
@@ -88,6 +145,18 @@ export default function SetupPage() {
           <p>
             你不需要先理解三端架构。按下面顺序完成即可；系统在缺少任何关键条件时都会拒绝真实订单。
           </p>
+          <button
+            className="primary-button"
+            type="button"
+            onClick={() => void runFirstPaperCycle()}
+            disabled={firstRunBusy || loading || !snapshot.me || !aiReady}
+          >
+            {firstRunBusy ? "首次模拟运行中…" : "一键启动首次 Paper 模拟"}
+          </button>
+          {!loading && !aiReady && (
+            <p className="field-help">先完成下方“连接你的 AI”，按钮才会启用。</p>
+          )}
+          {firstRunMessage && <p className="field-help">{firstRunMessage}</p>}
         </div>
         <div className="progress-ring" style={{ "--progress": `${progress}%` } as React.CSSProperties}>
           <strong>{progress}%</strong>
