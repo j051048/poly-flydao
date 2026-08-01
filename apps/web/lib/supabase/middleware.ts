@@ -7,8 +7,13 @@ const PUBLIC_PATHS = new Set([
   "/login",
   "/register",
   "/diagnostics",
+  "/api/deployment-check",
   "/auth/callback",
 ]);
+
+export function isPublicPath(pathname: string): boolean {
+  return PUBLIC_PATHS.has(pathname);
+}
 
 export function copyResponseCookies(
   source: NextResponse,
@@ -23,7 +28,7 @@ export function copyResponseCookies(
 export async function refreshAuthSession(request: NextRequest): Promise<NextResponse> {
   const config = getPublicSupabaseConfig();
   const pathname = request.nextUrl.pathname;
-  const isPublic = PUBLIC_PATHS.has(pathname);
+  const isPublic = isPublicPath(pathname);
   if (!config) {
     if (isPublic) return NextResponse.next({ request });
     const loginUrl = request.nextUrl.clone();
