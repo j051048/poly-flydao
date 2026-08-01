@@ -63,8 +63,12 @@ export default function SetupPage() {
   }, [refresh]);
 
   const steps = useMemo(() => buildSetupSteps(snapshot), [snapshot]);
+  const coreSteps = steps.filter((step) => !step.optional);
   const progress = setupProgress(steps);
-  const nextStep = steps.find((step) => step.state !== "done");
+  const nextStep = coreSteps.find((step) => step.state !== "done");
+  const completedCoreSteps = coreSteps.filter(
+    (step) => step.state === "done",
+  ).length;
   const aiReady = steps.some((step) => step.key === "ai" && step.state === "done");
 
   async function runFirstPaperCycle() {
@@ -88,7 +92,7 @@ export default function SetupPage() {
           trading_wallet_id: profile.trading_wallet_id ?? null,
           risk_policy_id: profile.risk_policy_id ?? null,
           desired_mode: "paper",
-          auto_run_enabled: true,
+          auto_run_enabled: false,
           cycle_interval_seconds: 300,
         },
       });
@@ -140,27 +144,50 @@ export default function SetupPage() {
 
       <section className="onboarding-hero">
         <div>
-          <span className="onboarding-kicker">推荐先模拟，后入金</span>
-          <h2>{nextStep ? `下一步：${nextStep.title}` : "基础设置已完成"}</h2>
+          <span className="onboarding-kicker">一次只做一件事</span>
+          <h2>{nextStep ? `现在只做：${nextStep.title}` : "安全启动已完成"}</h2>
           <p>
-            你不需要先理解三端架构。按下面顺序完成即可；系统在缺少任何关键条件时都会拒绝真实订单。
+            {nextStep
+              ? nextStep.description
+              : "Paper 自动周期已经准备好；专属钱包是可选项，等你准备小额实盘时再配置。"}
           </p>
-          <button
-            className="primary-button"
-            type="button"
-            onClick={() => void runFirstPaperCycle()}
-            disabled={firstRunBusy || loading || !snapshot.me || !aiReady}
-          >
-            {firstRunBusy ? "首次模拟运行中…" : "一键启动首次 Paper 模拟"}
-          </button>
-          {!loading && !aiReady && (
-            <p className="field-help">先完成下方“连接你的 AI”，按钮才会启用。</p>
+          {nextStep?.key === "paper" ? (
+            <button
+              className="primary-button onboarding-primary-action"
+              type="button"
+              onClick={() => void runFirstPaperCycle()}
+              disabled={
+                firstRunBusy ||
+                loading ||
+                !snapshot.me ||
+                !aiReady ||
+                nextStep.state === "working"
+              }
+            >
+              {firstRunBusy || nextStep.state === "working"
+                ? "Paper 模拟运行中…"
+                : "运行一次安全模拟"}
+            </button>
+          ) : nextStep ? (
+            <Link
+              className="primary-button onboarding-primary-action"
+              href={nextStep.href}
+            >
+              {nextStep.actionLabel}
+            </Link>
+          ) : (
+            <Link className="primary-button onboarding-primary-action" href="/">
+              进入控制台
+            </Link>
+          )}
+          {nextStep && (
+            <p className="field-help">完成后回到这里，系统会自动给出下一步。</p>
           )}
           {firstRunMessage && <p className="field-help">{firstRunMessage}</p>}
         </div>
         <div className="progress-ring" style={{ "--progress": `${progress}%` } as React.CSSProperties}>
           <strong>{progress}%</strong>
-          <span>完成度</span>
+          <span>安全启动</span>
         </div>
       </section>
 
@@ -170,38 +197,49 @@ export default function SetupPage() {
         </div>
       )}
 
-      <section className="setup-steps" aria-label="启动步骤">
-        {steps.map((step, index) => (
-          <article className={`setup-step ${step.state}`} key={step.key}>
-            <div className="step-index" aria-hidden="true">
-              {step.state === "done" ? "✓" : index + 1}
-            </div>
-            <div className="step-copy">
-              <div className="step-title-row">
-                <h2>{step.title}</h2>
-                <span className={`pill setup-${step.state}`}>
-                  {STATE_LABELS[step.state]}
-                </span>
+      <details className="setup-checklist">
+        <summary>
+          <span>查看完整启动清单</span>
+          <strong>{completedCoreSteps} / {coreSteps.length} 个必需步骤</strong>
+        </summary>
+        <section className="setup-steps" aria-label="启动步骤">
+          {steps.map((step, index) => (
+            <article
+              className={`setup-step ${step.state} ${step.optional ? "optional" : ""}`}
+              key={step.key}
+            >
+              <div className="step-index" aria-hidden="true">
+                {step.state === "done" ? "✓" : index + 1}
               </div>
-              <p>{step.description}</p>
-            </div>
-            {step.state !== "done" && (
-              <Link className="secondary-button step-action" href={step.href}>
-                {step.actionLabel}
-              </Link>
-            )}
-          </article>
-        ))}
-      </section>
+              <div className="step-copy">
+                <div className="step-title-row">
+                  <h2>{step.title}</h2>
+                  <span className={`pill setup-${step.state}`}>
+                    {step.optional && step.state === "todo"
+                      ? "实盘时再做"
+                      : STATE_LABELS[step.state]}
+                  </span>
+                </div>
+                <p>{step.description}</p>
+              </div>
+              {step.state !== "done" && (
+                <Link className="secondary-button step-action" href={step.href}>
+                  {step.actionLabel}
+                </Link>
+              )}
+            </article>
+          ))}
+        </section>
+      </details>
 
-      <section className="panel mode-explainer">
-        <div className="section-heading">
+      <details className="panel mode-explainer">
+        <summary className="mode-explainer-summary">
           <div>
             <p className="eyebrow">MODE LADDER</p>
-            <h2>四种模式怎么选</h2>
+            <h2>以后想升级真钱？先了解四种模式</h2>
           </div>
-          <span className="read-only-chip">逐级升级</span>
-        </div>
+          <span className="read-only-chip">点击展开</span>
+        </summary>
         <div className="mode-ladder">
           <div><strong>Paper</strong><span>模拟成交，适合首次运行</span></div>
           <div><strong>Shadow</strong><span>跟随实时盘口，但不发送订单</span></div>
@@ -211,7 +249,7 @@ export default function SetupPage() {
         <p className="panel-note">
           自动化只能稳定执行规则，不能保证盈利。是否升级应看费用后净收益、最大回撤和样本外表现，而不是只看胜率。
         </p>
-      </section>
+      </details>
     </main>
   );
 }

@@ -1,6 +1,29 @@
 import { describe, expect, it } from "vitest";
 
-import { validateCustomAIBaseUrl } from "./ai-provider";
+import {
+  getAIProviderOption,
+  initialModelForProvider,
+  normalizeTenantAIProvider,
+  validateCustomAIBaseUrl,
+} from "./ai-provider";
+
+describe("AI provider presets", () => {
+  it("falls back from platform-only profiles to the beginner OpenRouter option", () => {
+    expect(normalizeTenantAIProvider("platform")).toBe("openrouter");
+    expect(getAIProviderOption("openrouter").suggestedModel).toBe(
+      "openrouter/auto",
+    );
+  });
+
+  it("replaces the server platform default only before a tenant credential exists", () => {
+    expect(
+      initialModelForProvider("openrouter", "gpt-5.6-terra", false),
+    ).toBe("openrouter/auto");
+    expect(
+      initialModelForProvider("openai", "tenant-custom-model", true),
+    ).toBe("tenant-custom-model");
+  });
+});
 
 describe("validateCustomAIBaseUrl", () => {
   it("normalizes an OpenAI-compatible HTTPS relay", () => {

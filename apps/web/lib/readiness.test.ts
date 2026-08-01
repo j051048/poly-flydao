@@ -31,7 +31,8 @@ describe("buildSetupSteps", () => {
       ["automation", "done"],
       ["wallet", "todo"],
     ]);
-    expect(setupProgress(steps)).toBe(83);
+    expect(steps.find((step) => step.key === "wallet")?.optional).toBe(true);
+    expect(setupProgress(steps)).toBe(100);
   });
 
   it("shows pending wallet verification and a running paper job as working", () => {

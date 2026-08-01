@@ -3,6 +3,91 @@ export interface AIBaseUrlValidation {
   error: string | null;
 }
 
+export type TenantAIProvider =
+  | "openrouter"
+  | "openai"
+  | "anthropic"
+  | "litellm"
+  | "custom";
+
+export interface AIProviderOption {
+  value: TenantAIProvider;
+  label: string;
+  description: string;
+  suggestedModel: string | null;
+  modelPlaceholder: string;
+  keyPortalUrl: string | null;
+}
+
+export const AI_PROVIDER_OPTIONS: readonly AIProviderOption[] = [
+  {
+    value: "openrouter",
+    label: "OpenRouter",
+    description: "一个 Key 自动选择合适模型，最适合第一次使用。",
+    suggestedModel: "openrouter/auto",
+    modelPlaceholder: "例如 openrouter/auto",
+    keyPortalUrl: "https://openrouter.ai/settings/keys",
+  },
+  {
+    value: "openai",
+    label: "OpenAI",
+    description: "直接使用 OpenAI 官方 API Key。",
+    suggestedModel: "gpt-5-mini",
+    modelPlaceholder: "例如 gpt-5-mini",
+    keyPortalUrl: "https://platform.openai.com/api-keys",
+  },
+  {
+    value: "anthropic",
+    label: "Anthropic",
+    description: "直接使用 Anthropic 官方 API Key。",
+    suggestedModel: "anthropic/claude-sonnet-5",
+    modelPlaceholder: "例如 anthropic/claude-sonnet-5",
+    keyPortalUrl: "https://console.anthropic.com/settings/keys",
+  },
+  {
+    value: "litellm",
+    label: "LiteLLM",
+    description: "使用部署方统一管理的 LiteLLM 网关。",
+    suggestedModel: null,
+    modelPlaceholder: "输入网关中已配置的模型 ID",
+    keyPortalUrl: null,
+  },
+  {
+    value: "custom",
+    label: "自定义中转站",
+    description: "连接任意公开 HTTPS、OpenAI 兼容的第三方中转站。",
+    suggestedModel: null,
+    modelPlaceholder: "输入中转站要求的模型 ID",
+    keyPortalUrl: null,
+  },
+] as const;
+
+export function isTenantAIProvider(value: unknown): value is TenantAIProvider {
+  return AI_PROVIDER_OPTIONS.some((option) => option.value === value);
+}
+
+export function normalizeTenantAIProvider(value: unknown): TenantAIProvider {
+  return isTenantAIProvider(value) ? value : "openrouter";
+}
+
+export function getAIProviderOption(provider: TenantAIProvider): AIProviderOption {
+  return (
+    AI_PROVIDER_OPTIONS.find((option) => option.value === provider) ??
+    AI_PROVIDER_OPTIONS[0]
+  );
+}
+
+export function initialModelForProvider(
+  provider: TenantAIProvider,
+  currentModel: string | undefined,
+  hasConfiguredCredential: boolean,
+): string {
+  const current = currentModel?.trim() ?? "";
+  const isPlatformDefault = current === "gpt-5.6-terra";
+  if (current && (hasConfiguredCredential || !isPlatformDefault)) return current;
+  return getAIProviderOption(provider).suggestedModel ?? current;
+}
+
 const blockedSuffixes = [
   ".internal",
   ".lan",

@@ -6,7 +6,15 @@ import {
   apiRequest,
   readableApiError,
 } from "../../lib/api";
-import { validateCustomAIBaseUrl } from "../../lib/ai-provider";
+import {
+  AI_PROVIDER_OPTIONS,
+  getAIProviderOption,
+  initialModelForProvider,
+  isTenantAIProvider,
+  normalizeTenantAIProvider,
+  type TenantAIProvider,
+  validateCustomAIBaseUrl,
+} from "../../lib/ai-provider";
 import { getSupabaseBrowserClient } from "../../lib/supabase/browser";
 
 type Notice = { tone: "success" | "error" | "info"; text: string };
@@ -172,9 +180,12 @@ export default function SettingsPage() {
   // immediately after every submission attempt.
   const [apiKey, setApiKey] = useState("");
   const [privateKey, setPrivateKey] = useState("");
-  const [provider, setProvider] = useState("openrouter");
+  const [provider, setProvider] = useState<TenantAIProvider>("openrouter");
   const [baseUrl, setBaseUrl] = useState("");
   const [model, setModel] = useState("");
+  const [aiCheckState, setAiCheckState] = useState<
+    "idle" | "checking" | "passed" | "failed"
+  >("idle");
   const [aiBudgetLimit, setAiBudgetLimit] = useState(100);
   const [showAdvancedImport, setShowAdvancedImport] = useState(false);
   const [importConfirmed, setImportConfirmed] = useState(false);
@@ -193,6 +204,9 @@ export default function SettingsPage() {
     provider === "custom"
       ? validateCustomAIBaseUrl(baseUrl)
       : { normalized: null, error: null };
+  const providerOption = getAIProviderOption(provider);
+  const usesAdvancedProvider = !["openrouter", "openai"].includes(provider);
+  const needsNewAiKey = !status?.aiConfigured || provider !== status.provider;
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -204,16 +218,30 @@ export default function SettingsPage() {
       ]);
       const me = record(meResult.data);
       const runtimeProfile = record(me.runtime_profile);
-      const configuredProvider =
-        stringValue(runtimeProfile.ai_provider) ?? "openrouter";
+      const runtimeProvider = stringValue(runtimeProfile.ai_provider);
+      const preferredProvider = isTenantAIProvider(runtimeProvider)
+        ? runtimeProvider
+        : undefined;
       const parsed = parseCredentialStatus(
         credentialsResult.data,
-        configuredProvider,
+        preferredProvider,
       );
-      parsed.provider =
-        stringValue(configuredProvider, parsed.provider) ?? "openrouter";
-      parsed.aiBaseUrl = stringValue(runtimeProfile.ai_base_url);
-      parsed.model = stringValue(runtimeProfile.forecast_model, parsed.model);
+      const configuredProvider = normalizeTenantAIProvider(
+        preferredProvider ?? parsed.provider,
+      );
+      parsed.provider = configuredProvider;
+      parsed.aiBaseUrl =
+        configuredProvider === "custom"
+          ? stringValue(runtimeProfile.ai_base_url)
+          : undefined;
+      const configuredModel = preferredProvider
+        ? stringValue(runtimeProfile.forecast_model, parsed.model)
+        : parsed.model;
+      parsed.model = initialModelForProvider(
+        configuredProvider,
+        configuredModel,
+        parsed.aiConfigured,
+      );
       parsed.aiCredentialId =
         stringValue(runtimeProfile.ai_credential_id, parsed.aiCredentialId);
       parsed.walletId = stringValue(
@@ -233,9 +261,9 @@ export default function SettingsPage() {
       parsed.aiUsageUsed = Number(performance.ai_usage_used) || 0;
       parsed.aiUsageLimit = Number(performance.ai_usage_limit) || 100;
       setStatus(parsed);
-      if (parsed.provider) setProvider(parsed.provider);
-      if (parsed.aiBaseUrl) setBaseUrl(parsed.aiBaseUrl);
-      if (parsed.model) setModel(parsed.model);
+      setProvider(configuredProvider);
+      setBaseUrl(parsed.aiBaseUrl ?? "");
+      setModel(parsed.model ?? "");
       setAiBudgetLimit(parsed.aiUsageLimit ?? 100);
       setDesiredMode(parsed.desiredMode);
       setAutoRunEnabled(parsed.autoRunEnabled);
@@ -283,29 +311,39 @@ export default function SettingsPage() {
     return () => window.clearInterval(timer);
   }, [refresh, status?.walletStatus]);
 
-  async function saveAiCredential(includeSecret: boolean) {
+  function chooseProvider(nextProvider: TenantAIProvider) {
+    if (nextProvider === provider) return;
+    const nextOption = getAIProviderOption(nextProvider);
+    const storedModel =
+      nextProvider === status?.provider ? status.model?.trim() : undefined;
+    setProvider(nextProvider);
+    setModel(storedModel || nextOption.suggestedModel || "");
+    setAiCheckState("idle");
+  }
+
+  async function saveAiCredential(includeSecret: boolean): Promise<boolean> {
     const trimmedKey = apiKey.trim();
-    if (includeSecret && !trimmedKey) return;
+    if (includeSecret && !trimmedKey) return false;
     if (provider === "custom" && !baseUrlValidation.normalized) {
       setNotice({
         tone: "error",
         text: baseUrlValidation.error ?? "请输入安全的 HTTPS Base URL。",
       });
-      return;
+      return false;
     }
     if (!includeSecret && provider !== status?.provider) {
       setNotice({
         tone: "error",
         text: "切换 AI 提供商时必须同时输入并加密保存该提供商的 API Key。",
       });
-      return;
+      return false;
     }
     if (includeSecret && mfaLevel !== "aal2") {
       setNotice({
         tone: "error",
         text: "保存或轮换 AI Key 前必须先完成 TOTP 双因素验证。",
       });
-      return;
+      return false;
     }
     setBusy("ai");
     setNotice({
@@ -361,8 +399,10 @@ export default function SettingsPage() {
           : "模型设置已保存到租户运行配置。",
       });
       await refresh();
+      return true;
     } catch (error) {
       setNotice({ tone: "error", text: readableApiError(error) });
+      return false;
     } finally {
       setApiKey("");
       setBusy(null);
@@ -592,9 +632,12 @@ export default function SettingsPage() {
     }
   }
 
-  async function testAiCredential() {
-    if (!status?.aiConfigured || mfaLevel !== "aal2") return;
+  async function testAiCredential(requireStoredStatus = true): Promise<boolean> {
+    if ((requireStoredStatus && !status?.aiConfigured) || mfaLevel !== "aal2") {
+      return false;
+    }
     setBusy("ai-check");
+    setAiCheckState("checking");
     setNotice({ tone: "info", text: "Worker 正在验证 Key、模型和结构化输出…" });
     try {
       const queued = await apiRequest<unknown>("/v1/me/credentials/ai/check", {
@@ -615,7 +658,8 @@ export default function SettingsPage() {
             tone: "success",
             text: `AI 连接正常，结构化输出验证通过，耗时 ${Number(result.latency_ms) || 0} ms。`,
           });
-          return;
+          setAiCheckState("passed");
+          return true;
         }
         if (jobStatus === "failed") {
           throw new Error(`AI 检查失败：${stringValue(job.error_code) ?? "unknown"}`);
@@ -623,9 +667,23 @@ export default function SettingsPage() {
       }
       throw new Error("AI 检查仍在排队，请确认私有 Worker 在线后重试。 ");
     } catch (error) {
+      setAiCheckState("failed");
       setNotice({ tone: "error", text: readableApiError(error) });
+      return false;
     } finally {
       setBusy(null);
+    }
+  }
+
+  async function saveAndTestAi() {
+    const includeSecret = Boolean(apiKey.trim());
+    if (needsNewAiKey && !includeSecret) return;
+    setAiCheckState("checking");
+    const saved = await saveAiCredential(includeSecret);
+    if (saved) {
+      await testAiCredential(false);
+    } else {
+      setAiCheckState("failed");
     }
   }
 
@@ -745,8 +803,8 @@ export default function SettingsPage() {
     <main className="page-shell">
       <header className="topbar">
         <div>
-          <p className="eyebrow">TENANT CREDENTIALS</p>
-          <h1>凭证与钱包</h1>
+          <p className="eyebrow">SAFE SETUP</p>
+          <h1>配置中心</h1>
         </div>
         <button
           className="secondary-button"
@@ -761,10 +819,10 @@ export default function SettingsPage() {
       <section className="safety-banner">
         <span className="shield" aria-hidden="true">◆</span>
         <div>
-          <strong>一次提交，日常请求不携带密钥</strong>
+          <strong>密钥只输入一次</strong>
           <p>
-            Key 仅在当前输入框内存中短暂存在，经 HTTPS 提交到租户密钥库后立即清空。
-            页面只显示状态、末尾掩码和公开钱包地址，永不回显原文。
+            Key 会经 HTTPS 加密保存，提交后输入框立即清空；以后运行机器人时，
+            浏览器不会重复发送密钥，也不会在页面回显原文。
           </p>
         </div>
       </section>
@@ -774,7 +832,7 @@ export default function SettingsPage() {
         <span>1. 双因素验证</span>
         <span>2. AI Key</span>
         <span>3. Paper 模拟</span>
-        <span>4. 专属钱包与 Canary</span>
+        <span>4. 专属钱包（小额实盘时再做）</span>
       </section>
 
       {notice && (
@@ -784,134 +842,297 @@ export default function SettingsPage() {
       )}
 
       <div className="settings-grid">
-        <section className="panel" id="ai">
+        <section className="panel ai-setup-panel" id="ai">
           <div className="section-heading">
             <div>
-              <p className="eyebrow">AI PROFILE</p>
-              <h2>第三方 AI 凭证</h2>
+              <p className="eyebrow">AI QUICK CONNECT</p>
+              <h2>连接你的 AI</h2>
             </div>
             <span className={`pill ${status?.aiConfigured ? "online" : "offline"}`}>
               {status?.aiConfigured ? "已配置" : "未配置"}
             </span>
           </div>
 
-          <dl className="detail-list credential-status">
-            <div><dt>提供商</dt><dd>{status?.provider ?? "—"}</dd></div>
-            {status?.provider === "custom" && (
-              <div><dt>Base URL</dt><dd>{status?.aiBaseUrl ?? "—"}</dd></div>
-            )}
-            <div><dt>模型</dt><dd>{status?.model ?? "—"}</dd></div>
-            <div><dt>Key</dt><dd>{status?.keyMask ?? "永不回显"}</dd></div>
-            <div><dt>状态</dt><dd>{status?.aiStatus ?? "—"}</dd></div>
-          </dl>
+          {status?.aiConfigured && (
+            <div className="ai-current-connection">
+              <span className="connection-dot" aria-hidden="true" />
+              <div>
+                <strong>
+                  当前：
+                  {getAIProviderOption(
+                    normalizeTenantAIProvider(status.provider),
+                  ).label}
+                </strong>
+                <span>{status.model ?? "模型待确认"} · {status.keyMask ?? "Key 已隐藏"}</span>
+              </div>
+            </div>
+          )}
 
-          <div className="form-stack credential-form">
-            <label className="form-field" htmlFor="provider">
-              <span className="field-label">AI 提供商</span>
-              <select
-                id="provider"
-                value={provider}
-                onChange={(event) => setProvider(event.target.value)}
-              >
-                <option value="openrouter">OpenRouter</option>
-                <option value="openai">OpenAI</option>
-                <option value="anthropic">Anthropic</option>
-                <option value="litellm">LiteLLM</option>
-                <option value="custom">自定义 OpenAI 兼容中转站</option>
-              </select>
-            </label>
-            {provider === "custom" && (
-              <label className="form-field" htmlFor="base-url">
-                <span className="field-label">Base URL</span>
-                <input
-                  id="base-url"
-                  type="url"
-                  value={baseUrl}
-                  onChange={(event) => setBaseUrl(event.target.value)}
-                  placeholder="例如 https://my-proxy.example.com/v1"
-                  autoComplete="off"
-                  required
-                  maxLength={256}
-                  aria-invalid={Boolean(baseUrlValidation.error)}
-                  aria-describedby="base-url-help"
-                />
-                <span
-                  className={`field-help ${baseUrlValidation.error ? "error" : ""}`}
-                  id="base-url-help"
-                >
-                  {baseUrlValidation.error ??
-                    "仅支持公开 HTTPS 域名；后端还会执行 DNS、私网地址与重定向防护。"}
-                </span>
-              </label>
-            )}
-            <label className="form-field" htmlFor="model">
-              <span className="field-label">模型 ID</span>
-              <input
-                id="model"
-                type="text"
-                value={model}
-                onChange={(event) => setModel(event.target.value)}
-                placeholder="例如 openai/gpt-5-mini"
-                autoComplete="off"
-              />
-            </label>
-            <label className="form-field" htmlFor="api-key">
-              <span className="field-label">
-                {status?.aiConfigured ? "轮换 API Key" : "API Key"}
-              </span>
-              <input
-                id="api-key"
-                type="password"
-                value={apiKey}
-                onChange={(event) => setApiKey(event.target.value)}
-                placeholder="只输入一次，提交后立即清空"
-                autoComplete="off"
-                autoCapitalize="off"
-                spellCheck={false}
-              />
-            </label>
-
-            <div className="button-row">
-              <button
-                className="primary-button"
-                type="button"
-                onClick={() => void saveAiCredential(true)}
-                disabled={
-                  !apiKey.trim() ||
-                  !model.trim() ||
-                  (provider === "custom" && !baseUrlValidation.normalized) ||
-                  mfaLevel !== "aal2" ||
-                  busy !== null
-                }
-              >
-                {busy === "ai"
-                  ? "保存中…"
-                  : status?.aiConfigured
-                    ? "加密轮换 Key"
-                    : "加密保存 Key"}
-              </button>
-              {status?.aiConfigured && (
-                <>
+          <div className="ai-quick-flow">
+            <section className="ai-flow-step" aria-labelledby="ai-step-provider">
+              <span className="ai-step-number">1</span>
+              <div className="ai-step-content">
+                <h3 id="ai-step-provider">选择你在哪里买的 Key</h3>
+                <p>不确定就选 OpenRouter，模型已经替你选好。</p>
+                <div className="provider-choice" role="radiogroup" aria-label="AI 提供商">
                   <button
-                    className="secondary-button"
                     type="button"
-                    onClick={() => void saveAiCredential(false)}
-                    disabled={
-                      !model.trim() ||
-                      provider !== status.provider ||
-                      (provider === "custom" && !baseUrlValidation.normalized) ||
-                      busy !== null
-                    }
+                    role="radio"
+                    aria-checked={provider === "openrouter"}
+                    className={provider === "openrouter" ? "selected" : ""}
+                    onClick={() => chooseProvider("openrouter")}
                   >
-                    保存模型设置
+                    <strong>OpenRouter</strong>
+                    <span className="recommended-tag">新手推荐</span>
+                    <small>一个 Key，自动选模型</small>
                   </button>
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={provider === "openai"}
+                    className={provider === "openai" ? "selected" : ""}
+                    onClick={() => chooseProvider("openai")}
+                  >
+                    <strong>OpenAI</strong>
+                    <small>使用 OpenAI 官方 Key</small>
+                  </button>
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={usesAdvancedProvider}
+                    className={usesAdvancedProvider ? "selected" : ""}
+                    onClick={() => chooseProvider("custom")}
+                  >
+                    <strong>其他 / 中转站</strong>
+                    <small>Anthropic、LiteLLM 或自定义地址</small>
+                  </button>
+                </div>
+
+                {usesAdvancedProvider && (
+                  <label className="form-field compact-field" htmlFor="provider">
+                    <span className="field-label">具体服务类型</span>
+                    <select
+                      id="provider"
+                      value={provider}
+                      onChange={(event) =>
+                        chooseProvider(event.target.value as TenantAIProvider)
+                      }
+                    >
+                      {AI_PROVIDER_OPTIONS.filter(
+                        (option) => !["openrouter", "openai"].includes(option.value),
+                      ).map((option) => (
+                        <option value={option.value} key={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                    <span className="field-help">{providerOption.description}</span>
+                  </label>
+                )}
+              </div>
+            </section>
+
+            <section className="ai-flow-step" aria-labelledby="ai-step-key">
+              <span className="ai-step-number">2</span>
+              <div className="ai-step-content">
+                <h3 id="ai-step-key">粘贴 API Key</h3>
+                <p>只提交一次；保存后输入框会立即清空，页面不会再次取回原文。</p>
+
+                {provider === "custom" && (
+                  <label className="form-field" htmlFor="base-url">
+                    <span className="field-label">中转站 Base URL</span>
+                    <input
+                      id="base-url"
+                      type="url"
+                      value={baseUrl}
+                      onChange={(event) => {
+                        setBaseUrl(event.target.value);
+                        setAiCheckState("idle");
+                      }}
+                      placeholder="例如 https://my-proxy.example.com/v1"
+                      autoComplete="off"
+                      required
+                      maxLength={256}
+                      aria-invalid={Boolean(baseUrl.trim() && baseUrlValidation.error)}
+                      aria-describedby="base-url-help"
+                    />
+                    <span
+                      className={`field-help ${baseUrl.trim() && baseUrlValidation.error ? "error" : ""}`}
+                      id="base-url-help"
+                    >
+                      {baseUrl.trim()
+                        ? baseUrlValidation.error ?? "HTTPS 地址格式正确，保存时后端还会做私网与重定向检查。"
+                        : "复制中转站文档中的 OpenAI 兼容地址，通常以 /v1 结尾。"}
+                    </span>
+                  </label>
+                )}
+
+                {!providerOption.suggestedModel && (
+                  <label className="form-field" htmlFor="model">
+                    <span className="field-label">模型 ID</span>
+                    <input
+                      id="model"
+                      type="text"
+                      value={model}
+                      onChange={(event) => {
+                        setModel(event.target.value);
+                        setAiCheckState("idle");
+                      }}
+                      placeholder={providerOption.modelPlaceholder}
+                      autoComplete="off"
+                    />
+                  </label>
+                )}
+
+                {providerOption.suggestedModel && (
+                  <div className="automatic-model">
+                    <span>已自动选择模型</span>
+                    <strong>{model || providerOption.suggestedModel}</strong>
+                  </div>
+                )}
+
+                <label className="form-field" htmlFor="api-key">
+                  <span className="field-label">
+                    {needsNewAiKey
+                      ? `${providerOption.label} API Key`
+                      : "API Key（已保存，不更换可留空）"}
+                  </span>
+                  <input
+                    id="api-key"
+                    type="password"
+                    value={apiKey}
+                    onChange={(event) => {
+                      setApiKey(event.target.value);
+                      setAiCheckState("idle");
+                    }}
+                    placeholder={needsNewAiKey ? "粘贴 Key" : "留空表示继续使用已保存的 Key"}
+                    autoComplete="new-password"
+                    autoCapitalize="off"
+                    spellCheck={false}
+                  />
+                </label>
+                {providerOption.keyPortalUrl && needsNewAiKey && (
+                  <a
+                    className="key-portal-link"
+                    href={providerOption.keyPortalUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    还没有 Key？打开 {providerOption.label} 官方页面 ↗
+                  </a>
+                )}
+              </div>
+            </section>
+
+            <section className="ai-flow-step" aria-labelledby="ai-step-check">
+              <span className="ai-step-number">3</span>
+              <div className="ai-step-content">
+                <h3 id="ai-step-check">保存并自动检测</h3>
+                <p>系统会验证 Key、模型响应和结构化输出，不会扫描市场或创建订单。</p>
+
+                {mfaLevel !== "aal2" && (
+                  <div className="ai-prerequisite">
+                    <div>
+                      <strong>还差一步安全验证</strong>
+                      <span>先绑定验证器，才能安全保存密钥。</span>
+                    </div>
+                    <a className="secondary-button" href="#mfa">去完成双因素验证</a>
+                  </div>
+                )}
+
+                <button
+                  className="primary-button full-width"
+                  type="button"
+                  onClick={() => void saveAndTestAi()}
+                  disabled={
+                    (needsNewAiKey && !apiKey.trim()) ||
+                    !model.trim() ||
+                    (provider === "custom" && !baseUrlValidation.normalized) ||
+                    mfaLevel !== "aal2" ||
+                    busy !== null
+                  }
+                >
+                  {busy === "ai"
+                    ? "正在加密保存…"
+                    : busy === "ai-check" || aiCheckState === "checking"
+                      ? "正在检测连接…"
+                      : status?.aiConfigured
+                        ? "保存并重新检测"
+                        : "保存并检测连接"}
+                </button>
+
+                {aiCheckState === "passed" && (
+                  <div className="ai-validation-summary" role="status">
+                    <strong>连接完成，可以开始 Paper 模拟</strong>
+                    <span>✓ 密钥已加密保存</span>
+                    <span>✓ 模型成功响应</span>
+                    <span>✓ 决策格式验证通过</span>
+                  </div>
+                )}
+              </div>
+            </section>
+          </div>
+
+          <details className="advanced-panel ai-advanced-settings">
+            <summary>高级设置：模型、调用额度与凭证管理</summary>
+            <div className="form-stack">
+              {providerOption.suggestedModel && (
+                <label className="form-field" htmlFor="model">
+                  <span className="field-label">自定义模型 ID</span>
+                  <input
+                    id="model"
+                    type="text"
+                    value={model}
+                    onChange={(event) => {
+                      setModel(event.target.value);
+                      setAiCheckState("idle");
+                    }}
+                    placeholder={providerOption.modelPlaceholder}
+                    autoComplete="off"
+                  />
+                  <span className="field-help">
+                    新手建议保留推荐值；模型不可用时，连接检测会明确报错。
+                  </span>
+                </label>
+              )}
+
+              <div className="budget-control">
+                <label className="form-field" htmlFor="ai-budget">
+                  <span className="field-label">每日 AI 请求上限</span>
+                  <select
+                    id="ai-budget"
+                    value={aiBudgetLimit}
+                    onChange={(event) => setAiBudgetLimit(Number(event.target.value))}
+                  >
+                    <option value={100}>100 · 新手推荐</option>
+                    <option value={500}>500 · Paper 观察</option>
+                    <option value={2000}>2,000 · 高频自动周期</option>
+                    <option value={5000}>5,000 · 高额度（谨慎）</option>
+                  </select>
+                </label>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => void saveAiBudget()}
+                  disabled={mfaLevel !== "aal2" || busy !== null}
+                >
+                  {busy === "ai-budget" ? "保存中…" : "保存调用上限"}
+                </button>
+                <p className="field-help">
+                  今日已预留 {status?.aiUsageUsed ?? 0} / {status?.aiUsageLimit ?? 100}
+                  请求单位；达到上限后自动停止新 AI 分析。
+                </p>
+              </div>
+
+              {status?.aiConfigured && (
+                <div className="button-row">
                   <button
                     className="secondary-button"
                     type="button"
                     onClick={() => void testAiCredential()}
                     disabled={mfaLevel !== "aal2" || busy !== null}
                   >
-                    {busy === "ai-check" ? "检查中…" : "测试 AI 连接"}
+                    {busy === "ai-check" ? "检查中…" : "仅重新检测"}
                   </button>
                   <button
                     className="danger-button"
@@ -921,40 +1142,10 @@ export default function SettingsPage() {
                   >
                     撤销凭证
                   </button>
-                </>
+                </div>
               )}
             </div>
-            <p className="field-help">
-              保存后请点击“测试 AI 连接”；诊断只验证模型输出，不扫描市场或创建订单。
-            </p>
-            <div className="budget-control">
-              <label className="form-field" htmlFor="ai-budget">
-                <span className="field-label">每日 AI 请求预算</span>
-                <select
-                  id="ai-budget"
-                  value={aiBudgetLimit}
-                  onChange={(event) => setAiBudgetLimit(Number(event.target.value))}
-                >
-                  <option value={100}>100 · 低成本试用</option>
-                  <option value={500}>500 · Paper 观察</option>
-                  <option value={2000}>2,000 · 高频自动周期</option>
-                  <option value={5000}>5,000 · 高额度（谨慎）</option>
-                </select>
-              </label>
-              <button
-                className="secondary-button"
-                type="button"
-                onClick={() => void saveAiBudget()}
-                disabled={mfaLevel !== "aal2" || busy !== null}
-              >
-                {busy === "ai-budget" ? "保存中…" : "保存 AI 预算"}
-              </button>
-              <p className="field-help">
-                今日已预留 {status?.aiUsageUsed ?? 0} / {status?.aiUsageLimit ?? 100}
-                请求单位；达到上限后自动停止新 AI 分析，不会绕过预算。
-              </p>
-            </div>
-          </div>
+          </details>
         </section>
 
         <section className="panel" id="mfa">
