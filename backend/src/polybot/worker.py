@@ -4,25 +4,38 @@ import asyncio
 import logging
 import os
 import socket
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import timedelta
+from typing import Any
 from uuid import uuid4
 
 from polybot.brokers.base import Broker
+from polybot.brokers.paper import PaperBroker
 from polybot.brokers.polymarket import PolymarketBroker
-from polybot.config import TradingMode, get_settings
+from polybot.config import Settings, TradingMode, get_settings
 from polybot.engine import LiveSafetyLatchError
+from polybot.models import utc_now
+from polybot.personal_execution import PersonalExecutionRepository
 from polybot.runtime import build_runtime
 from polybot.security_logging import configure_secure_logging, safe_json
 from polybot.stores.base import StateStore
+from polybot.stores.supabase_store import PersonalExecutionScope, SupabaseStore
 
 _WORKER_READY = False
+PersonalCleanupClientFactory = Callable[[str, str | None], Any]
 
 
 def _set_worker_ready(value: bool) -> None:
     global _WORKER_READY
     _WORKER_READY = value
+
+
+def is_worker_ready() -> bool:
+    """Return process-local readiness without exposing account or credential state."""
+
+    return _WORKER_READY
 
 
 @dataclass(frozen=True)
@@ -355,8 +368,318 @@ async def _shutdown_live_safely(
     )
 
 
-async def run_worker() -> None:
-    settings = get_settings()
+async def _wait_for_next_cycle(
+    *,
+    stop: asyncio.Event,
+    cycle_trigger: asyncio.Event | None,
+    timeout_seconds: float,
+) -> None:
+    if cycle_trigger is None:
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=timeout_seconds)
+        except TimeoutError:
+            pass
+        return
+
+    stop_task = asyncio.create_task(stop.wait())
+    trigger_task = asyncio.create_task(cycle_trigger.wait())
+    tasks = {stop_task, trigger_task}
+    try:
+        await asyncio.wait(tasks, timeout=timeout_seconds, return_when=asyncio.FIRST_COMPLETED)
+        if trigger_task.done() and cycle_trigger.is_set():
+            cycle_trigger.clear()
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        for task in tasks:
+            with suppress(asyncio.CancelledError):
+                await task
+
+
+async def _prepare_personal_live_cycle(
+    *,
+    settings: Settings,
+    broker: PolymarketBroker,
+    repository: PersonalExecutionRepository,
+    owner_id: str,
+    fencing_token: int,
+    logger: logging.Logger,
+) -> bool:
+    """Refresh the short-lived personal authority without persisting secrets."""
+
+    environment = broker.client.environment
+    binding = await repository.bind_wallet(
+        owner_id=owner_id,
+        fencing_token=fencing_token,
+        signer_address=str(broker.client.signer),
+        deposit_wallet_address=str(broker.client.wallet),
+        chain_id=int(environment.chain_id),
+        collateral_token=str(environment.collateral_token),
+    )
+    if binding is None:
+        logger.warning("personal wallet binding lost its active worker lease; retrying")
+        return False
+    if binding.paused:
+        logger.info("personal live execution is paused")
+        return False
+
+    now = utc_now()
+    control = await repository.get_runtime_control()
+    if control.cancellation_pending:
+        logger.info("personal live execution is waiting for cancellation acknowledgement")
+        return False
+    # An expired stored arm must first be expired and cancellation-acknowledged
+    # by the runtime-control watcher. Calling the arm RPC in this state is a CAS
+    # no-op, so treat it as a normal retry instead of a permanent failure.
+    if control.armed and not control.is_live_armed:
+        logger.info("expired personal runtime arm is being safely rolled over")
+        return False
+    renew_before = now + timedelta(minutes=5)
+    needs_arm = (
+        not control.is_live_armed
+        or control.mode is not settings.mode
+        or control.armed_until is None
+        or control.armed_until <= renew_before
+    )
+    if needs_arm:
+        control = await repository.arm(
+            owner_id=owner_id,
+            fencing_token=fencing_token,
+            mode=settings.mode,
+            armed_until=now + timedelta(minutes=10),
+            expected_version=control.version,
+        )
+        if control is None:
+            logger.info("personal runtime arm raced a control or lease update; retrying")
+            return False
+
+    collateral, allowances_ready = await broker.ensure_trading_approvals()
+    ready_binding = await repository.record_wallet_readiness(
+        owner_id=owner_id,
+        fencing_token=fencing_token,
+        binding_version=binding.binding_version,
+        collateral_balance_pusd=collateral,
+        allowances_ready=allowances_ready,
+    )
+    if ready_binding is None:
+        logger.warning("personal wallet readiness lost its active fence; retrying")
+        return False
+    return bool(
+        not ready_binding.paused
+        and ready_binding.allowances_ready
+        and ready_binding.collateral_balance_pusd is not None
+        and ready_binding.collateral_balance_pusd > 0
+    )
+
+
+def _personal_cleanup_client(private_key: str, wallet: str | None) -> Any:
+    from polymarket import SecureClient
+
+    return SecureClient.create(private_key=private_key, wallet=wallet)
+
+
+async def _clear_personal_live_downgrade(
+    *,
+    settings: Settings,
+    store: StateStore,
+    owner_id: str,
+    fencing_token: int,
+    logger: logging.Logger,
+    client_factory: PersonalCleanupClientFactory = _personal_cleanup_client,
+) -> bool:
+    """Fail closed before a former live deployment may run paper/shadow cycles."""
+
+    if settings.mode not in {TradingMode.PAPER, TradingMode.SHADOW}:
+        return True
+    try:
+        control = await store.get_runtime_control(settings.account_id)
+        unresolved = await store.has_unresolved_live_orders(settings.account_id)
+        historical_live = bool(
+            control.mode in {TradingMode.CANARY, TradingMode.LIVE}
+            or control.armed
+            or control.accept_new_intents
+            or not control.kill_switch
+            or control.cancellation_pending
+            or unresolved
+        )
+        lease_valid = await store.validate_worker_lease(
+            settings.account_id,
+            owner_id,
+            fencing_token,
+        )
+        if not lease_valid:
+            logger.warning("personal downgrade cleanup is waiting for the active worker lease")
+            return False
+        if not historical_live:
+            if control.mode is settings.mode:
+                return True
+            aligned = await store.disarm_runtime_control(
+                settings.account_id,
+                settings.mode,
+            )
+            return bool(
+                aligned.mode is settings.mode
+                and not aligned.armed
+                and aligned.kill_switch
+                and await store.validate_worker_lease(
+                    settings.account_id,
+                    owner_id,
+                    fencing_token,
+                )
+            )
+
+        historical_mode = (
+            control.mode
+            if control.mode in {TradingMode.CANARY, TradingMode.LIVE}
+            else TradingMode.LIVE
+        )
+        if (
+            control.cancellation_pending
+            and not control.armed
+            and not control.accept_new_intents
+            and control.kill_switch
+            and control.mode is historical_mode
+        ):
+            disarmed = control
+        else:
+            disarmed = await store.disarm_runtime_control(
+                settings.account_id,
+                historical_mode,
+            )
+
+        key = settings.polymarket_private_key
+        if key is None:
+            logger.critical(
+                "POLYMARKET_PRIVATE_KEY is required to clear the former live wallet "
+                "before paper/shadow execution"
+            )
+            return False
+
+        client: Any | None = None
+        try:
+            client = await asyncio.to_thread(
+                client_factory,
+                key.get_secret_value(),
+                settings.polymarket_deposit_wallet,
+            )
+            await asyncio.to_thread(client.cancel_all)
+            open_orders: list[Any] = []
+            for delay in (0.0, 0.2, 0.5):
+                if delay:
+                    await asyncio.sleep(delay)
+                open_orders = await asyncio.to_thread(
+                    lambda: list(client.list_open_orders().iter_items())
+                )
+                if not open_orders:
+                    break
+            if open_orders:
+                logger.critical(
+                    "personal downgrade cleanup could not verify zero exchange open orders"
+                )
+                return False
+        finally:
+            if client is not None:
+                close = getattr(client, "close", None)
+                if callable(close):
+                    with suppress(Exception):
+                        await asyncio.to_thread(close)
+
+        if not await store.validate_worker_lease(
+            settings.account_id,
+            owner_id,
+            fencing_token,
+        ):
+            logger.critical("personal downgrade cleanup lost its worker lease")
+            return False
+        if await store.has_unresolved_live_orders(settings.account_id):
+            logger.critical(
+                "personal downgrade cleanup is blocked by a signed, submitting, "
+                "or unknown durable order"
+            )
+            return False
+        acknowledged = await store.acknowledge_runtime_cancellation(
+            settings.account_id,
+            disarmed.version,
+        )
+        if acknowledged is None:
+            logger.warning("personal downgrade cancellation acknowledgement raced; retrying")
+            return False
+        if not await store.validate_worker_lease(
+            settings.account_id,
+            owner_id,
+            fencing_token,
+        ):
+            logger.critical("personal downgrade cleanup lost its lease before mode alignment")
+            return False
+        aligned = await store.disarm_runtime_control(
+            settings.account_id,
+            settings.mode,
+        )
+        if not await store.validate_worker_lease(
+            settings.account_id,
+            owner_id,
+            fencing_token,
+        ):
+            logger.critical("personal downgrade cleanup lost its lease after mode alignment")
+            return False
+        return bool(
+            aligned.mode is settings.mode
+            and not aligned.armed
+            and not aligned.accept_new_intents
+            and aligned.kill_switch
+            and not aligned.cancellation_pending
+        )
+    except Exception:
+        logger.critical(
+            "personal downgrade cleanup failed; paper/shadow execution remains blocked",
+            exc_info=True,
+        )
+        return False
+
+
+async def _load_personal_paper_broker(
+    *,
+    settings: Settings,
+    repository: PersonalExecutionRepository,
+    owner_id: str,
+    fencing_token: int,
+) -> PaperBroker:
+    state = await repository.load_paper_state(
+        owner_id=owner_id,
+        fencing_token=fencing_token,
+    )
+    return PaperBroker.from_state(
+        settings.bankroll_usd,
+        state.state if state is not None else None,
+    )
+
+
+async def _save_personal_paper_broker(
+    *,
+    repository: PersonalExecutionRepository,
+    broker: PaperBroker,
+    owner_id: str,
+    fencing_token: int,
+) -> bool:
+    saved = await repository.save_paper_state(
+        owner_id=owner_id,
+        fencing_token=fencing_token,
+        state=broker.export_state(),
+    )
+    return saved is not None
+
+
+async def run_worker(
+    *,
+    settings: Settings | None = None,
+    stop_event: asyncio.Event | None = None,
+    cycle_trigger: asyncio.Event | None = None,
+    cycle_observer: Callable[[dict[str, object]], None] | None = None,
+    install_signal_handlers: bool = True,
+) -> None:
+    settings = settings or get_settings()
+    _set_worker_ready(False)
     if settings.component == "api":
         raise RuntimeError("POLYBOT_COMPONENT=api cannot run the signer worker")
     configure_secure_logging(settings.log_level)
@@ -376,11 +699,20 @@ async def run_worker() -> None:
 
     runtime = build_runtime(settings)
     logger = logging.getLogger("polybot.worker")
+
+    def publish_cycle(snapshot: dict[str, object]) -> None:
+        if cycle_observer is None:
+            return
+        try:
+            cycle_observer(snapshot)
+        except Exception:
+            logger.exception("personal cycle status observer failed")
+
     if not await _wait_for_store_startup(runtime.store, logger):
         await runtime.close()
         raise RuntimeError(
             "state store startup preflight failed; verify the Supabase Auth user, "
-            "account UUID, migrations 0001-0006, URL, and service-role key"
+            "account UUID, migrations through 0016, URL, and service-role key"
         )
     if isinstance(runtime.broker, PolymarketBroker):
         logger.info(
@@ -390,16 +722,34 @@ async def run_worker() -> None:
             runtime.broker.client.wallet_type,
         )
     owner_id = f"{socket.gethostname()}-{os.getpid()}-{str(uuid4())[:8]}"
-    stop = asyncio.Event()
+    personal_execution: PersonalExecutionRepository | None = None
+    if settings.personal_mode and settings.uses_supabase:
+        if not isinstance(runtime.store, SupabaseStore):
+            await runtime.close()
+            raise RuntimeError("personal Supabase runtime requires SupabaseStore")
+        personal_execution = PersonalExecutionRepository(
+            runtime.store.client,
+            settings.account_id,
+        )
+        if not await personal_execution.schema_ready():
+            await runtime.close()
+            raise RuntimeError("personal runtime requires Supabase migration 0016")
+        if settings.mode in {TradingMode.CANARY, TradingMode.LIVE}:
+            runtime.store.bind_personal_execution_scope(
+                PersonalExecutionScope(owner_id=owner_id, mode=settings.mode)
+            )
+    stop = stop_event or asyncio.Event()
     lease_ok = asyncio.Event()
     runtime_control_ready = asyncio.Event()
     lease_token: int | None = None
+    paper_state_fencing_token: int | None = None
     loop = asyncio.get_running_loop()
-    for signal_name in ("SIGINT", "SIGTERM"):
-        with suppress(AttributeError, NotImplementedError):
-            import signal
+    if install_signal_handlers:
+        for signal_name in ("SIGINT", "SIGTERM"):
+            with suppress(AttributeError, NotImplementedError):
+                import signal
 
-            loop.add_signal_handler(getattr(signal, signal_name), stop.set)
+                loop.add_signal_handler(getattr(signal, signal_name), stop.set)
 
     lease_ttl = timedelta(seconds=min(300, max(30, settings.scan_interval_seconds * 2)))
     reconcile_task: asyncio.Task[None] | None = None
@@ -440,22 +790,113 @@ async def run_worker() -> None:
             logger.critical("cancel-all failed or could not be verified: %s", reason, exc_info=True)
             return False
 
+    async def pause_personal_live(reason: str) -> bool:
+        if personal_execution is None or settings.mode not in {
+            TradingMode.CANARY,
+            TradingMode.LIVE,
+        }:
+            return False
+        try:
+            saved = await personal_execution.set_paused(True)
+        except Exception:
+            logger.critical(
+                "failed to persist the personal live pause latch: %s",
+                reason,
+                exc_info=True,
+            )
+            stop.set()
+            return False
+        if saved is None:
+            logger.critical("personal live pause latch has no wallet binding: %s", reason)
+            stop.set()
+            return False
+        logger.critical("personal live execution paused: %s", reason)
+        return True
+
+    async def restore_personal_paper_state(token: int) -> bool:
+        nonlocal paper_state_fencing_token
+        if personal_execution is None or settings.mode is not TradingMode.PAPER:
+            return True
+        if paper_state_fencing_token == token:
+            return True
+        paper_broker = await _load_personal_paper_broker(
+            settings=settings,
+            repository=personal_execution,
+            owner_id=owner_id,
+            fencing_token=token,
+        )
+        runtime.broker = paper_broker
+        runtime.engine.broker = paper_broker
+        paper_state_fencing_token = token
+        logger.info("personal paper account state restored under worker fence %s", token)
+        return True
+
+    async def save_personal_paper_state(token: int) -> bool:
+        nonlocal paper_state_fencing_token
+        if personal_execution is None or settings.mode is not TradingMode.PAPER:
+            return True
+        if not isinstance(runtime.broker, PaperBroker):
+            raise RuntimeError("personal paper runtime has an incompatible broker")
+        saved = await _save_personal_paper_broker(
+            repository=personal_execution,
+            broker=runtime.broker,
+            owner_id=owner_id,
+            fencing_token=token,
+        )
+        if saved:
+            return True
+        # Never keep trading from a state that failed its fenced durable save.
+        # The next iteration must reload the last committed state.
+        paper_state_fencing_token = None
+        logger.critical("personal paper state save lost its worker fence; cycle halted")
+        return False
+
+    def refresh_worker_readiness() -> None:
+        reconciliation_ok = runtime.reconciler is None or runtime.reconciler.healthy.is_set()
+        _set_worker_ready(
+            not stop.is_set()
+            and lease_ok.is_set()
+            and runtime_control_ready.is_set()
+            and reconciliation_ok
+        )
+
     async def watch_runtime_control() -> None:
         state = RuntimeControlWatchState()
+        downgrade_mode = bool(
+            settings.personal_mode and settings.mode in {TradingMode.PAPER, TradingMode.SHADOW}
+        )
         while not stop.is_set():
             try:
-                await _enforce_runtime_control_once(
-                    store=runtime.store,
-                    broker=runtime.broker,
-                    account_id=settings.account_id,
-                    mode=settings.mode,
-                    state=state,
-                    logger=logger,
-                )
-                if state.cancellation_pending:
-                    runtime_control_ready.clear()
+                token = lease_token
+                if downgrade_mode:
+                    cleanup_ready = bool(
+                        lease_ok.is_set()
+                        and token is not None
+                        and await _clear_personal_live_downgrade(
+                            settings=settings,
+                            store=runtime.store,
+                            owner_id=owner_id,
+                            fencing_token=token,
+                            logger=logger,
+                        )
+                    )
+                    if cleanup_ready:
+                        runtime_control_ready.set()
+                    else:
+                        runtime_control_ready.clear()
                 else:
-                    runtime_control_ready.set()
+                    await _enforce_runtime_control_once(
+                        store=runtime.store,
+                        broker=runtime.broker,
+                        account_id=settings.account_id,
+                        mode=settings.mode,
+                        state=state,
+                        logger=logger,
+                    )
+                    if state.cancellation_pending:
+                        runtime_control_ready.clear()
+                    else:
+                        runtime_control_ready.set()
             except Exception:
                 runtime_control_ready.clear()
                 logger.exception("runtime-control watch failed")
@@ -463,6 +904,7 @@ async def run_worker() -> None:
                     state.cancellation_pending = not await cancel_all_or_alert(
                         "runtime-control watch failed"
                     )
+            refresh_worker_readiness()
             try:
                 await asyncio.wait_for(stop.wait(), timeout=2.0)
             except TimeoutError:
@@ -491,6 +933,7 @@ async def run_worker() -> None:
                 logger.exception("worker lease heartbeat failed")
                 if settings.mode in {TradingMode.CANARY, TradingMode.LIVE}:
                     await cancel_all_or_alert("worker lease heartbeat failed")
+            refresh_worker_readiness()
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
             except TimeoutError:
@@ -503,6 +946,7 @@ async def run_worker() -> None:
 
     try:
         while not stop.is_set():
+            refresh_worker_readiness()
             try:
                 if not lease_ok.is_set():
                     logger.warning("execution skipped until worker lease is healthy")
@@ -512,31 +956,129 @@ async def run_worker() -> None:
                     )
                 elif runtime.reconciler is not None and not runtime.reconciler.healthy.is_set():
                     logger.error("execution skipped until account reconciliation is healthy")
-                    await cancel_all_or_alert("account reconciliation unhealthy")
+                    if not await cancel_all_or_alert("account reconciliation unhealthy"):
+                        await pause_personal_live("account reconciliation cancel-all failed")
                 elif await runtime.store.has_unresolved_live_orders(settings.account_id):
                     logger.critical(
                         "execution blocked: an ambiguous signed/submitting order requires review"
                     )
                     await cancel_all_or_alert("ambiguous durable order state")
+                    await pause_personal_live("ambiguous durable order state")
                 elif not await runtime.store.health():
                     logger.error("state store unhealthy; execution skipped")
                     if settings.mode in {TradingMode.CANARY, TradingMode.LIVE}:
-                        await cancel_all_or_alert("state store unhealthy")
+                        if not await cancel_all_or_alert("state store unhealthy"):
+                            await pause_personal_live("state-store cancel-all failed")
                 else:
-                    report = await runtime.engine.run_cycle()
-                    logger.info(safe_json(report.model_dump(mode="json")))
-                    safety_latched = any(
-                        reason.startswith("live_stop_latched:") for reason in report.skipped
-                    )
-                    if safety_latched:
-                        logger.critical(
-                            "real-money safety stop is durably latched; "
-                            "manual review and a new arm are required"
-                        )
+                    current_fence = lease_token
+                    cycle_ready = current_fence is not None
+                    if cycle_ready and settings.mode is TradingMode.PAPER:
+                        cycle_ready = await restore_personal_paper_state(current_fence)
+                    if (
+                        cycle_ready
+                        and personal_execution is not None
+                        and settings.mode in {TradingMode.CANARY, TradingMode.LIVE}
+                    ):
+                        if not isinstance(runtime.broker, PolymarketBroker):
+                            raise RuntimeError(
+                                "personal real-money runtime requires PolymarketBroker"
+                            )
+                        try:
+                            cycle_ready = await _prepare_personal_live_cycle(
+                                settings=settings,
+                                broker=runtime.broker,
+                                repository=personal_execution,
+                                owner_id=owner_id,
+                                fencing_token=current_fence,
+                                logger=logger,
+                            )
+                        except Exception as exc:
+                            # No collateral, an approval transport failure, or a
+                            # short lease/control race is recoverable. Keep the
+                            # durable manual pause unchanged and retry later.
+                            logger.warning(
+                                "personal live readiness is not ready (%s); retrying",
+                                type(exc).__name__,
+                            )
+                            cycle_ready = False
+                    if not cycle_ready:
+                        logger.info("personal cycle prerequisites are not ready; execution skipped")
                     else:
-                        redeemed = await runtime.broker.redeem_resolved()
-                        if redeemed:
-                            logger.info("submitted %s resolved-position redemptions", redeemed)
+                        cycle_id = str(uuid4())
+                        started_at = utc_now()
+                        publish_cycle(
+                            {
+                                "id": cycle_id,
+                                "state": "running",
+                                "started_at": started_at.isoformat(),
+                                "completed_at": None,
+                                "message": "cycle is running",
+                                "result_summary": None,
+                            }
+                        )
+                        try:
+                            report = await runtime.engine.run_cycle()
+                            if (
+                                settings.mode is TradingMode.PAPER
+                                and not await save_personal_paper_state(current_fence)
+                            ):
+                                raise RuntimeError("personal paper state was not durably committed")
+                        except Exception as exc:
+                            if (
+                                settings.mode is TradingMode.PAPER
+                                and personal_execution is not None
+                            ):
+                                # The broker may have mutated cash/positions before
+                                # the cycle raised. Force the next attempt to discard
+                                # that uncommitted in-memory state and reload the last
+                                # fenced Supabase snapshot.
+                                paper_state_fencing_token = None
+                            publish_cycle(
+                                {
+                                    "id": cycle_id,
+                                    "state": "failed",
+                                    "started_at": started_at.isoformat(),
+                                    "completed_at": utc_now().isoformat(),
+                                    "message": f"cycle failed ({type(exc).__name__})",
+                                    "result_summary": None,
+                                }
+                            )
+                            raise
+                        publish_cycle(
+                            {
+                                "id": cycle_id,
+                                "state": "succeeded",
+                                "started_at": started_at.isoformat(),
+                                "completed_at": (report.completed_at or utc_now()).isoformat(),
+                                "message": "cycle completed",
+                                "result_summary": {
+                                    "run_id": report.run_id,
+                                    "markets_scanned": report.markets_scanned,
+                                    "forecasts_created": report.forecasts_created,
+                                    "candidates_created": report.candidates_created,
+                                    "intents_approved": report.intents_approved,
+                                    "executions": len(report.executions),
+                                    "skipped": report.skipped,
+                                },
+                            }
+                        )
+                        logger.info(safe_json(report.model_dump(mode="json")))
+                        safety_latched = any(
+                            reason.startswith("live_stop_latched:") for reason in report.skipped
+                        )
+                        if safety_latched:
+                            logger.critical(
+                                "real-money safety stop is durably latched; "
+                                "manual review and a resume are required"
+                            )
+                            await pause_personal_live("deterministic live safety latch")
+                        else:
+                            redeemed = await runtime.broker.redeem_resolved()
+                            if redeemed:
+                                logger.info(
+                                    "submitted %s resolved-position redemptions",
+                                    redeemed,
+                                )
             except LiveSafetyLatchError:
                 logger.critical(
                     "cycle could not complete the durable real-money safety stop; "
@@ -544,18 +1086,35 @@ async def run_worker() -> None:
                     exc_info=True,
                 )
                 if settings.mode in {TradingMode.CANARY, TradingMode.LIVE}:
+                    await pause_personal_live("incomplete deterministic live safety latch")
                     await cancel_all_or_alert("incomplete real-money safety latch")
                 stop.set()
             except Exception:
                 logger.exception("cycle failed")
                 if settings.mode in {TradingMode.CANARY, TradingMode.LIVE}:
-                    await cancel_all_or_alert("worker cycle failure")
+                    cancellation_verified = await cancel_all_or_alert("worker cycle failure")
+                    unresolved = True
+                    try:
+                        unresolved = await runtime.store.has_unresolved_live_orders(
+                            settings.account_id
+                        )
+                    except Exception:
+                        logger.critical(
+                            "failed to verify durable order state after cycle failure",
+                            exc_info=True,
+                        )
+                    if not cancellation_verified or unresolved:
+                        await pause_personal_live(
+                            "cycle failure left cancellation or order state ambiguous"
+                        )
 
-            try:
-                await asyncio.wait_for(stop.wait(), timeout=settings.scan_interval_seconds)
-            except TimeoutError:
-                pass
+            await _wait_for_next_cycle(
+                stop=stop,
+                cycle_trigger=cycle_trigger,
+                timeout_seconds=settings.scan_interval_seconds,
+            )
     finally:
+        _set_worker_ready(False)
         stop.set()
         # Freeze lease/control state before the bounded shutdown sequence. The lease
         # remains valid for at least 30 seconds, while shutdown retries are bounded to

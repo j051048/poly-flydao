@@ -241,6 +241,20 @@ class TenantExecutionFence:
             raise ValueError("tenant execution fence is only valid for live modes")
 
 
+@dataclass(frozen=True)
+class PersonalExecutionScope:
+    """Immutable owner/mode scope for the personal live submission gate."""
+
+    owner_id: str
+    mode: TradingMode
+
+    def __post_init__(self) -> None:
+        if len(self.owner_id.strip()) < 8:
+            raise ValueError("personal execution owner id is invalid")
+        if self.mode not in {TradingMode.CANARY, TradingMode.LIVE}:
+            raise ValueError("personal execution scope is only valid for live modes")
+
+
 def _rpc_boolean(value: Any, function_name: str) -> bool:
     """Decode PostgREST scalar booleans without treating ``[False]`` as true."""
 
@@ -277,6 +291,7 @@ class SupabaseStore:
         self._fill_ledger_cache: tuple[str, float, FillLedgerSnapshot] | None = None
         self._preflight_complete = False
         self._tenant_execution_fence: TenantExecutionFence | None = None
+        self._personal_execution_scope: PersonalExecutionScope | None = None
 
     @property
     def account_id(self) -> str:
@@ -291,15 +306,33 @@ class SupabaseStore:
     def bind_tenant_execution_fence(self, fence: TenantExecutionFence) -> None:
         """Bind this one-shot account store to exactly one live cycle job."""
 
-        if self._tenant_execution_fence is not None:
+        if self._tenant_execution_fence is not None or self._personal_execution_scope is not None:
             raise RuntimeError("tenant execution fence is already bound")
         self._tenant_execution_fence = fence
+
+    def bind_personal_execution_scope(self, scope: PersonalExecutionScope) -> None:
+        """Route every live submission through migration 0016's personal gate."""
+
+        if self._tenant_execution_fence is not None or self._personal_execution_scope is not None:
+            raise RuntimeError("execution scope is already bound")
+        self._personal_execution_scope = scope
 
     async def _execute(self, builder: Any) -> Any:
         return await asyncio.to_thread(builder.execute)
 
     async def health(self) -> bool:
         try:
+            version_response = await self._execute(self.client.rpc("polybot_schema_version", {}))
+            version_data = getattr(version_response, "data", None)
+            if isinstance(version_data, list):
+                version_data = version_data[0] if version_data else None
+            if isinstance(version_data, dict):
+                version_data = version_data.get(
+                    "polybot_schema_version",
+                    version_data.get("version"),
+                )
+            if version_data != 16:
+                return False
             await self._execute(
                 self.client.table("runtime_controls")
                 .select("account_id")
@@ -661,6 +694,29 @@ class SupabaseStore:
         control_version: int | None = None,
     ) -> None:
         self._require_account(account_id)
+        personal_scope = self._personal_execution_scope
+        if personal_scope is not None:
+            if control_version is None:
+                raise RuntimeError("personal submission requires a runtime-control version")
+            response = await self._execute(
+                self.client.rpc(
+                    "mark_personal_order_submitting",
+                    {
+                        "p_account_id": account_id,
+                        "p_intent_hash": intent_hash,
+                        "p_owner_id": personal_scope.owner_id,
+                        "p_worker_fencing_token": fencing_token,
+                        "p_control_version": control_version,
+                        "p_mode": personal_scope.mode.value,
+                    },
+                )
+            )
+            if not _rpc_boolean(response.data, "mark_personal_order_submitting"):
+                raise RuntimeError(
+                    "personal wallet, runtime control, readiness, or worker lease "
+                    "changed before submission"
+                )
+            return
         fence = self._tenant_execution_fence
         if fence is not None:
             if control_version is None:

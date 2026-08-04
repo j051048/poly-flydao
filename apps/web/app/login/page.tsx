@@ -54,7 +54,7 @@ function LoginForm() {
         <div className="brand-mark" aria-hidden="true">PM</div>
         <p className="eyebrow">SECURE SESSION</p>
         <h1>登录控制台</h1>
-        <p>登录会话决定后端租户身份，不再使用共享管理员令牌。</p>
+        <p>登录会话只允许你本人操作个人机器人，不使用共享管理员令牌。</p>
       </div>
 
       <form className="form-stack" onSubmit={handleSubmit}>
@@ -103,7 +103,7 @@ function LoginForm() {
       </form>
 
       <p className="auth-switch">
-        还没有账户？<Link href="/register">立即注册</Link>
+        个人版不开放网页注册。Owner 账户请在 Supabase Dashboard 中创建。
       </p>
     </section>
   );

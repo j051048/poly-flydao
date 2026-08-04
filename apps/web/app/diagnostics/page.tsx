@@ -36,17 +36,17 @@ function deploymentMessage(payload: DeploymentCheckPayload): string | undefined 
   if (!payload.cors.ok) {
     const missing: string[] = [];
     if (!payload.cors.allowsOrigin) missing.push("当前 Vercel 域名");
-    if (!payload.cors.allowsPut) missing.push("PUT 方法");
+    if (!payload.cors.allowsPost) missing.push("POST 方法");
     if (!payload.cors.allowsAuthorization) missing.push("Authorization 请求头");
     if (!payload.cors.allowsContentType) missing.push("Content-Type 请求头");
     if (!payload.cors.allowsIdempotencyKey) missing.push("Idempotency-Key 请求头");
-    return `Zeabur 在线，但 CORS 未放行：${missing.join("、")}。请在 Zeabur API 服务设置 POLYBOT_DASHBOARD_ORIGINS=${payload.dashboardOrigin}，确认部署最新 main 分支后重新部署。`;
+    return `Zeabur 在线，但 CORS 未放行：${missing.join("、")}。请在 Zeabur 个人服务设置 POLYBOT_DASHBOARD_ORIGINS=${payload.dashboardOrigin} 后重新部署。`;
   }
   if (!payload.database.ok) {
     return `Zeabur API 在线，但 /health 返回 HTTP ${payload.database.status ?? "未知"}。请检查 Supabase URL、service role 与迁移。`;
   }
   if (!payload.worker.ok) {
-    return `API 与 Supabase 已连接，但 Worker 心跳未就绪（HTTP ${payload.worker.status ?? "不可达"}）。请检查 Zeabur Worker 日志和环境变量。`;
+    return `API 与 Supabase 已连接，但内嵌 Worker 尚未就绪（HTTP ${payload.worker.status ?? "不可达"}）。请检查同一个 Zeabur 个人服务的启动日志和环境变量。`;
   }
   return undefined;
 }
@@ -137,9 +137,9 @@ export default function DiagnosticsPage() {
           </article>
           <article>
             <div>
-              <strong>浏览器 → Zeabur 写请求</strong>
+              <strong>浏览器 → Zeabur 运行指令</strong>
               <p>
-                自动验证当前 Vercel 域名，以及 <code>PUT</code>、认证和幂等请求头是否被 CORS 放行。
+                自动验证当前 Vercel 域名，以及 <code>POST</code>、认证和幂等请求头是否被 CORS 放行。
               </p>
             </div>
             <CheckBadge state={remote.cors} />
@@ -153,9 +153,9 @@ export default function DiagnosticsPage() {
           </article>
           <article>
             <div>
-              <strong>Zeabur 私有 Worker</strong>
+              <strong>Zeabur 个人 Worker</strong>
               <p>
-                API 通过数据库心跳确认 Worker 已完成迁移预检且持续消费队列；Worker 本身仍不绑定公网域名。
+                同一个个人服务会同时启动 API 与常驻 Worker；这里验证 Worker 已完成预检并可以持续运行。
               </p>
             </div>
             <CheckBadge state={remote.worker} />
@@ -170,7 +170,7 @@ export default function DiagnosticsPage() {
           <strong>{allReady ? "公开连接已经就绪" : "还有配置没有完成"}</strong>
           <p>
             {allReady
-              ? "现在可以登录，再用新手向导检查 MFA、AI、钱包和 Worker。"
+              ? "现在可以登录，再用四步向导确认环境变量、Paper 模拟与自动运行。"
               : "请在对应平台补齐变量，并确保 Vercel Preview 与 Production 使用了正确作用域。"}
           </p>
         </div>

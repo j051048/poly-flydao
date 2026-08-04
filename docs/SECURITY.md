@@ -1,100 +1,91 @@
-# 安全模型
+# 安全模型：个人单账户部署
 
-## 目标与非目标
+## 目标与明确取舍
 
-系统目标是限制单个租户、单个任务或单个组件失陷后的影响，并在授权、数据或对账不确定时停止新订单。它不能消除私钥托管风险、第三方依赖风险、交易所风险、智能合约风险、模型错误、网络中断或市场亏损。
+个人模式优先降低部署和使用门槛：AI Key 与 EVM 私钥直接由 Zeabur Secret 环境变量注入，同一个 `personal` 进程同时运行 API 和 Worker。这样不再需要浏览器录入秘密、TOTP、RSA credential envelope、fingerprint key 或第二个私有 Worker 服务。
 
-## 秘密分层
+代价也必须说清楚：Zeabur personal service 同时持有 Supabase service-role key、AI Key 和钱包私钥。若该容器、Zeabur 账户或部署供应链被攻破，攻击者可能取得全部权限。这是个人自托管接受的单一信任边界，不具备原两服务多租户架构的最小爆炸半径。
+
+系统不能消除私钥托管、第三方依赖、智能合约、模型错误、网络中断、Polymarket/CLOB 故障、地理合规或市场亏损风险。
+
+## 秘密放置
 
 | 位置 | 允许 | 禁止 |
 |---|---|---|
-| Vercel | API origin、Supabase URL、publishable/anon key、用户短期会话 | service role、AI key、钱包私钥、RSA 私钥、payload key |
-| Control API | Supabase service role、RSA 公钥、指纹 HMAC key | RSA 私钥、钱包私钥、AI key、签名 payload key |
-| Tenant Worker | Supabase service role、RSA 私钥或轮换 keyring、签名 payload key | 公开域名、浏览器会话 |
-| Supabase | 账户绑定密文、任务/风险快照、订单/成交账本 | 凭证明文、Worker 私钥 |
+| Vercel | Zeabur API origin、Supabase URL、publishable/anon key、短期用户会话 | service role、AI Key、EVM 私钥、助记词、CLOB credential、admin token |
+| Zeabur personal | Supabase service role、AI Key、专用 EVM 私钥、允许的 AI hostname | 主钱包/助记词、任何 `NEXT_PUBLIC_*`、共享密码 |
+| Supabase | 公开钱包地址、配置绑定、租约、风险/订单/成交/审计状态 | AI Key 明文、EVM 私钥明文 |
+| Git/日志/聊天/截图 | 脱敏示例与公开地址 | 任何真实秘密 |
 
-API 接收秘密时：
+Zeabur 环境变量应标记为私有，限制项目成员，并开启平台账户 MFA。任何曾出现在截图、聊天、构建日志或 Git 历史中的 key 都应立即轮换。
 
-1. JWT `sub` 决定账户，不接受客户端传 account ID。
-2. 请求需要 HTTPS；敏感操作需要 TOTP AAL2。
-3. API 使用随机 AES-256-GCM 数据密钥加密明文，再用 3072-bit RSA-OAEP-256 包装数据密钥。
-4. AAD 包含账户、秘密类型、provider、版本和随机版本号，阻止跨租户/跨用途替换。
-5. 数据库保存 HMAC 指纹用于同账户冲突检测，不向浏览器暴露指纹或完整尾号。
-6. 验证错误、日志与 API 响应不反射输入。
+个人模式可从高熵 EVM 私钥派生内部 signed-payload 加密材料，因此无需额外配置 `POLYBOT_SIGNED_PAYLOAD_KEY`。更换钱包会改变派生材料；轮换前必须切回 Paper、停止服务、确认没有开放或 unresolved 订单，再重新部署。不要在存在待对账订单时直接替换私钥。
 
-Python 字符串无法保证内存安全擦除；代码会尽力清零可变 bytearray，但生产上仍应使用短生命周期进程、最小权限和平台 secret 管理。
+## Owner 登录
+
+- 后端只接受 Supabase 支持的非对称 JWT，并校验签名、issuer、audience、有效期和 UUID subject；
+- 个人模式进一步要求 JWT `sub` 精确等于 `POLYBOT_ACCOUNT_ID`；
+- Supabase 应关闭公开注册，只保留唯一 owner；
+- Vercel middleware 恢复/刷新会话，未登录用户不能进入受保护控制台；
+- 浏览器配置拒绝 service-role/secret key 和生产 loopback URL。
+
+不要求“保存秘密”的 AAL2，是因为浏览器没有保存秘密的接口，不代表应取消 Supabase 登录或把 API 公开成共享 admin token。
 
 ## 自定义 AI 出站请求
 
-租户可以配置 OpenAI 兼容 HTTPS 中转站，但不能把 Worker 当作任意 URL 请求器：
+OpenAI 兼容中转站能够读取发给模型的市场证据和 AI Key。只使用可信、专用、低额度 Key；个人模式会从 `POLYBOT_AI_BASE_URL` 自动提取并锁定唯一允许的 hostname。
 
-- Runtime Profile 只保存规范化 HTTPS Base URL，数据库约束拒绝 HTTP；
-- Control API 保存时解析 DNS，Worker 在解密租户 AI Key 前重新解析；
-- 自定义 Provider 的 HTTP transport 在每次携带 Key 的请求前再次验证全部 A/AAAA 地址；
-- 私网、loopback、link-local、CGNAT、保留、组播、未指定地址和本地域名全部拒绝；
-- 禁止 URL credentials/query/fragment、环境代理和 HTTP redirect；
-- 可通过 `POLYBOT_CUSTOM_AI_ALLOWED_HOSTS` 将域名进一步限制为管理员批准列表；
-- 自定义 Provider 持有 Key 的 SDK client 会随单次租户 Runtime 关闭，不复用到其他租户。
+应用继续执行以下限制：
 
-DNS 验证与实际 TCP 建连之间仍存在很小的解析竞态。生产必须同时使用云平台 egress policy/firewall 阻止 RFC1918、loopback、link-local 与 metadata 网段，不能把应用层检查描述为对 DNS rebinding 的绝对证明。
+- 仅允许公开 HTTPS Base URL；
+- 拒绝 URL credentials、query/fragment、HTTP redirect 和环境代理；
+- 拒绝 localhost、RFC1918、link-local、CGNAT、保留、组播、云 metadata 等地址；
+- 在配置和携带 Key 发请求前重新解析 DNS；
+- 限制超时、响应大小，并对模型输出做结构化校验。
 
-## 身份与会话
+DNS 检查与实际 TCP 建连之间仍存在解析竞态。高价值部署还应使用云 egress firewall 阻止私网、loopback、link-local 和 metadata 网段。
 
-- 后端只接受 Supabase 非对称 RS256/ES256 JWT，并验证签名、issuer、audience、exp、nbf/iat、UUID subject、role 和 AAL。
-- JWKS 仅允许 HTTPS 或精确 loopback 开发地址，限制响应大小/密钥数量，并对未知 `kid` 做并发合并和负缓存。
-- 浏览器配置会拒绝 `sb_secret_*`、可解码为 `service_role`/`supabase_admin` 的 JWT，以及生产 loopback URL。
-- Next.js middleware 在重定向时保留刷新后的 Supabase cookie；受保护页面在 Auth 未配置或不可用时 fail closed。
-- URL 回跳只允许规范化后的站内绝对路径，拒绝 `//`、反斜线和编码斜线。
+## 真实资金授权
 
-## 多租户数据库边界
+默认配置是：
 
-Supabase service role 会绕过 RLS，因此仅靠 policy 不够。系统同时使用：
+```dotenv
+POLYBOT_MODE=paper
+POLYBOT_PERSONAL_LIVE_ENABLED=false
+```
 
-- API repository 的每个写操作显式携带 JWT-derived account ID；
-- Worker 的 `SupabaseStore` 和 `SupabasePairExecutionStore` 创建后永久绑定一个 account ID；
-- 账户复合外键，防止配置引用别人的凭证、钱包或风险策略；
-- FORCE RLS 与受限表权限；
-- `SECURITY DEFINER SET search_path=''` RPC；
-- 默认撤销 `public/anon/authenticated` EXECUTE，只授予 service role；
-- audit 与 pair inventory event append-only。
+Canary/Live 必须同时显式设置 `POLYBOT_PERSONAL_LIVE_ENABLED=true` 和对应模式，并重新部署。这个环境变量是部署级 owner 授权；AI 和浏览器不能修改它。
 
-## 任务和订单 fencing
+即使开启，提交前仍保留：
 
-真实订单需通过两层租约：
+- 单副本 Worker lease 与 fencing token；
+- runtime control/config binding 版本与取消状态；
+- 钱包地址、余额和 allowance 新鲜度；
+- unresolved order 与对账健康检查；
+- 单笔、事件、桶、总敞口、日亏损和最大回撤限制；
+- 官方 geoblock 与盘口新鲜度；
+- 签名订单的幂等状态转换。
 
-- cycle job：`claimed_by + fencing_token + lease_expires_at`
-- account worker：`owner_id + fencing_token + expires_at`
+真实模式只使用专用、低余额钱包。不要配置主钱包私钥或助记词。启动资金应是可以完全损失的小额资金；先用 Canary 旁观首单与撤单流程。
 
-订单签名后先加密持久化。进入 `submitting` 的同一 SQL 事务再次检查：
+## 单进程与可用性
 
-- 两层租约仍有效；
-- job 为 running，任务风险版本未变化；
-- runtime control 的版本、模式、arm、到期、kill/cancellation 状态；
-- runtime profile 版本及 AI/钱包/风险引用；
-- 风险快照仍 active；
-- 钱包、AI credential、signer credential 仍 active；
-- 订单仍是该账户、该模式、该 fencing token 的 signed 状态。
+`SERVICE_ROLE=personal` 必须使用一个 Zeabur 副本和 `WEB_CONCURRENCY=1`。数据库租约仍是最终闸门，但随意扩容会增加签名、轮询和恢复路径复杂度。滚动部署、数据库不可用、租约丢失、对账失败、模式/配置变化或 geoblock 拒绝时，应停止新订单并尽力撤单。
 
-数据库事务不能与外部 CLOB POST 做分布式原子提交，因此 SQL 后仍有不可消除的极短网络竞态。Broker 会在 POST 前再次同步检查，使用 GTD 到期、模糊结果不盲重发、cancel-all、持久 unresolved 状态和对账来降低影响；这不是“绝对不会出现孤儿订单”的保证。
+外部 CLOB POST 与数据库事务无法形成真正的分布式原子提交。模糊网络结果必须记录为 unresolved 并对账，不能盲目重发；系统不能承诺绝对不会出现孤儿订单。
 
-## 钱包生命周期
+## 运行响应清单
 
-- 只允许导入全新低余额专用钱包，服务端生成钱包默认关闭。
-- 导入请求明确确认标准 allowance 权限；Worker 先派生公开地址，不在未入金时耗尽重试。
-- 资金到位、任务租约和短时 arm 有效时才初始化并复核 allowance。
-- 撤销先停止新任务、cancel-all，并从交易所复核开放订单为零；无法验证时保持 `revocation_pending`。
-- 钱包私钥永不回显。前端输入仅在 React 内存短暂存在，提交后清空，并使用 `autocomplete=off` 尽量避免密码管理器保存，但浏览器扩展仍可能读取页面内容。
+发生异常时：
 
-## 运行响应
+1. 在 Zeabur 设置 `POLYBOT_PERSONAL_LIVE_ENABLED=false`、`POLYBOT_MODE=paper` 并重新部署；
+2. 从 Polymarket 官方界面确认并撤销开放订单；
+3. 检查 Supabase unresolved orders、持仓、成交和 runtime control；
+4. 轮换可能泄漏的 AI Key、service-role key 和钱包；
+5. 保存 request ID 与脱敏日志，复盘后再恢复 Canary。
 
-以下情况停止新订单并尽力撤单：
+仍需为真实资金配置外部存活监控、异常告警、数据库备份/恢复、密钥轮换和撤单演练。
 
-- disarm、arm 到期或 control version 变化；
-- job/account lease 丢失；
-- profile、risk、wallet 或 credential 变化；
-- Supabase、余额、allowance、盘口或对账不可用；
-- 日亏损/回撤硬阈值；
-- 地理限制拒绝；
-- CLOB 响应模糊、成交账本不完整或存在 unresolved order。
+## 高级/旧多租户安全边界
 
-所有真实资金部署仍需要外部监控、异常告警、数据库备份、密钥轮换、撤单演练和人工 runbook。
+对外 SaaS 应恢复公开 Control API 与私有 Tenant Worker 分离、RSA-OAEP + AES-GCM 账户凭证加密、fingerprint HMAC、tenant queue 和 AAL2 敏感操作。个人模式的简化不应直接复制到多人托管产品。

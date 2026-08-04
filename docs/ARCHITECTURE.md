@@ -1,79 +1,103 @@
-# 架构与 P0–P2 状态
+# 架构：个人单账户模式
 
-## 组件边界
+## 推荐拓扑
 
 ```mermaid
 flowchart TB
-  V["Vercel Web<br/>Supabase Auth + TOTP"] -->|"JWT"| A["Control API"]
-  V -->|"一次性 AI/EVM secret"| A
-  A -->|"RSA 公钥加密<br/>只写任务/配置"| S["Supabase"]
-  W["Tenant Worker<br/>RSA 私钥"] -->|"领取 fenced job"| S
-  W -->|"瞬时租户运行时"| M["市场 + AI + 风控"]
-  M -->|"最终原子闸门"| S
-  M -->|"post-only/GTD/撤单/对账"| P["Polymarket"]
+  V["Vercel Web<br/>Owner 控制台"] -->|"登录 / 会话"| A["Supabase Auth"]
+  V -->|"Supabase Bearer JWT"| Z["Zeabur Personal Service"]
+  subgraph Z["Zeabur：一个服务、一个进程"]
+    API["FastAPI 控制面"]
+    W["Single-account Worker"]
+    API -->|"lifespan 触发 / 状态"| W
+  end
+  API -->|"owner 校验 / 状态"| S["Supabase 数据库"]
+  W -->|"账本 / 租约 / 风控 / 对账"| S
+  W -->|"结构化预测请求"| AI["AI Provider"]
+  W -->|"限价执行"| P["Polymarket"]
 ```
 
-- Vercel 只持有公开 URL、Supabase publishable key 和短期用户会话。
-- Control API 验证 Supabase RS256/ES256 JWT，以 `sub` 作为唯一账户范围。它不能解密凭证或签名订单。
-- Tenant Worker 持有 RSA 私钥与签名 payload key。每个任务创建一个账户绑定 Store 和瞬时 Runtime。
-- Supabase service role 绕过 RLS，因此所有后端 Store 都再次做不可变账户绑定；跨账户参数在查询前被拒绝。
+`SERVICE_ROLE=personal` 将 API 和一个单账户 Worker 放入同一 Uvicorn 进程，适合个人自托管。`WEB_CONCURRENCY=1` 与单副本是这一部署形态的组成部分，不应为追求吞吐量擅自增加。
 
-## P0：控制面和秘密边界
+## 配置来源
 
-已实现：
+个人模式以 Zeabur 环境变量作为运行配置的唯一秘密来源：
 
-- Supabase 注册、登录、回调、退出、会话恢复和受保护路由。
-- 缺少 Supabase 配置时惰性创建客户端，Vercel 预渲染不再因空 URL 失败。
-- 公开 `/diagnostics` 仅返回三端连通性布尔状态；登录后的 `/setup` 给出下一步，
-  `/analysis` 展示账户隔离的概率、反方证据、失效条件与来源。
-- 生产漏配 API/Auth 不回退 localhost。
-- TOTP MFA；敏感凭证、钱包和真实资金控制要求 AAL2。
-- AI key 与 EVM key 一次性提交；API 用 RSA-OAEP-256 + AES-256-GCM 账户绑定加密。
-- API/Worker 密钥分离、日志脱敏、验证错误不反射输入。
-- 旧 `X-*` secret headers 被拒绝，旧 localStorage secret 整体清除。
+- AI：`POLYBOT_AI_API_KEY`、`POLYBOT_AI_BASE_URL`、`POLYBOT_AI_MODEL`；
+- 钱包：`POLYMARKET_PRIVATE_KEY`，可选 `POLYMARKET_DEPOSIT_WALLET`；
+- owner：`POLYBOT_ACCOUNT_ID`；
+- 模式：`POLYBOT_MODE`、`POLYBOT_PERSONAL_LIVE_ENABLED`；
+- 风险与资金：`POLYBOT_BANKROLL_USD`、单笔/敞口/亏损/回撤参数。
 
-## P1：多租户自动执行
+前端只读取脱敏状态，例如 provider、model、钱包地址和“已配置/未配置”；不会返回 Key 或私钥。删除/轮换秘密必须在 Zeabur 完成并重新部署。
 
-已实现：
+## 身份和账户范围
 
-- 账户运行配置、不可变风险快照、自动周期和幂等任务队列。
-- `FOR UPDATE SKIP LOCKED` 任务领取、heartbeat、租约回收、每账户并发限制。
-- Worker 每次从任务快照加载 AI、钱包、模型、模式和风险限制。
-- 钱包导入采用异步生命周期：派生地址、展示入金信息、资金到位后授权、撤销前 cancel-all + 零挂单验证。
-- API 只排队，不同步运行交易，也不构建 signer。
-- 真实下单使用账户 Worker lease、任务 lease、短时 arm、控制 watcher、对账健康和订单幂等。
-- 最后一个数据库事务同时验证任务、账户租约、控制版本、运行配置、风险版本、钱包和两类凭证，再允许 `signed → submitting`。
-- disarm、租约丢失、对账失败或周期边界触发撤单和 fail-closed。
+Supabase Auth 仍是控制台门锁，但产品不再开放多租户注册。FastAPI 验证 JWT 后，只接受 `sub == POLYBOT_ACCOUNT_ID` 的 owner 会话。浏览器不能通过请求参数切换账户。
 
-## P2：微结构配对研究
+因为秘密从不经过前端，个人模式不要求 TOTP/AAL2 来“保存 Key”，也不需要 RSA-OAEP credential envelope、credential fingerprint 或独立 worker keyring。这是易用性改造，不代表取消登录或公开 API 的 owner 校验。
 
-已实现但默认关闭：
+## 自动周期与持久状态
 
-- 严格识别 BTC/ETH 等短周期 Up/Down 市场，不靠问题文字猜测 token 方向。
-- 两边只挂 maker 限价；计算 YES + NO 完整成本、费用、对冲费用缓冲、单腿风险和资金成本。
-- 只有费用后配对成本严格低于结算价值才生成计划。
-- 双腿不是原子成交：状态机处理部分接受、部分成交、撤单竞态、确定性有界对冲和冻结。
-- 配对仓位与方向性多余仓位分账；方向覆盖有独立上限，不能把单腿风险伪装成套利。
-- Supabase 原子 plan/CAS/fill RPC、幂等成交、append-only inventory event 和对账回调。
-- 事件级 L2 replay 模拟队列前方深度、部分成交、提交/撤单延迟和 cancel race。
+FastAPI lifespan 启动内嵌 Worker。自动周期按配置间隔执行，前端也可以触发一次即时周期。Supabase 保存：
 
-P2 的 `research_only` 是代码与数据库双重门，不连接 live runtime。传闻账户的历史利润只能形成假设，不能证明可复制、费用后正 EV 或适合当前市场。
+- 运行控制、模式与配置绑定版本；
+- Worker 租约和 fencing token；
+- Paper 状态、预测、证据、交易意图、订单、成交与持仓；
+- 风险快照、对账状态、通知与审计记录；
+- 个人钱包公开地址、余额/allowance 就绪状态和检查时间，不保存环境变量中的明文私钥。
+
+重启服务不应把已经提交或结果不确定的订单当作全新订单重发。无法确认数据库、租约或对账状态时停止新订单。
+
+## Paper、Shadow、Canary、Live
+
+```mermaid
+flowchart LR
+  P["paper<br/>默认"] --> S["shadow"] --> C["canary<br/>小额真实资金"] --> L["live"]
+  G["POLYBOT_PERSONAL_LIVE_ENABLED=true"] --> C
+  G --> L
+```
+
+- `paper`：模拟成交，不发送真实订单；
+- `shadow`：使用真实盘口评估但不提交订单；
+- `canary`：小额真实资金，单笔有硬上限；
+- `live`：真实资金，仍受全部确定性风险闸门限制。
+
+Canary/Live 必须同时满足部署级 `POLYBOT_PERSONAL_LIVE_ENABLED=true` 与显式模式。个人模式的最新数据库迁移为环境钱包建立专用提交闸门；它不会复用需要 tenant credential row 的旧 SaaS 路径。
 
 ## AI 的权限
 
-AI 只产出结构化概率、置信区间、论据和有限方向信号。以下决定始终由确定性代码控制：
+AI 只产出结构化概率、置信区间、论据、反方证据和有限方向信号。以下决定仍由确定性代码控制：
 
 - 市场是否可交易、token 身份和结算规则；
-- 价格、深度、费用、最小订单和 post-only；
-- Kelly/单笔/事件/桶/总敞口、日亏损和回撤；
-- 钱包余额、allowance、arm、租约和地理限制；
-- 签名、发送、撤单和对账。
+- 价格、深度、费用、最小订单、限价/post-only/GTD；
+- Kelly、单笔、事件、桶、总敞口、日亏损和回撤；
+- 钱包余额、allowance、租约、模式授权和地理限制；
+- 签名、发送、撤单、重试与对账。
 
-第三方模型输出被视为不可信输入，不能读取钱包私钥，也不能直接调用 Broker。
+模型输出被视为不可信输入。AI API 不会收到 EVM 私钥，也不能直接调用 Broker。
 
-## 仍需外部验证
+## 真实订单提交闸门
 
-- 0007–0014 在真实 PostgreSQL/Supabase 上的完整 migration reset。
-- Polymarket 生产环境的小额 wallet approval、post-only/GTD、user stream 和模糊响应恢复。
-- 长期 point-in-time 数据、样本外概率校准、shadow 成交偏差和 live canary。
-- 生产监控、告警、备份恢复、密钥轮换演练和人工事件响应。
+在 `signed → submitting` 的数据库事务中，个人模式至少再次检查：
+
+- 订单属于 owner 和当前配置绑定；
+- Worker lease/fencing token 仍有效；
+- runtime control 的模式、版本和取消状态未变化；
+- 部署已显式允许个人真实资金模式；
+- 钱包公开地址与当前配置绑定一致；
+- collateral 余额与 allowance 就绪记录足够新；
+- 风险、地理、盘口和对账状态可用；
+- 订单仍是可提交的幂等状态。
+
+数据库事务与外部 CLOB POST 不能组成分布式原子事务，因此系统仍需 GTD 到期、模糊结果不盲重发、cancel-all、unresolved 状态和持续对账。它降低风险，但不能保证绝对没有孤儿订单。
+
+## P2 策略边界
+
+全限价、分时收集 YES/NO、总成本低于 1、方向覆盖和 L2 replay 已作为研究流水线存在。P2 仍由代码与数据库双重标记为 research-only；启用个人 Canary/Live 不会自动把研究策略接入真实执行。
+
+历史账户盈利、胜率截图或社交媒体传闻只能形成研究假设，不能证明当前费用后优势、可复制性或未来盈利。
+
+## 高级/旧多租户模式
+
+仓库仍保留 `Control API + Tenant Worker` 两服务、账户队列、RSA envelope、租户凭证/钱包生命周期和原子 tenant submission gate。它适用于未来 SaaS 化，但会增加部署和密钥管理复杂度，不是个人模式默认路径。

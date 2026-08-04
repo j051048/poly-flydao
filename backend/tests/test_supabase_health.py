@@ -26,6 +26,8 @@ class Query:
 
     def execute(self):
         self.client.executions.append((self.source, self.column))
+        if self.source == "rpc:polybot_schema_version":
+            return SimpleNamespace(data=16)
         return SimpleNamespace(data=[])
 
 
@@ -77,6 +79,7 @@ async def test_supabase_health_preflights_account_migrations_and_expiry_rpc_once
     assert ("pair_inventory_events", "clob_trade_id") in client.executions
     assert ("rpc:expire_runtime_control", "") in client.executions
     assert ("rpc:mark_tenant_order_submitting", "") in client.executions
+    assert ("rpc:polybot_schema_version", "") in client.executions
 
 
 async def test_supabase_health_rejects_a_different_auth_user() -> None:

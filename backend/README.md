@@ -1,15 +1,43 @@
 # Polybot backend
 
-`backend/` 是可独立部署到 Zeabur 的构建根目录，包含 FastAPI 控制面、常驻多租户 Worker、Supabase migrations、策略研究组件和测试。
+`backend/` 可直接作为 Zeabur 的构建根目录。个人版推荐只创建一个 `SERVICE_ROLE=personal` 服务：同一个 Uvicorn 进程提供控制 API，并由应用 lifespan 管理一个单账户 Worker。部署必须保持 `WEB_CONCURRENCY=1`，避免在同一服务中创建多个签名运行时。
 
-生产环境必须从同一镜像创建两个服务：
+## 个人版配置
 
-| 服务 | `SERVICE_ROLE` | 是否公开 | 持有的密钥 |
-|---|---|---|---|
-| Control API | `api` | 是 | Supabase service role、凭证 RSA 公钥、指纹 HMAC key |
-| Tenant Worker | `worker` | 否 | Supabase service role、凭证 RSA 私钥、签名 payload key |
+复制 [`deploy/personal.env.example`](deploy/personal.env.example) 到 Zeabur 环境变量。关键规则：
 
-API 不持有钱包私钥或 AI key。用户登录后一次性提交这些值；API 只用公钥生成账户绑定的密文。Worker 按任务租约取出并瞬时解密，任务结束后销毁运行时。浏览器后续请求只携带 Supabase Bearer JWT，不再通过 `X-*` 请求头传秘密。
+- `POLYBOT_ACCOUNT_ID` 必须是唯一 owner 的 Supabase Auth User UUID，不是邮箱、项目 ref 或钱包地址；
+- `POLYBOT_AI_API_KEY`、`POLYBOT_AI_BASE_URL`、`POLYBOT_AI_MODEL` 和 `POLYMARKET_PRIVATE_KEY` 只放 Zeabur；
+- `PORT` 直接填写 `8080`，不要填写 `${WEB_PORT}`；
+- `POLYBOT_DASHBOARD_ORIGINS` 填 Vercel 的完整 HTTPS origin，多个域名用英文逗号分隔且不带路径；
+- 默认 `POLYBOT_MODE=paper`。只有显式设置 `POLYBOT_PERSONAL_LIVE_ENABLED=true` 且模式为 `canary` 或 `live`，才允许构建真实资金运行时。
+
+个人版不需要以下多租户密钥：
+
+```text
+POLYBOT_CREDENTIAL_PUBLIC_KEY_PEM
+POLYBOT_CREDENTIAL_PRIVATE_KEY_PEM
+POLYBOT_CREDENTIAL_FINGERPRINT_KEY
+POLYBOT_SIGNED_PAYLOAD_KEY
+```
+
+也不要把任何 `NEXT_PUBLIC_*`、`PASSWORD` 或 `POLYBOT_ADMIN_TOKEN` 放在 Zeabur。
+
+## Supabase
+
+按文件名顺序应用 `supabase/migrations/` 中全部迁移，包括个人模式的最新 `0016` 迁移。个人模式仍依赖 Supabase 保存订单、运行控制、风险快照、租约、Paper 状态与审计记录；缺少数据库或最新迁移时会 fail closed。
+
+Supabase Auth 只保留一个 owner。先在 Supabase Dashboard 创建/确认该用户，复制 User UUID 到 `POLYBOT_ACCOUNT_ID`，再关闭公开注册。后端会拒绝其他有效用户访问个人运行时。
+
+## 健康检查
+
+- `GET /livez`：进程已启动；
+- `GET /health`：API 可以访问 Supabase 控制面；
+- `GET /worker-health`：内嵌 Worker 已完成初始化并持有健康租约。
+
+Zeabur 平台 Health Check Path 推荐 `/livez`，避免 Supabase 短暂故障触发容器重启；控制台仍以 `/health` 和 `/worker-health` 判断是否可以交易。服务应为一个副本。
+
+从 Canary/Live 降级到 Paper/Shadow 时先保留原钱包私钥。新 Worker 会在有效租约下原子停机、撤销交易所挂单并验证零开放单；清场失败时 `/worker-health` 保持 503，模拟周期不会在不确定状态下启动。
 
 ## 本地验证
 
@@ -18,26 +46,11 @@ Set-Location backend
 uv sync --frozen --extra dev
 uv run --frozen --extra dev ruff check .
 uv run --frozen --extra dev python -m pytest
-uv run --frozen --extra dev polybot pair-replay --input examples/pair_replay_sample.json
+uv run --frozen polybot pair-replay --input examples/pair_replay_sample.json
 ```
 
-默认配置是 `paper + mock`，不会发送真实订单。本地无 Supabase 的控制面必须显式设置 `POLYBOT_ALLOW_INMEMORY_CONTROL=true`；生产环境缺少持久控制面会直接返回 503。
+## 高级：旧多租户部署
 
-## Supabase
+仓库仍保留 `SERVICE_ROLE=api` 与 `SERVICE_ROLE=worker`、tenant queue、账户凭证加密和 API/Worker 密钥分离，模板位于 [`deploy/api.env.example`](deploy/api.env.example) 与 [`deploy/worker.env.example`](deploy/worker.env.example)。这条路径适合对外 SaaS，不是个人版的推荐配置。不要把两套模板混在同一个服务里。
 
-按文件名顺序应用 `supabase/migrations/0001_initial.sql` 至 `0015_product_operations.sql`。`0007` 引入多租户凭证、钱包生命周期、风险快照和任务队列；`0008`–`0009` 是默认关闭的配对微结构研究账本；`0010` 是真实订单提交前的原子授权闸门；`0011`–`0012` 加固自定义 AI 中转站；`0013`–`0014` 保存任务摘要并接通自定义中转站；`0015` 增加持久 Paper 账户、Worker 心跳、钱包就绪闸门、AI 诊断/预算、通知和预测校准闭环。
-
-GitHub CI 使用固定版本的官方 Supabase CLI，在全新本地数据库应用所有迁移并执行一次
-完整 reset。新增或修改 SQL 后，`Supabase / migration-reset` 是必需检查，不要只依赖
-`tests/test_schema.py` 的静态约束断言。
-
-上线配置与操作顺序见 [部署手册](../docs/DEPLOYMENT.md)，安全边界见 [安全说明](../docs/SECURITY.md)。
-
-为避免把 Worker 私钥误放进公开 API，Zeabur 两个服务分别从
-[`deploy/api.env.example`](deploy/api.env.example) 和
-[`deploy/worker.env.example`](deploy/worker.env.example) 复制变量。API 健康检查使用
-`/health`；私有 Worker 使用只返回固定进程状态的 `/livez`，且不要绑定公网域名。
-
-## P2 策略状态
-
-限价 maker、分时收集 YES/NO、完整成本低于 1 的配对逻辑、方向覆盖、非原子双腿状态机、幂等成交和 L2 队列回放均已实现。它仍被硬编码为 `research_only`，Supabase 中 `execution_enabled=false`，不能作为实盘盈利证明。完成事件级数据、样本外 walk-forward、shadow 和小额 canary 门槛前，不应解除该限制。
+P2 的 YES/NO 配对微结构策略仍是 research/paper 流水线，不能把历史传闻当成可复制收益证明，也不会因启用个人 Live 自动解除研究闸门。

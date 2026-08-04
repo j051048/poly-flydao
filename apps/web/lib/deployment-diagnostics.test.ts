@@ -14,7 +14,7 @@ describe("evaluateDashboardCors", () => {
     ).toEqual({
       ok: true,
       allowsOrigin: true,
-      allowsPut: true,
+      allowsPost: true,
       allowsAuthorization: true,
       allowsContentType: true,
       allowsIdempotencyKey: true,
@@ -32,7 +32,7 @@ describe("evaluateDashboardCors", () => {
     ).toEqual({
       ok: false,
       allowsOrigin: false,
-      allowsPut: false,
+      allowsPost: true,
       allowsAuthorization: true,
       allowsContentType: true,
       allowsIdempotencyKey: false,

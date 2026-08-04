@@ -7,7 +7,7 @@ export interface HealthProbe {
 export interface CorsEvaluation {
   ok: boolean;
   allowsOrigin: boolean;
-  allowsPut: boolean;
+  allowsPost: boolean;
   allowsAuthorization: boolean;
   allowsContentType: boolean;
   allowsIdempotencyKey: boolean;
@@ -49,7 +49,7 @@ export function evaluateDashboardCors(
   const allowsOrigin =
     normalizedOrigin === "*" ||
     normalizedOrigin === dashboardOrigin.trim().toLowerCase();
-  const allowsPut = methods.has("put");
+  const allowsPost = methods.has("post");
   const allowsAuthorization = headers.has("authorization") || headers.has("*");
   const allowsContentType = headers.has("content-type") || headers.has("*");
   const allowsIdempotencyKey =
@@ -58,12 +58,12 @@ export function evaluateDashboardCors(
   return {
     ok:
       allowsOrigin &&
-      allowsPut &&
+      allowsPost &&
       allowsAuthorization &&
       allowsContentType &&
       allowsIdempotencyKey,
     allowsOrigin,
-    allowsPut,
+    allowsPost,
     allowsAuthorization,
     allowsContentType,
     allowsIdempotencyKey,

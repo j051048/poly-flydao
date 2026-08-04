@@ -37,6 +37,11 @@ interface StatusView {
   configuredMode?: string;
   aiProvider?: string;
   forecastModel?: string;
+  personalEnabled?: boolean;
+  liveSupported?: boolean;
+  personalPaused?: boolean;
+  autoRunEnabled?: boolean;
+  personalCycleCount?: number;
   control: ControlView;
   riskLimits: Array<{ key: string; label: string; value: string }>;
   latestJob?: JobView;
@@ -115,8 +120,12 @@ function parseJob(payload: unknown): JobView {
         summary.executions ?? source.executions ?? source.execution_count,
       );
   return {
-    id: asString(source.job_id ?? source.id ?? source.run_id),
-    status: asString(source.status) ?? (source.completed_at ? "completed" : undefined),
+    id: asString(
+      source.job_id ?? source.request_id ?? source.id ?? source.run_id,
+    ),
+    status:
+      asString(source.status ?? source.state) ??
+      (source.completed_at ? "completed" : undefined),
     mode: asString(source.mode),
     marketsScanned: asNumber(summary.markets_scanned ?? source.markets_scanned),
     forecastsCreated: asNumber(
@@ -164,12 +173,22 @@ function skipReasonLabel(code: string): string {
 
 function parseStatus(payload: unknown): StatusView {
   const root = asRecord(payload);
+  const personal = asRecord(root.personal);
+  const personalAi = asRecord(personal.ai);
+  const personalWallet = asRecord(personal.wallet);
   const control = asRecord(root.control);
   const risk = asRecord(root.risk_limits ?? root.risk_policy);
   return {
-    configuredMode: asString(root.mode),
-    aiProvider: asString(root.ai_provider),
-    forecastModel: asString(root.forecast_model),
+    configuredMode: asString(personal.mode ?? root.mode),
+    aiProvider: asString(personalAi.provider ?? root.ai_provider),
+    forecastModel: asString(
+      personalAi.forecast_model ?? root.forecast_model,
+    ),
+    personalEnabled: asBoolean(personal.enabled ?? root.personal_mode),
+    liveSupported: asBoolean(personal.live_supported),
+    personalPaused: asBoolean(personalWallet.paused),
+    autoRunEnabled: asBoolean(personal.auto_run_enabled),
+    personalCycleCount: asNumber(personal.cycle_count),
     control: {
       accountId: asString(control.account_id),
       mode: asString(control.mode),
@@ -185,7 +204,11 @@ function parseStatus(payload: unknown): StatusView {
       label: definition.label,
       value: formatRisk(risk[definition.key], definition.format),
     })),
-    latestJob: root.latest_job ? parseJob(root.latest_job) : undefined,
+    latestJob: root.latest_job
+      ? parseJob(root.latest_job)
+      : personal.last_cycle
+        ? parseJob(personal.last_cycle)
+        : undefined,
     fetchedAt: Date.now(),
   };
 }
@@ -232,12 +255,12 @@ export default function HomePage() {
   const [busy, setBusy] = useState<BusyAction>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [lastJob, setLastJob] = useState<JobView | null>(null);
-  const [armMinutes, setArmMinutes] = useState(5);
   const [riskConfirmed, setRiskConfirmed] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [now, setNow] = useState(0);
   const [notifications, setNotifications] = useState<NotificationView[]>([]);
   const cycleIdempotencyKey = useRef<string | null>(null);
+  const personalCycleBaseline = useRef<number | null>(null);
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
@@ -257,7 +280,14 @@ export default function HomePage() {
       .then(({ data }) => {
         const parsed = parseStatus(data);
         setStatus(parsed);
-        if (parsed.latestJob) setLastJob(parsed.latestJob);
+        if (
+          parsed.latestJob &&
+          (personalCycleBaseline.current === null ||
+            (parsed.personalCycleCount ?? 0) > personalCycleBaseline.current ||
+            parsed.latestJob.status?.toLowerCase() === "running")
+        ) {
+          setLastJob(parsed.latestJob);
+        }
         setStatusError(null);
       })
       .catch((error) => setStatusError(readableApiError(error)));
@@ -310,6 +340,48 @@ export default function HomePage() {
     let cancelled = false;
     const poll = async () => {
       try {
+        if (status?.personalEnabled) {
+          const result = await apiRequest<unknown>("/v1/status");
+          if (cancelled) return;
+          const updatedStatus = parseStatus(result.data);
+          setStatus(updatedStatus);
+          const completedRequestedCycle =
+            personalCycleBaseline.current === null ||
+            (updatedStatus.personalCycleCount ?? 0) >
+              personalCycleBaseline.current;
+          if (
+            updatedStatus.latestJob &&
+            (completedRequestedCycle ||
+              updatedStatus.latestJob.status?.toLowerCase() === "running")
+          ) {
+            setLastJob(updatedStatus.latestJob);
+            const updatedState = updatedStatus.latestJob.status?.toLowerCase();
+            if (
+              completedRequestedCycle &&
+              updatedState &&
+              ["completed", "succeeded"].includes(updatedState)
+            ) {
+              personalCycleBaseline.current = null;
+              setNotice({
+                tone: "success",
+                text: jobCompletionText(updatedStatus.latestJob),
+              });
+            } else if (
+              completedRequestedCycle &&
+              updatedState &&
+              ["failed", "cancelled", "dead"].includes(updatedState)
+            ) {
+              personalCycleBaseline.current = null;
+              setNotice({
+                tone: "error",
+                text:
+                  updatedStatus.latestJob.message ??
+                  `周期以 ${updatedState} 状态结束。`,
+              });
+            }
+          }
+          return;
+        }
         const result = await apiRequest<unknown>(
           `/v1/jobs/${encodeURIComponent(jobId)}`,
         );
@@ -345,7 +417,7 @@ export default function HomePage() {
       cancelled = true;
       globalThis.clearInterval(timer);
     };
-  }, [lastJob?.id, lastJob?.status]);
+  }, [lastJob?.id, lastJob?.status, status?.personalEnabled]);
 
   async function markNotificationRead(notificationId: number) {
     try {
@@ -368,6 +440,8 @@ export default function HomePage() {
       ? configuredMode
       : null;
   const control = status?.control;
+  const personalRealMode = Boolean(status?.personalEnabled && armableMode);
+  const personalPaused = status?.personalPaused === true;
   const armedUntilMs = control?.armedUntil
     ? new Date(control.armedUntil).getTime()
     : 0;
@@ -393,23 +467,31 @@ export default function HomePage() {
       return;
     }
     setBusy("cycle");
-    setNotice({ tone: "info", text: "正在创建租户隔离的运行任务…" });
+    setNotice({ tone: "info", text: "正在启动个人运行周期…" });
     try {
       cycleIdempotencyKey.current ??= crypto.randomUUID();
-      const result = await apiRequest<unknown>("/v1/jobs/cycles", {
+      if (status?.personalEnabled) {
+        personalCycleBaseline.current = status.personalCycleCount ?? 0;
+      }
+      const result = await apiRequest<unknown>("/v1/personal/cycles/run", {
         method: "POST",
         body: { mode: configuredMode ?? "paper" },
         idempotencyKey: cycleIdempotencyKey.current,
         timeoutMs: 30_000,
       });
       cycleIdempotencyKey.current = null;
-      const job = parseJob(result.data);
+      const parsedResponse = asRecord(result.data);
+      const job = {
+        ...parseJob(result.data),
+        status: asString(parsedResponse.state) ?? "queued",
+        mode: asString(parsedResponse.mode) ?? configuredMode,
+      };
       setLastJob(job);
       setNotice({
         tone: "success",
           text:
             result.status === 202
-              ? `任务已进入队列${job.id ? `（${job.id}）` : ""}，worker 将异步执行。`
+              ? `周期已交给个人 Worker${job.id ? `（${job.id}）` : ""}，可以继续使用控制台。`
               : jobCompletionText(job),
       });
       await refresh();
@@ -424,7 +506,7 @@ export default function HomePage() {
     if (!armableMode || !riskConfirmed || !control?.version) return;
     if (
       !window.confirm(
-        `确认将${modeLabel(armableMode)}解锁 ${armMinutes} 分钟？`,
+        `确认恢复${modeLabel(armableMode)}自动运行？它会持续运行，直到你点击“立即停用”或关闭 Zeabur 实盘开关。`,
       )
     ) {
       return;
@@ -435,7 +517,7 @@ export default function HomePage() {
         method: "POST",
         body: {
           mode: armableMode,
-          minutes: armMinutes,
+          minutes: 10,
           expected_version: control.version,
         },
         idempotencyKey: crypto.randomUUID(),
@@ -443,7 +525,7 @@ export default function HomePage() {
       setRiskConfirmed(false);
       setNotice({
         tone: "success",
-        text: `${modeLabel(armableMode)}已短时解锁 ${armMinutes} 分钟。`,
+        text: `${modeLabel(armableMode)}恢复请求已交给个人 Worker；内部短期授权会由它自动续期。`,
       });
       await refresh();
     } catch (error) {
@@ -491,7 +573,7 @@ export default function HomePage() {
     <main className="page-shell">
       <header className="topbar">
         <div>
-          <p className="eyebrow">TENANT CONTROL PLANE</p>
+          <p className="eyebrow">PERSONAL CONTROL</p>
           <h1>控制台总览</h1>
         </div>
         <div className="api-address" title={API_BASE_URL}>
@@ -505,7 +587,7 @@ export default function HomePage() {
           <div>
             <p className="eyebrow">FIRST RUN</p>
             <strong>第一次使用？让向导告诉你下一步</strong>
-            <p>先完成 MFA 和 AI 配置，再运行一次不会下真实订单的 Paper 任务。</p>
+            <p>在 Zeabur 填好 AI 环境变量，再运行一次不会下真实订单的 Paper 任务。</p>
           </div>
           <Link className="primary-button" href="/setup">
             打开新手向导
@@ -516,10 +598,10 @@ export default function HomePage() {
       <section className="safety-banner">
         <span className="shield" aria-hidden="true">◆</span>
         <div>
-          <strong>当前 Supabase 会话就是租户身份</strong>
+          <strong>个人后端已与当前登录账户绑定</strong>
           <p>
-            本页仅发送 JWT、任务参数和幂等键，不读取或转发 AI Key、EVM
-            私钥、助记词及 CLOB 凭证。
+            本页只发送登录令牌和运行指令；AI Key 与 EVM 私钥仅由 Zeabur
+            个人服务读取，不会进入浏览器。
           </p>
         </div>
       </section>
@@ -628,16 +710,16 @@ export default function HomePage() {
           <div className="section-heading">
             <div>
               <p className="eyebrow">CONTROL ACTIONS</p>
-              <h2>租户操作</h2>
+              <h2>个人机器人操作</h2>
             </div>
-            <span className="read-only-chip">JWT 已绑定</span>
+            <span className="read-only-chip">单账户模式</span>
           </div>
 
           <div className="action-stack">
             <article className="action-card">
               <div>
                 <h3>创建运行任务</h3>
-                <p>API 只入队；隔离 worker 获取租户租约后才加载密钥并执行。</p>
+                <p>同一 Zeabur 服务中的常驻 Worker 会立即领取并执行本次周期。</p>
               </div>
               <button
                 className="primary-button"
@@ -649,62 +731,99 @@ export default function HomePage() {
               </button>
             </article>
 
-            <article className="action-card arm-action">
-              <div className="action-copy">
-                <h3>短时解锁</h3>
-                <p>仅 canary/live 可用；到期后服务端自动拒绝新交易。</p>
-              </div>
-              <div className="arm-settings">
-                <label htmlFor="arm-minutes">窗口</label>
-                <select
-                  id="arm-minutes"
-                  value={armMinutes}
-                  onChange={(event) => setArmMinutes(Number(event.target.value))}
-                  disabled={busy !== null}
+            {status?.personalEnabled && !status.liveSupported ? (
+              <article className="action-card arm-action">
+                <div className="action-copy">
+                  <h3>真钱模式默认关闭</h3>
+                  <p>先观察 Paper / Shadow；需要实盘时必须在 Zeabur 显式开启个人实盘。</p>
+                </div>
+                <Link className="secondary-button" href="/settings#runtime">
+                  查看模式说明
+                </Link>
+              </article>
+            ) : !armableMode ? (
+              <article className="action-card arm-action">
+                <div className="action-copy">
+                  <h3>当前保持安全模式</h3>
+                  <p>后端现在是 Paper / Shadow，不需要交易授权；切换模式只能在 Zeabur 完成。</p>
+                </div>
+                <Link className="secondary-button" href="/settings#runtime">
+                  查看模式说明
+                </Link>
+              </article>
+            ) : personalPaused ? (
+              <article className="action-card arm-action">
+                <div className="action-copy">
+                  <h3>恢复自动实盘</h3>
+                  <p>恢复后 Worker 会自动维护内部短期授权；“立即停用”会跨重启保持。</p>
+                </div>
+                <label className="confirm-row">
+                  <input
+                    type="checkbox"
+                    checked={riskConfirmed}
+                    onChange={(event) => setRiskConfirmed(event.target.checked)}
+                    disabled={!armableMode || busy !== null}
+                  />
+                  <span>我确认这可能提交真实资金订单，并已核对风险上限。</span>
+                </label>
+                <button
+                  className="warning-button"
+                  type="button"
+                  onClick={() => void armTrading()}
+                  disabled={
+                    !armableMode ||
+                    !riskConfirmed ||
+                    !control?.version ||
+                    busy !== null ||
+                    !apiUsesSafeTransport
+                  }
                 >
-                  {[1, 3, 5, 10, 15].map((minutes) => (
-                    <option key={minutes} value={minutes}>{minutes} 分钟</option>
-                  ))}
-                </select>
-              </div>
-              <label className="confirm-row">
-                <input
-                  type="checkbox"
-                  checked={riskConfirmed}
-                  onChange={(event) => setRiskConfirmed(event.target.checked)}
-                  disabled={!armableMode || busy !== null}
-                />
-                <span>我确认这可能提交真实资金订单，并已核对风险上限。</span>
-              </label>
-              <button
-                className="warning-button"
-                type="button"
-                onClick={() => void armTrading()}
-                disabled={
-                  !armableMode ||
-                  !riskConfirmed ||
-                  !control?.version ||
-                  busy !== null ||
-                  !apiUsesSafeTransport
-                }
-              >
-                {busy === "arm" ? "解锁中…" : "短时解锁交易"}
-              </button>
-            </article>
+                  {busy === "arm" ? "恢复中…" : "恢复自动实盘"}
+                </button>
+              </article>
+            ) : (
+              <article className="action-card arm-action">
+                <div className="action-copy">
+                  <h3>自动实盘已启用</h3>
+                  <p>
+                    Worker 会自动刷新余额、allowance 与内部授权；未入金时只会等待，不会提交订单。
+                  </p>
+                </div>
+                <span className="read-only-chip">
+                  {effectivelyArmed ? "授权有效" : "准备中"}
+                </span>
+              </article>
+            )}
 
             <article className="action-card stop-action">
               <div>
                 <h3>立即停用</h3>
-                <p>先持久化 kill switch，再由持有租约的 worker 异步撤单。</p>
+                <p>
+                  {personalRealMode
+                    ? "立即打开 kill switch，并让个人 Worker 停止新交易、撤销挂单。"
+                    : "Paper / Shadow 不会发送真实订单；停止自动周期请修改 Zeabur 环境变量。"}
+                </p>
               </div>
-              <button
-                className="danger-button"
-                type="button"
-                onClick={() => void disarmTrading()}
-                disabled={busy !== null || !apiUsesSafeTransport}
-              >
-                {busy === "disarm" ? "停用中…" : "停用并撤单"}
-              </button>
+              {personalRealMode ? (
+                <button
+                  className="danger-button"
+                  type="button"
+                  onClick={() => void disarmTrading()}
+                  disabled={
+                    personalPaused || busy !== null || !apiUsesSafeTransport
+                  }
+                >
+                  {personalPaused
+                    ? "已停用"
+                    : busy === "disarm"
+                      ? "停用中…"
+                      : "停用并撤单"}
+                </button>
+              ) : (
+                <Link className="secondary-button" href="/settings#runtime">
+                  查看自动运行变量
+                </Link>
+              )}
             </article>
           </div>
 

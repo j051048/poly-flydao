@@ -13,6 +13,8 @@ from polybot.config import (
     TradingMode,
 )
 
+PERSONAL_ACCOUNT_ID = "11111111-1111-4111-8111-111111111111"
+
 
 def test_defaults_are_non_trading() -> None:
     value = Settings(_env_file=None)
@@ -252,4 +254,225 @@ def test_openai_compatible_provider_requires_safe_https_base_url() -> None:
             ai_provider="openai_compatible",
             litellm_api_key="relay-key",
             litellm_base_url="http://relay.example.com/v1",
+        )
+
+
+def test_personal_mode_accepts_simple_ai_and_wallet_environment_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("POLYBOT_PERSONAL_MODE", "true")
+    monkeypatch.setenv("POLYBOT_COMPONENT", "all")
+    monkeypatch.setenv("POLYBOT_ACCOUNT_ID", PERSONAL_ACCOUNT_ID)
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-role-test")
+    monkeypatch.setenv("POLYBOT_AI_API_KEY", "personal-relay-key")
+    monkeypatch.setenv("POLYBOT_AI_BASE_URL", "https://relay.example.com/v1/")
+    monkeypatch.setenv("POLYBOT_AI_MODEL", "relay-model-v1")
+    monkeypatch.setenv("POLYMARKET_PRIVATE_KEY", "0X" + ("12" * 32))
+
+    settings = Settings(_env_file=None)
+
+    assert settings.personal_mode is True
+    assert settings.ai_provider == "openai_compatible"
+    assert settings.litellm_base_url == "https://relay.example.com/v1"
+    assert settings.forecast_model == "relay-model-v1"
+    assert settings.critic_model == "relay-model-v1"
+    assert settings.effective_ai_api_key is not None
+    assert settings.polymarket_private_key is not None
+    assert settings.polymarket_private_key.get_secret_value() == "0x" + ("12" * 32)
+    assert settings.custom_ai_allowed_hosts == "relay.example.com"
+
+
+def test_personal_mode_accepts_standard_openai_key_without_provider_setting() -> None:
+    settings = Settings(
+        _env_file=None,
+        personal_mode=True,
+        component="all",
+        account_id=PERSONAL_ACCOUNT_ID,
+        openai_api_key="standard-openai-key",
+        supabase_url="https://example.supabase.co",
+        supabase_service_role_key="service-role-test",
+    )
+
+    assert settings.ai_provider == "openai"
+    assert settings.effective_ai_api_key is not None
+    assert settings.effective_ai_api_key.get_secret_value() == "standard-openai-key"
+
+
+def test_personal_payload_key_is_stable_across_evm_key_prefix_and_case() -> None:
+    bare_key = "12" * 32
+    first = Settings(
+        _env_file=None,
+        personal_mode=True,
+        component="all",
+        account_id=PERSONAL_ACCOUNT_ID,
+        polymarket_private_key=bare_key,
+        supabase_url="https://example.supabase.co",
+        supabase_service_role_key="service-role-test",
+    )
+    second = Settings(
+        _env_file=None,
+        personal_mode=True,
+        component="all",
+        account_id=PERSONAL_ACCOUNT_ID,
+        polymarket_private_key="0X" + bare_key.upper(),
+        supabase_url="https://example.supabase.co",
+        supabase_service_role_key="service-role-test",
+    )
+
+    assert first.resolved_signed_payload_key is not None
+    assert second.resolved_signed_payload_key is not None
+    assert (
+        first.resolved_signed_payload_key.get_secret_value()
+        == second.resolved_signed_payload_key.get_secret_value()
+    )
+
+
+def test_personal_mode_rejects_invalid_wallet_and_real_money_modes() -> None:
+    with pytest.raises(ValidationError, match="both SUPABASE_URL"):
+        Settings(
+            _env_file=None,
+            personal_mode=True,
+            component="all",
+            account_id=PERSONAL_ACCOUNT_ID,
+            supabase_url="https://example.supabase.co",
+        )
+
+    with pytest.raises(ValidationError, match="valid HTTPS URL"):
+        Settings(
+            _env_file=None,
+            personal_mode=True,
+            component="all",
+            account_id=PERSONAL_ACCOUNT_ID,
+            supabase_url="http://example.supabase.co",
+            supabase_service_role_key="service-role-test",
+        )
+
+    with pytest.raises(ValidationError, match="Supabase Auth user UUID"):
+        Settings(
+            _env_file=None,
+            personal_mode=True,
+            component="all",
+            account_id="replace-me",
+            supabase_url="https://example.supabase.co",
+            supabase_service_role_key="service-role-test",
+        )
+
+    with pytest.raises(ValidationError, match="POLYBOT_ACCOUNT_ID"):
+        Settings(
+            _env_file=None,
+            personal_mode=True,
+            component="all",
+            supabase_url="https://example.supabase.co",
+            supabase_service_role_key="service-role-test",
+        )
+
+    with pytest.raises(ValidationError, match="real Supabase Auth user UUID"):
+        Settings(
+            _env_file=None,
+            personal_mode=True,
+            component="all",
+            account_id="00000000-0000-0000-0000-000000000000",
+            supabase_url="https://example.supabase.co",
+            supabase_service_role_key="service-role-test",
+        )
+
+    with pytest.raises(ValidationError, match="32-byte hexadecimal"):
+        Settings(
+            _env_file=None,
+            personal_mode=True,
+            component="all",
+            account_id=PERSONAL_ACCOUNT_ID,
+            polymarket_private_key="not-a-private-key",
+            supabase_url="https://example.supabase.co",
+            supabase_service_role_key="service-role-test",
+        )
+
+    with pytest.raises(ValidationError, match="POLYBOT_PERSONAL_LIVE_ENABLED=true"):
+        Settings(
+            _env_file=None,
+            personal_mode=True,
+            component="all",
+            account_id=PERSONAL_ACCOUNT_ID,
+            mode="canary",
+            supabase_url="https://example.supabase.co",
+            supabase_service_role_key="service-role-test",
+        )
+
+
+def test_personal_canary_uses_one_live_switch_and_keeps_hard_gates() -> None:
+    settings = Settings(
+        _env_file=None,
+        personal_mode=True,
+        personal_live_enabled=True,
+        component="all",
+        account_id=PERSONAL_ACCOUNT_ID,
+        mode="canary",
+        ai_api_key="personal-live-ai-key",
+        ai_base_url="https://relay.example.com/v1",
+        ai_model="relay-model-v1",
+        polymarket_private_key="12" * 32,
+        supabase_url="https://example.supabase.co",
+        supabase_service_role_key="service-role-test",
+    )
+
+    assert settings.mode is TradingMode.CANARY
+    assert settings.live_ack == ""
+    assert settings.beta_sdk_ack == ""
+    assert settings.dedicated_wallet_ack == ""
+    assert settings.resolved_signed_payload_key is not None
+
+    with pytest.raises(ValidationError) as locked:
+        Settings(
+            _env_file=None,
+            personal_mode=True,
+            personal_live_enabled=True,
+            component="all",
+            account_id=PERSONAL_ACCOUNT_ID,
+            mode="live",
+            supabase_url="https://example.supabase.co",
+            supabase_service_role_key="service-role-test",
+            geoblock_url="https://example.com/not-the-official-gate",
+            min_evidence_items=1,
+        )
+    locked_message = str(locked.value)
+    assert "POLYMARKET_PRIVATE_KEY" in locked_message
+    assert "POLYBOT_AI_PROVIDER cannot be mock" in locked_message
+    assert "POLYBOT_GEOBLOCK_URL" in locked_message
+    assert "POLYBOT_MIN_EVIDENCE_ITEMS" in locked_message
+
+    with pytest.raises(ValidationError, match="both SUPABASE_URL"):
+        Settings(
+            _env_file=None,
+            personal_mode=True,
+            personal_live_enabled=True,
+            component="all",
+            account_id=PERSONAL_ACCOUNT_ID,
+            mode="canary",
+            ai_api_key="personal-live-ai-key",
+            polymarket_private_key="12" * 32,
+        )
+
+    with pytest.raises(ValidationError, match="hard-caps"):
+        Settings(
+            _env_file=None,
+            personal_mode=True,
+            personal_live_enabled=True,
+            component="all",
+            account_id=PERSONAL_ACCOUNT_ID,
+            mode="canary",
+            max_order_usd=Decimal("6"),
+            ai_api_key="personal-live-ai-key",
+            polymarket_private_key="12" * 32,
+            supabase_url="https://example.supabase.co",
+            supabase_service_role_key="service-role-test",
+        )
+
+
+def test_control_api_rejects_simple_personal_ai_alias_without_personal_role() -> None:
+    with pytest.raises(ValidationError, match="POLYBOT_AI_API_KEY"):
+        Settings(
+            _env_file=None,
+            component="api",
+            ai_api_key="must-not-enter-public-api",
         )

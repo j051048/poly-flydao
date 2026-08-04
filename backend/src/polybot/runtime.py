@@ -69,9 +69,13 @@ def _ai(settings: Settings) -> tuple[ForecastProvider, EvidenceCollector]:
     if provider_name == "mock":
         return SafeMockForecastProvider(), NoopEvidenceCollector()
     if provider_name == "openai":
-        if settings.openai_api_key is None:
-            raise ValueError("OPENAI_API_KEY is required for POLYBOT_AI_PROVIDER=openai")
-        key = settings.openai_api_key.get_secret_value()
+        key_setting = settings.effective_ai_api_key
+        if key_setting is None:
+            raise ValueError(
+                "OPENAI_API_KEY or POLYBOT_AI_API_KEY is required for "
+                "POLYBOT_AI_PROVIDER=openai"
+            )
+        key = key_setting.get_secret_value()
         return (
             OpenAIForecastProvider(key, timeout_seconds=settings.ai_timeout_seconds),
             _evidence_collector(settings, default="openai_web"),
@@ -79,11 +83,15 @@ def _ai(settings: Settings) -> tuple[ForecastProvider, EvidenceCollector]:
     if provider_name == "litellm":
         from polybot.ai.litellm_provider import LiteLLMForecastProvider
 
-        if settings.litellm_api_key is None:
-            raise ValueError("LITELLM_API_KEY is required for POLYBOT_AI_PROVIDER=litellm")
+        key_setting = settings.effective_ai_api_key
+        if key_setting is None:
+            raise ValueError(
+                "LITELLM_API_KEY or POLYBOT_AI_API_KEY is required for "
+                "POLYBOT_AI_PROVIDER=litellm"
+            )
         return (
             LiteLLMForecastProvider(
-                api_key=settings.litellm_api_key.get_secret_value(),
+                api_key=key_setting.get_secret_value(),
                 api_base=settings.litellm_base_url,
                 timeout_seconds=settings.ai_timeout_seconds,
             ),
@@ -94,13 +102,15 @@ def _ai(settings: Settings) -> tuple[ForecastProvider, EvidenceCollector]:
             OpenAICompatibleForecastProvider,
         )
 
-        if settings.litellm_api_key is None:
+        key_setting = settings.effective_ai_api_key
+        if key_setting is None:
             raise ValueError(
-                "LITELLM_API_KEY is required for POLYBOT_AI_PROVIDER=openai_compatible"
+                "LITELLM_API_KEY or POLYBOT_AI_API_KEY is required for "
+                "POLYBOT_AI_PROVIDER=openai_compatible"
             )
         return (
             OpenAICompatibleForecastProvider(
-                api_key=settings.litellm_api_key.get_secret_value(),
+                api_key=key_setting.get_secret_value(),
                 api_base=settings.litellm_base_url,
                 timeout_seconds=settings.ai_timeout_seconds,
                 allowed_hosts=settings.custom_ai_allowed_hosts,
@@ -121,10 +131,14 @@ def _evidence_collector(
     if name == "gdelt":
         return GDELTNewsEvidenceCollector(timeout_seconds=min(settings.ai_timeout_seconds, 30))
     if name == "openai_web":
-        if settings.openai_api_key is None:
-            raise ValueError("OPENAI_API_KEY is required for POLYBOT_EVIDENCE_PROVIDER=openai_web")
+        key_setting = settings.effective_ai_api_key
+        if key_setting is None:
+            raise ValueError(
+                "OPENAI_API_KEY or POLYBOT_AI_API_KEY is required for "
+                "POLYBOT_EVIDENCE_PROVIDER=openai_web"
+            )
         return OpenAIWebEvidenceCollector(
-            settings.openai_api_key.get_secret_value(),
+            key_setting.get_secret_value(),
             model=settings.forecast_model,
             timeout_seconds=settings.ai_timeout_seconds,
         )

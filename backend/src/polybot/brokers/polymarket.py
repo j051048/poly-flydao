@@ -41,7 +41,10 @@ class PolymarketBroker:
         self.settings = settings
         self.store = store
         self.geoblock = geoblock or GeoblockChecker(settings.geoblock_url)
-        self.cipher = TenantAeadCipher(settings.signed_payload_key.get_secret_value())
+        payload_key = settings.resolved_signed_payload_key
+        if payload_key is None:
+            raise ValueError("a signed-payload encryption key is required for live execution")
+        self.cipher = TenantAeadCipher(payload_key.get_secret_value())
         if client is None:
             from polymarket import SecureClient
 

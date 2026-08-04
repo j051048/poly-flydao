@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import ipaddress
+import re
+from base64 import urlsafe_b64encode
 from decimal import Decimal
 from enum import StrEnum
 from functools import lru_cache
+from hashlib import sha256
 from typing import Literal
 from urllib.parse import SplitResult, urlsplit
 from uuid import UUID
@@ -26,6 +29,24 @@ LIVE_ACK_TEXT = "I_UNDERSTAND_REAL_FUNDS_CAN_BE_LOST"
 BETA_SDK_ACK_TEXT = "I_ACCEPT_BETA_SDK_CANARY_ONLY"
 DEDICATED_WALLET_ACK_TEXT = "I_CONFIRM_DEDICATED_WALLET_NO_EXTERNAL_FLOWS"
 OFFICIAL_GEOBLOCK_URL = "https://polymarket.com/api/geoblock"
+DEFAULT_ACCOUNT_ID = "00000000-0000-0000-0000-000000000001"
+_EVM_PRIVATE_KEY = re.compile(r"^(?:0[xX])?[0-9a-fA-F]{64}$")
+_SECP256K1_ORDER = int(
+    "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141",
+    16,
+)
+
+
+def _canonical_evm_private_key(value: str) -> str:
+    normalized = value.strip()
+    if not _EVM_PRIVATE_KEY.fullmatch(normalized):
+        raise ValueError("personal EVM private key must be a 32-byte hexadecimal value")
+    canonical = normalized[2:] if normalized.lower().startswith("0x") else normalized
+    canonical = canonical.lower()
+    scalar = int(canonical, 16)
+    if scalar == 0 or scalar >= _SECP256K1_ORDER:
+        raise ValueError("personal EVM private key is outside the secp256k1 scalar range")
+    return canonical
 
 
 def _http_endpoint(value: str) -> SplitResult | None:
@@ -76,15 +97,19 @@ class Settings(BaseSettings):
         extra="ignore",
         case_sensitive=False,
         populate_by_name=True,
+        hide_input_in_errors=True,
     )
 
     mode: TradingMode = TradingMode.PAPER
     component: Literal["all", "api", "worker"] = "all"
     worker_execution_model: Literal["single_account", "tenant_queue"] = "single_account"
+    personal_mode: bool = False
+    personal_auto_run: bool = True
+    personal_live_enabled: bool = False
     tenant_worker_max_concurrency: int = Field(default=4, ge=1, le=32)
     tenant_job_lease_seconds: int = Field(default=60, ge=10, le=300)
     tenant_job_poll_seconds: float = Field(default=1.0, gt=0, le=30)
-    account_id: str = "00000000-0000-0000-0000-000000000001"
+    account_id: str = DEFAULT_ACCOUNT_ID
     log_level: str = "INFO"
     api_host: str = "0.0.0.0"
     api_port: int = 8000
@@ -123,6 +148,9 @@ class Settings(BaseSettings):
     evidence_provider: Literal["auto", "openai_web", "gdelt", "none"] = "auto"
     forecast_model: str = "gpt-5.6-terra"
     critic_model: str = "gpt-5.6-sol"
+    ai_api_key: SecretStr | None = None
+    ai_base_url: str | None = None
+    ai_model: str | None = None
     openai_api_key: SecretStr | None = Field(
         default=None,
         validation_alias=AliasChoices("OPENAI_API_KEY", "POLYBOT_OPENAI_API_KEY"),
@@ -146,7 +174,12 @@ class Settings(BaseSettings):
 
     polymarket_private_key: SecretStr | None = Field(
         default=None,
-        validation_alias=AliasChoices("POLYMARKET_PRIVATE_KEY", "POLYBOT_PRIVATE_KEY"),
+        validation_alias=AliasChoices(
+            "POLYMARKET_PRIVATE_KEY",
+            "POLYBOT_PRIVATE_KEY",
+            "EVM_PRIVATE_KEY",
+            "POLYBOT_EVM_PRIVATE_KEY",
+        ),
     )
     polymarket_deposit_wallet: str | None = Field(
         default=None,
@@ -170,6 +203,63 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_live_configuration(self) -> Settings:
+        if self.personal_mode:
+            if (
+                not self.uses_supabase
+                or self.supabase_service_role_key is None
+                or not self.supabase_service_role_key.get_secret_value().strip()
+            ):
+                raise ValueError(
+                    "POLYBOT_PERSONAL_MODE requires both SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY"
+                )
+            endpoint = _http_endpoint(self.supabase_url or "")
+            if endpoint is None or endpoint.scheme.lower() != "https":
+                raise ValueError(
+                    "POLYBOT_PERSONAL_MODE requires SUPABASE_URL to be a valid HTTPS URL"
+                )
+            try:
+                personal_account_id = UUID(self.account_id)
+            except ValueError as exc:
+                raise ValueError(
+                    "POLYBOT_PERSONAL_MODE requires POLYBOT_ACCOUNT_ID to be the "
+                    "owner's Supabase Auth user UUID"
+                ) from exc
+            if personal_account_id.int == 0 or str(personal_account_id) == DEFAULT_ACCOUNT_ID:
+                raise ValueError(
+                    "POLYBOT_PERSONAL_MODE requires POLYBOT_ACCOUNT_ID to match "
+                    "the owner's real Supabase Auth user UUID"
+                )
+            if self.component != "all":
+                raise ValueError(
+                    "POLYBOT_PERSONAL_MODE requires POLYBOT_COMPONENT=all "
+                    "(use SERVICE_ROLE=personal in Docker)"
+                )
+            if self.worker_execution_model != "single_account":
+                raise ValueError(
+                    "POLYBOT_PERSONAL_MODE requires POLYBOT_WORKER_EXECUTION_MODEL=single_account"
+                )
+            if (
+                self.mode in {TradingMode.CANARY, TradingMode.LIVE}
+                and not self.personal_live_enabled
+            ):
+                raise ValueError("personal canary/live requires POLYBOT_PERSONAL_LIVE_ENABLED=true")
+            if self.polymarket_private_key is not None:
+                canonical_key = _canonical_evm_private_key(
+                    self.polymarket_private_key.get_secret_value()
+                )
+                self.polymarket_private_key = SecretStr("0x" + canonical_key)
+            if self.ai_model and self.ai_model.strip():
+                model = self.ai_model.strip()
+                self.forecast_model = model
+                self.critic_model = model
+            if self.ai_base_url and self.ai_base_url.strip():
+                self.litellm_base_url = self.ai_base_url.strip()
+                if self.ai_provider.lower() == "mock":
+                    self.ai_provider = "openai_compatible"
+            elif (
+                self.ai_api_key is not None or self.openai_api_key is not None
+            ) and self.ai_provider.lower() == "mock":
+                self.ai_provider = "openai"
         if self.component == "api":
             forbidden = {
                 "POLYMARKET_PRIVATE_KEY": self.polymarket_private_key,
@@ -178,6 +268,7 @@ class Settings(BaseSettings):
                 "POLYBOT_CREDENTIAL_PRIVATE_KEYS_JSON": (self.credential_private_keys_json),
                 "OPENAI_API_KEY": self.openai_api_key,
                 "LITELLM_API_KEY": self.litellm_api_key,
+                "POLYBOT_AI_API_KEY": self.ai_api_key,
             }
             exposed = [
                 name
@@ -190,7 +281,7 @@ class Settings(BaseSettings):
                 )
         if self.uses_supabase:
             try:
-                UUID(self.account_id)
+                self.account_id = str(UUID(self.account_id))
             except ValueError as exc:
                 raise ValueError("POLYBOT_ACCOUNT_ID must be a Supabase Auth UUID") from exc
         if self.credential_private_key_pem and self.credential_private_keys_json:
@@ -212,19 +303,28 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "POLYBOT_LITELLM_BASE_URL must be a safe public HTTPS endpoint"
                 ) from exc
+            if self.personal_mode and self.ai_base_url and not self.custom_ai_allowed_hosts.strip():
+                hostname = urlsplit(self.litellm_base_url).hostname
+                if hostname is None:
+                    raise ValueError("personal AI Base URL is missing a hostname")
+                self.custom_ai_allowed_hosts = hostname
         if self.mode in {TradingMode.CANARY, TradingMode.LIVE}:
             missing: list[str] = []
-            if self.live_ack != LIVE_ACK_TEXT:
-                missing.append("POLYBOT_LIVE_ACK")
-            if self.beta_sdk_ack != BETA_SDK_ACK_TEXT:
-                missing.append("POLYBOT_BETA_SDK_ACK")
+            if not self.personal_mode:
+                if self.live_ack != LIVE_ACK_TEXT:
+                    missing.append("POLYBOT_LIVE_ACK")
+                if self.beta_sdk_ack != BETA_SDK_ACK_TEXT:
+                    missing.append("POLYBOT_BETA_SDK_ACK")
             tenant_queue_worker = (
                 self.component == "worker" and self.worker_execution_model == "tenant_queue"
             )
             if self.component in {"all", "worker"}:
-                if self.dedicated_wallet_ack != DEDICATED_WALLET_ACK_TEXT:
+                if (
+                    not self.personal_mode
+                    and self.dedicated_wallet_ack != DEDICATED_WALLET_ACK_TEXT
+                ):
                     missing.append("POLYBOT_DEDICATED_WALLET_ACK")
-                if self.signed_payload_key is None:
+                if self.resolved_signed_payload_key is None:
                     missing.append("POLYBOT_SIGNED_PAYLOAD_KEY")
                 if tenant_queue_worker:
                     if (
@@ -244,11 +344,11 @@ class Settings(BaseSettings):
                     if provider == "mock":
                         missing.append("POLYBOT_AI_PROVIDER cannot be mock")
                     elif provider == "openai":
-                        if self.openai_api_key is None:
-                            missing.append("OPENAI_API_KEY")
+                        if self.effective_ai_api_key is None:
+                            missing.append("OPENAI_API_KEY/POLYBOT_AI_API_KEY")
                     elif provider in {"litellm", "openai_compatible"}:
-                        if self.litellm_api_key is None:
-                            missing.append("LITELLM_API_KEY")
+                        if self.effective_ai_api_key is None:
+                            missing.append("LITELLM_API_KEY/POLYBOT_AI_API_KEY")
                         if provider == "litellm":
                             endpoint = _http_endpoint(self.litellm_base_url)
                             if endpoint is None or endpoint.scheme.lower() != "https":
@@ -263,8 +363,8 @@ class Settings(BaseSettings):
                         and provider in {"litellm", "openai_compatible"}
                         else self.evidence_provider
                     )
-                    if evidence_name == "openai_web" and self.openai_api_key is None:
-                        missing.append("OPENAI_API_KEY for web evidence")
+                    if evidence_name == "openai_web" and self.effective_ai_api_key is None:
+                        missing.append("OPENAI_API_KEY/POLYBOT_AI_API_KEY for web evidence")
             if not self.uses_supabase:
                 missing.append("SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY")
             elif not self.supabase_url.lower().startswith("https://"):
@@ -284,6 +384,38 @@ class Settings(BaseSettings):
         """Rebuild settings through validation instead of Pydantic's unchecked model_copy."""
 
         return type(self).model_validate({**self.model_dump(), **updates})
+
+    @property
+    def effective_ai_api_key(self) -> SecretStr | None:
+        """Return the provider key while supporting the simple personal-mode alias."""
+
+        if self.ai_api_key is not None and self.ai_api_key.get_secret_value():
+            return self.ai_api_key
+        if self.ai_provider.lower() == "openai":
+            return self.openai_api_key or self.litellm_api_key
+        if self.ai_provider.lower() in {"litellm", "openai_compatible"}:
+            return self.litellm_api_key or self.openai_api_key
+        return None
+
+    @property
+    def resolved_signed_payload_key(self) -> SecretStr | None:
+        """Resolve the durable-order cipher key for a personal single-wallet runtime.
+
+        A dedicated configured key remains authoritative. Personal mode can derive a
+        stable, domain-separated Fernet key from its high-entropy wallet key so a
+        second deployment secret is not required. Changing the wallet invalidates
+        outstanding encrypted payloads and therefore still requires a clean handoff.
+        """
+
+        if self.signed_payload_key is not None and self.signed_payload_key.get_secret_value():
+            return self.signed_payload_key
+        if not self.personal_mode or self.polymarket_private_key is None:
+            return None
+        private_key = _canonical_evm_private_key(self.polymarket_private_key.get_secret_value())
+        digest = sha256(
+            b"polybot-personal-signed-payload:v1\x00" + private_key.encode("ascii")
+        ).digest()
+        return SecretStr(urlsafe_b64encode(digest).decode("ascii"))
 
     @property
     def uses_supabase(self) -> bool:

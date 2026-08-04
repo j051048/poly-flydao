@@ -55,11 +55,11 @@ async function probeHealth(path: string): Promise<HealthProbe> {
 
 async function probeCors(dashboardOrigin: string): Promise<CorsProbe> {
   try {
-    const response = await fetchWithTimeout("/v1/me/credentials/ai", {
+    const response = await fetchWithTimeout("/v1/personal/cycles/run", {
       method: "OPTIONS",
       headers: {
         Origin: dashboardOrigin,
-        "Access-Control-Request-Method": "PUT",
+        "Access-Control-Request-Method": "POST",
         "Access-Control-Request-Headers":
           "authorization,content-type,idempotency-key",
       },
@@ -80,7 +80,7 @@ async function probeCors(dashboardOrigin: string): Promise<CorsProbe> {
       status: null,
       ok: false,
       allowsOrigin: false,
-      allowsPut: false,
+      allowsPost: false,
       allowsAuthorization: false,
       allowsContentType: false,
       allowsIdempotencyKey: false,
@@ -100,7 +100,7 @@ export async function GET(request: NextRequest) {
     status: null,
     ok: false,
     allowsOrigin: false,
-    allowsPut: false,
+    allowsPost: false,
     allowsAuthorization: false,
     allowsContentType: false,
     allowsIdempotencyKey: false,

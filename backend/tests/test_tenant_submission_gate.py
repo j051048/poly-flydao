@@ -7,6 +7,7 @@ import pytest
 
 from polybot.config import TradingMode
 from polybot.stores.supabase_store import (
+    PersonalExecutionScope,
     SupabaseStore,
     TenantExecutionFence,
 )
@@ -88,6 +89,62 @@ async def test_tenant_submission_rejects_missing_control_or_false_scalar() -> No
             account_id,
             12,
             control_version=8,
+        )
+
+
+async def test_personal_scope_uses_atomic_personal_submission_rpc() -> None:
+    account_id = "33333333-3333-3333-3333-333333333333"
+    client = _Client()
+    store = SupabaseStore(
+        "https://example.supabase.co",
+        "service-role",
+        account_id=account_id,
+        client=client,  # type: ignore[arg-type]
+    )
+    store.bind_personal_execution_scope(
+        PersonalExecutionScope(owner_id="personal-worker-1", mode=TradingMode.CANARY)
+    )
+
+    await store.mark_order_submitting(
+        "intent-hash",
+        account_id,
+        17,
+        control_version=6,
+    )
+
+    name, params = client.calls[0]
+    assert name == "mark_personal_order_submitting"
+    assert params == {
+        "p_account_id": account_id,
+        "p_intent_hash": "intent-hash",
+        "p_owner_id": "personal-worker-1",
+        "p_worker_fencing_token": 17,
+        "p_control_version": 6,
+        "p_mode": "canary",
+    }
+
+
+async def test_personal_scope_fails_closed_without_control_or_when_rpc_rejects() -> None:
+    account_id = "33333333-3333-3333-3333-333333333333"
+    client = _Client([False])
+    store = SupabaseStore(
+        "https://example.supabase.co",
+        "service-role",
+        account_id=account_id,
+        client=client,  # type: ignore[arg-type]
+    )
+    store.bind_personal_execution_scope(
+        PersonalExecutionScope(owner_id="personal-worker-1", mode=TradingMode.LIVE)
+    )
+
+    with pytest.raises(RuntimeError, match="runtime-control version"):
+        await store.mark_order_submitting("intent-hash", account_id, 17)
+    with pytest.raises(RuntimeError, match="personal wallet"):
+        await store.mark_order_submitting(
+            "intent-hash",
+            account_id,
+            17,
+            control_version=6,
         )
 
 

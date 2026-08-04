@@ -2119,8 +2119,225 @@ footer {
   border: 2px solid #07130f;
 }
 
+.personal-mode-banner {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 18px;
+  margin-bottom: 16px;
+  padding: 20px;
+  border: 1px solid rgba(83, 242, 167, 0.22);
+  border-radius: var(--radius);
+  background:
+    radial-gradient(circle at 92% 8%, rgba(83, 242, 167, 0.12), transparent 17rem),
+    rgba(9, 27, 20, 0.78);
+  box-shadow: var(--shadow);
+}
+
+.personal-mode-banner h2 {
+  margin: 0 0 6px;
+  font-size: clamp(1.05rem, 2vw, 1.35rem);
+}
+
+.personal-mode-banner p {
+  max-width: 760px;
+  color: var(--muted);
+  font-size: 0.75rem;
+  line-height: 1.6;
+}
+
+.personal-mode-icon {
+  display: grid;
+  width: 46px;
+  height: 46px;
+  place-items: center;
+  border: 1px solid rgba(83, 242, 167, 0.3);
+  border-radius: 15px;
+  color: var(--green);
+  background: var(--green-soft);
+  font-size: 1rem;
+  font-weight: 900;
+}
+
+.personal-readiness-panel {
+  margin-bottom: 18px;
+}
+
+.personal-status-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.personal-status-grid article {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(3, 15, 11, 0.32);
+}
+
+.personal-status-grid article.ready {
+  border-color: rgba(83, 242, 167, 0.2);
+}
+
+.personal-status-grid article.missing {
+  border-color: rgba(255, 209, 102, 0.2);
+}
+
+.personal-status-grid article > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.personal-status-grid small {
+  color: var(--muted);
+  font-size: 0.61rem;
+}
+
+.personal-status-grid strong {
+  overflow: hidden;
+  color: #d8ebe2;
+  font-size: 0.72rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.personal-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--yellow);
+  box-shadow: 0 0 0 4px rgba(255, 209, 102, 0.08);
+}
+
+.personal-status-grid .ready .personal-status-dot {
+  background: var(--green);
+  box-shadow: 0 0 0 4px rgba(83, 242, 167, 0.08);
+}
+
+.personal-settings-grid > #environment {
+  grid-column: 1 / -1;
+}
+
+.env-setup-list {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.env-setup-list > article {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr);
+  align-content: start;
+  gap: 11px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: rgba(3, 13, 10, 0.34);
+}
+
+.env-setup-list h3 {
+  margin: 3px 0 9px;
+  font-size: 0.82rem;
+}
+
+.env-setup-list p {
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 0.67rem;
+  line-height: 1.55;
+}
+
+.env-variable-list {
+  display: grid;
+  gap: 5px;
+}
+
+.env-variable-list code {
+  display: block;
+  overflow-wrap: anywhere;
+  padding: 7px 8px;
+  border: 1px solid rgba(83, 242, 167, 0.13);
+  border-radius: 8px;
+  color: #bcebd1;
+  background: rgba(83, 242, 167, 0.045);
+  font-size: 0.62rem;
+}
+
+.personal-action-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 9px;
+  margin-top: 16px;
+}
+
+.account-id-callout {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid rgba(83, 242, 167, 0.18);
+  border-radius: 12px;
+  background: var(--green-soft);
+}
+
+.account-id-callout > div {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.account-id-callout span {
+  color: var(--muted);
+  font-size: 0.63rem;
+}
+
+.account-id-callout code {
+  overflow-wrap: anywhere;
+  color: #c6f5db;
+  font-size: 0.7rem;
+}
+
+.personal-mode-ladder div.current {
+  border-color: var(--green);
+  background: var(--green-soft);
+  box-shadow: 0 0 0 2px rgba(83, 242, 167, 0.06);
+}
+
+.personal-runtime-details {
+  margin-top: 17px;
+}
+
+.personal-runtime-details dd {
+  max-width: 62%;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.personal-risk-notice {
+  margin-top: 14px;
+}
+
 @media (max-width: 1100px) {
   .ai-quick-flow {
+    grid-template-columns: 1fr;
+  }
+
+  .personal-status-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .env-setup-list {
     grid-template-columns: 1fr;
   }
 }
@@ -2184,7 +2401,21 @@ footer {
 
   .onboarding-hero,
   .diagnostics-heading,
-  .getting-started-banner {
+  .getting-started-banner,
+  .personal-mode-banner {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .personal-mode-banner {
+    display: flex;
+  }
+
+  .personal-status-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .account-id-callout {
     align-items: flex-start;
     flex-direction: column;
   }

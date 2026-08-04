@@ -157,7 +157,7 @@ export default function AssetsPage() {
     <main className="page-shell">
       <header className="topbar">
         <div>
-          <p className="eyebrow">TENANT PORTFOLIO</p>
+          <p className="eyebrow">PERSONAL PORTFOLIO</p>
           <h1>个人资产</h1>
           <p className="muted">
             {portfolio?.mode === "paper"
@@ -209,7 +209,7 @@ export default function AssetsPage() {
           <div className="primary-value">
             {loading ? "读取中…" : percent(portfolio?.grossExposurePct)}
           </div>
-          <p className="muted">服务端按租户风控口径计算</p>
+          <p className="muted">服务端按个人风控口径计算</p>
         </article>
 
         <article className="summary-card">
@@ -245,7 +245,7 @@ export default function AssetsPage() {
         {loading ? (
           <div className="empty-state" aria-live="polite">
             <span aria-hidden="true">◌</span>
-            <p>正在读取该租户的仓位、订单和盈亏…</p>
+            <p>正在读取你的仓位、订单和盈亏…</p>
           </div>
         ) : portfolio && portfolio.positions.length > 0 ? (
           <div className="table-scroll">
@@ -281,7 +281,7 @@ export default function AssetsPage() {
         ) : (
           <div className="empty-state">
             <span aria-hidden="true">◎</span>
-            <p>{error ? "资产读取失败。" : "当前租户暂无开放仓位。"}</p>
+            <p>{error ? "资产读取失败。" : "当前暂无开放仓位。"}</p>
             <p>
               {portfolio?.mode === "paper"
                 ? "先运行一次 Paper 周期，模拟成交后会在这里显示。"

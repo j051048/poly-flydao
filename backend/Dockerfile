@@ -52,8 +52,7 @@ EXPOSE 8080
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 
-# The same immutable image is deployed twice on Zeabur. The public API is the
-# safe default. Set SERVICE_ROLE=worker only on the private, single-replica
-# worker service; polybot.worker must hold the database fencing lease before it
-# signs or submits an order.
-CMD ["sh", "-c", "umask 077; ulimit -c 0 2>/dev/null || true; case \"${SERVICE_ROLE:-api}\" in api) export POLYBOT_COMPONENT=api; exec uvicorn polybot.api:app --host 0.0.0.0 --port \"${PORT:-8080}\" --workers \"${WEB_CONCURRENCY:-1}\" --proxy-headers --forwarded-allow-ips \"${FORWARDED_ALLOW_IPS:-127.0.0.1}\" ;; worker) export POLYBOT_COMPONENT=worker; export POLYBOT_WORKER_EXECUTION_MODEL=tenant_queue; exec python -m polybot.worker ;; *) echo \"Invalid SERVICE_ROLE=${SERVICE_ROLE}; expected api or worker\" >&2; exit 64 ;; esac"]
+# The safe default remains the signer-free multi-tenant API. `personal` runs one
+# API process whose lifespan owns exactly one single-account worker; this keeps
+# one Zeabur service simple without permitting multiple signer replicas.
+CMD ["sh", "-c", "umask 077; ulimit -c 0 2>/dev/null || true; case \"${SERVICE_ROLE:-api}\" in api) export POLYBOT_COMPONENT=api; python -m polybot.config_check || exit $?; exec uvicorn polybot.api:app --host 0.0.0.0 --port \"${PORT:-8080}\" --workers \"${WEB_CONCURRENCY:-1}\" --proxy-headers --forwarded-allow-ips \"${FORWARDED_ALLOW_IPS:-127.0.0.1}\" ;; personal) export POLYBOT_COMPONENT=all; export POLYBOT_WORKER_EXECUTION_MODEL=single_account; export POLYBOT_PERSONAL_MODE=true; python -m polybot.config_check || exit $?; exec uvicorn polybot.api:app --host 0.0.0.0 --port \"${PORT:-8080}\" --workers 1 --proxy-headers --forwarded-allow-ips \"${FORWARDED_ALLOW_IPS:-127.0.0.1}\" ;; worker) export POLYBOT_COMPONENT=worker; export POLYBOT_WORKER_EXECUTION_MODEL=tenant_queue; python -m polybot.config_check || exit $?; exec python -m polybot.worker ;; *) echo \"Invalid SERVICE_ROLE=${SERVICE_ROLE}; expected api, personal, or worker\" >&2; exit 64 ;; esac"]

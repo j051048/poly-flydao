@@ -13,7 +13,7 @@ const NAV_ITEMS = [
   { name: "AI 分析", path: "/analysis" },
   { name: "效果校准", path: "/performance" },
   { name: "个人资产", path: "/assets" },
-  { name: "凭证与钱包", path: "/settings" },
+  { name: "个人设置", path: "/settings" },
 ];
 
 export default function Sidebar() {
@@ -82,7 +82,7 @@ export default function Sidebar() {
         ) : (
           <Link className="nav-link" href="/login">登录账户</Link>
         )}
-        <p className="muted">Poly-Flydao secure beta</p>
+        <p className="muted">Poly-Flydao personal beta</p>
       </div>
     </aside>
   );

@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 from datetime import timedelta
 from decimal import Decimal
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -389,8 +390,8 @@ class _AnalysisClient:
 
 @pytest.mark.asyncio
 async def test_supabase_health_requires_latest_schema_sentinel() -> None:
-    assert await SupabaseJobRepository(_HealthClient(15)).health()
-    assert not await SupabaseJobRepository(_HealthClient(14)).health()
+    assert await SupabaseJobRepository(_HealthClient(16)).health()
+    assert not await SupabaseJobRepository(_HealthClient(15)).health()
 
 
 @pytest.mark.asyncio
@@ -423,6 +424,53 @@ async def test_supabase_scalar_boolean_rpc_results_are_not_dropped() -> None:
         claimed_by="worker",
         fencing_token=1,
     )
+
+
+@pytest.mark.asyncio
+async def test_personal_live_portfolio_uses_mode_override_and_binding_fallback() -> None:
+    class Client:
+        def table(self, name: str) -> _AnalysisBuilder:
+            del name
+            return _AnalysisBuilder([], [])
+
+    repository = SupabaseJobRepository(Client())
+    repository._execute = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[
+            _Response([]),  # positions
+            _Response([]),  # orders
+            _Response([]),  # fills
+            _Response([]),  # risk state
+            _Response([]),  # tenant wallet
+            _Response([{"desired_mode": "paper"}]),
+            _Response([]),  # paper state
+            _Response(
+                [
+                    {
+                        "account_id": ACCOUNT,
+                        "deposit_wallet_address": "0x" + ("22" * 20),
+                        "signer_address": "0x" + ("11" * 20),
+                        "chain_id": 137,
+                        "collateral_token": "0x" + ("33" * 20),
+                        "binding_version": 4,
+                        "paused": False,
+                        "collateral_balance_pusd": "42.5",
+                        "allowances_ready": True,
+                        "readiness_checked_at": "2026-08-04T00:00:00Z",
+                        "updated_at": "2026-08-04T00:00:00Z",
+                    }
+                ]
+            ),
+        ]
+    )
+
+    result = await repository.portfolio(ACCOUNT, mode=TradingMode.LIVE)
+
+    assert result.mode is TradingMode.LIVE
+    assert result.wallet is not None
+    assert result.wallet["status"] == "active"
+    assert result.wallet["deposit_wallet_address"] == "0x" + ("22" * 20)
+    assert result.summary["cash_usd"] == "42.5"
+    assert result.summary["portfolio_value_usd"] == "42.5"
 
 
 def test_cycle_job_preserves_risk_policy_version_from_database_row() -> None:

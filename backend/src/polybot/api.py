@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
 import time
-from contextlib import asynccontextmanager
-from datetime import datetime
+from collections import OrderedDict
+from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from hashlib import sha256
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
@@ -66,7 +69,13 @@ from polybot.jobs import (
     WorkerStatusSnapshot,
     arm_expiry,
 )
+from polybot.models import utc_now
+from polybot.personal_execution import (
+    PersonalExecutionRepository,
+    PersonalRuntimeBinding,
+)
 from polybot.security_logging import configure_secure_logging, safe_json
+from polybot.worker import is_worker_ready, run_worker
 from supabase import create_client
 
 LOGGER = logging.getLogger(__name__)
@@ -79,6 +88,51 @@ _LEGACY_SECRET_HEADERS = frozenset(
     }
 )
 _IDEMPOTENCY_KEY = re.compile(r"^[A-Za-z0-9._:@+-]{16,128}$")
+
+
+@dataclass(frozen=True, slots=True)
+class PersonalCycleAcceptance:
+    request_id: str
+    mode: TradingMode
+
+
+class PersonalCycleIdempotencyConflict(ValueError):
+    pass
+
+
+class PersonalCycleRequestRegistry:
+    """Bounded process-local idempotency for manual personal worker wake-ups."""
+
+    def __init__(self, *, max_entries: int = 512) -> None:
+        if max_entries < 1:
+            raise ValueError("personal cycle registry must retain at least one request")
+        self._max_entries = max_entries
+        self._entries: OrderedDict[tuple[str, str], PersonalCycleAcceptance] = OrderedDict()
+        self._lock = asyncio.Lock()
+
+    async def accept(
+        self,
+        *,
+        account_id: str,
+        idempotency_key: str,
+        mode: TradingMode,
+    ) -> tuple[PersonalCycleAcceptance, bool]:
+        cache_key = (account_id, idempotency_key)
+        async with self._lock:
+            existing = self._entries.get(cache_key)
+            if existing is not None:
+                self._entries.move_to_end(cache_key)
+                if existing.mode is not mode:
+                    raise PersonalCycleIdempotencyConflict(
+                        "Idempotency-Key was already used with a different personal cycle input"
+                    )
+                return existing, False
+
+            accepted = PersonalCycleAcceptance(request_id=str(uuid4()), mode=mode)
+            self._entries[cache_key] = accepted
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+            return accepted, True
 
 
 class RequestRateLimiter:
@@ -134,6 +188,10 @@ class ArmRequest(BaseModel):
     expected_version: int = Field(ge=1)
 
 
+class PersonalCycleRequest(BaseModel):
+    mode: TradingMode
+
+
 class MeResponse(BaseModel):
     account_id: UUID
     aal: str
@@ -158,6 +216,51 @@ class PublicCredentialStatus(BaseModel):
     wallets: list[TradingWalletMetadata]
 
 
+class PersonalAIStatus(BaseModel):
+    configured: bool
+    provider: str
+    base_url: str | None
+    forecast_model: str
+    critic_model: str
+
+
+class PersonalWalletStatus(BaseModel):
+    configured: bool
+    address: str | None
+    bound: bool = False
+    signer_address: str | None = None
+    chain_id: int | None = None
+    collateral_token: str | None = None
+    binding_version: int | None = None
+    paused: bool = False
+    collateral_balance_pusd: str | None = None
+    allowances_ready: bool = False
+    readiness_checked_at: datetime | None = None
+
+
+class PersonalCycleStatus(BaseModel):
+    id: str
+    state: Literal["running", "succeeded", "failed"]
+    started_at: datetime
+    completed_at: datetime | None = None
+    message: str
+    result_summary: dict[str, object] | None = None
+
+
+class PersonalStatusResponse(BaseModel):
+    enabled: bool
+    live_supported: bool
+    mode: TradingMode
+    auto_run_enabled: bool
+    worker_execution_model: str
+    worker_ready: bool
+    ready: bool
+    cycle_count: int
+    last_cycle: PersonalCycleStatus | None = None
+    ai: PersonalAIStatus
+    wallet: PersonalWalletStatus
+
+
 class ControlPlaneUnavailable(RuntimeError):
     pass
 
@@ -177,6 +280,93 @@ class DisabledControlPlane:
             raise ControlPlaneUnavailable(self.reason)
 
         return unavailable
+
+
+def _personal_status(
+    settings: Settings,
+    *,
+    binding: PersonalRuntimeBinding | None = None,
+    cycle_count: int = 0,
+    last_cycle: dict[str, object] | None = None,
+) -> PersonalStatusResponse:
+    provider = settings.ai_provider.lower()
+    ai_configured = provider != "mock" and settings.effective_ai_api_key is not None
+    wallet_configured = settings.polymarket_private_key is not None
+    base_url = settings.litellm_base_url if provider in {"litellm", "openai_compatible"} else None
+    worker_ready = settings.personal_mode and is_worker_ready()
+    real_money = settings.mode in {TradingMode.CANARY, TradingMode.LIVE}
+    readiness_fresh = bool(
+        binding is not None
+        and binding.readiness_checked_at is not None
+        and binding.readiness_checked_at >= utc_now() - timedelta(minutes=15)
+    )
+    live_wallet_ready = bool(
+        binding is not None
+        and not binding.paused
+        and binding.allowances_ready
+        and binding.collateral_balance_pusd is not None
+        and binding.collateral_balance_pusd > 0
+        and readiness_fresh
+    )
+    credentials_ready = ai_configured and (
+        wallet_configured and live_wallet_ready if real_money else True
+    )
+    return PersonalStatusResponse(
+        enabled=settings.personal_mode,
+        live_supported=settings.personal_live_enabled,
+        mode=settings.mode,
+        auto_run_enabled=settings.personal_mode and settings.personal_auto_run,
+        worker_execution_model=settings.worker_execution_model,
+        worker_ready=worker_ready,
+        ready=worker_ready and credentials_ready,
+        cycle_count=cycle_count,
+        last_cycle=(
+            PersonalCycleStatus.model_validate(last_cycle) if last_cycle is not None else None
+        ),
+        ai=PersonalAIStatus(
+            configured=ai_configured,
+            provider=provider,
+            base_url=base_url,
+            forecast_model=settings.forecast_model,
+            critic_model=settings.critic_model,
+        ),
+        wallet=PersonalWalletStatus(
+            configured=wallet_configured,
+            address=(
+                binding.deposit_wallet_address
+                if binding is not None
+                else settings.polymarket_deposit_wallet
+            ),
+            bound=binding is not None,
+            signer_address=binding.signer_address if binding is not None else None,
+            chain_id=binding.chain_id if binding is not None else None,
+            collateral_token=binding.collateral_token if binding is not None else None,
+            binding_version=(binding.binding_version if binding is not None else None),
+            paused=binding.paused if binding is not None else False,
+            collateral_balance_pusd=(
+                str(binding.collateral_balance_pusd)
+                if binding is not None and binding.collateral_balance_pusd is not None
+                else None
+            ),
+            allowances_ready=(binding.allowances_ready if binding is not None else False),
+            readiness_checked_at=(binding.readiness_checked_at if binding is not None else None),
+        ),
+    )
+
+
+def _record_personal_cycle(
+    application: FastAPI,
+    snapshot: dict[str, object],
+) -> None:
+    previous = application.state.personal_last_cycle
+    state = snapshot.get("state")
+    if state in {"succeeded", "failed"} and (
+        not isinstance(previous, dict)
+        or previous.get("id") != snapshot.get("id")
+        or previous.get("state") == "running"
+    ):
+        application.state.personal_cycle_count += 1
+    application.state.personal_last_cycle = snapshot
 
 
 def _build_verifier(settings: Settings) -> TokenVerifier | None:
@@ -267,13 +457,20 @@ async def current_principal(
             "Supabase authentication is not configured",
         )
     try:
-        return await verifier.verify(token)
+        principal = await verifier.verify(token)
     except JWTVerificationError as exc:
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED,
             "invalid access token",
             headers={"WWW-Authenticate": "Bearer"},
         ) from exc
+    settings: Settings = request.app.state.settings
+    if settings.personal_mode and principal.account_id != settings.account_id:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "this personal deployment is bound to a different Supabase account",
+        )
+    return principal
 
 
 PrincipalDep = Annotated[AuthPrincipal, Depends(current_principal)]
@@ -324,6 +521,7 @@ def create_app(
     jobs: JobRepository | None = None,
     credentials: CredentialRepository | None = None,
     credential_writer: CredentialService | None = None,
+    personal_execution: PersonalExecutionRepository | None = None,
 ) -> FastAPI:
     api_settings = settings or get_settings()
     default_jobs: JobRepository
@@ -334,25 +532,61 @@ def create_app(
         default_jobs, default_credentials = jobs, credentials
     selected_jobs = jobs or default_jobs
     selected_credentials = credentials or default_credentials
+    selected_personal_execution = personal_execution
+    if (
+        selected_personal_execution is None
+        and api_settings.personal_mode
+        and api_settings.uses_supabase
+    ):
+        assert api_settings.supabase_url is not None
+        assert api_settings.supabase_service_role_key is not None
+        personal_client = create_client(
+            api_settings.supabase_url,
+            api_settings.supabase_service_role_key.get_secret_value(),
+        )
+        selected_personal_execution = PersonalExecutionRepository(
+            personal_client,
+            api_settings.account_id,
+        )
     credential_error: str | None = None
     if credential_writer is None:
-        credential_writer, credential_error = _build_credential_service(selected_credentials)
+        if not api_settings.personal_mode:
+            credential_writer, credential_error = _build_credential_service(selected_credentials)
     selected_verifier = auth_verifier or _build_verifier(api_settings)
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         configure_secure_logging(api_settings.log_level)
-        forbidden_api_secrets = {
+        personal_worker_stop = asyncio.Event()
+        personal_cycle_trigger = asyncio.Event()
+        personal_worker_task: asyncio.Task[None] | None = None
+        application.state.personal_worker_task = None
+        application.state.personal_cycle_trigger = personal_cycle_trigger
+        application.state.personal_cycle_requests = PersonalCycleRequestRegistry()
+        application.state.personal_cycle_count = 0
+        application.state.personal_last_cycle = None
+        worker_secrets = {
             "polymarket_private_key": api_settings.polymarket_private_key,
             "signed_payload_key": api_settings.signed_payload_key,
             "openai_api_key": api_settings.openai_api_key,
             "litellm_api_key": api_settings.litellm_api_key,
+            "ai_api_key": api_settings.ai_api_key,
+        }
+        tenant_decryption_secrets = {
             "credential_private_key": os.getenv("POLYBOT_CREDENTIAL_PRIVATE_KEY_PEM"),
             "credential_private_keyring": os.getenv("POLYBOT_CREDENTIAL_PRIVATE_KEYS_JSON"),
             "credential_symmetric_key": os.getenv("POLYBOT_CREDENTIAL_MASTER_KEY"),
         }
-        present = [name for name, value in forbidden_api_secrets.items() if value]
-        if present:
+        tenant_decryption_present = [
+            name for name, value in tenant_decryption_secrets.items() if value
+        ]
+        if tenant_decryption_present:
+            raise RuntimeError(
+                "the API process received tenant decryption material: "
+                + ", ".join(tenant_decryption_present)
+            )
+        present = [name for name, value in worker_secrets.items() if value]
+        if present and not api_settings.personal_mode:
             raise RuntimeError(
                 "the public API process received worker-only secret material: " + ", ".join(present)
             )
@@ -365,17 +599,58 @@ def create_app(
                     }
                 )
             )
+        if api_settings.personal_mode and api_settings.personal_auto_run:
+            personal_worker_task = asyncio.create_task(
+                run_worker(
+                    settings=api_settings,
+                    stop_event=personal_worker_stop,
+                    cycle_trigger=personal_cycle_trigger,
+                    cycle_observer=lambda snapshot: _record_personal_cycle(
+                        application,
+                        snapshot,
+                    ),
+                    install_signal_handlers=False,
+                ),
+                name="polybot-personal-worker",
+            )
+
+            def observe_personal_worker(task: asyncio.Task[None]) -> None:
+                if task.cancelled():
+                    return
+                error = task.exception()
+                if error is not None:
+                    LOGGER.critical(
+                        "personal worker exited unexpectedly",
+                        exc_info=(type(error), error, error.__traceback__),
+                    )
+
+            personal_worker_task.add_done_callback(observe_personal_worker)
+            application.state.personal_worker_task = personal_worker_task
         try:
             yield
         finally:
+            personal_worker_stop.set()
+            if personal_worker_task is not None:
+                with suppress(asyncio.CancelledError, Exception):
+                    await personal_worker_task
+            application.state.personal_worker_task = None
+            application.state.personal_cycle_trigger = None
             verifier: TokenVerifier | None = application.state.auth_verifier
             if verifier is not None:
                 await verifier.close()
 
     application = FastAPI(
-        title="Polybot Tenant Control API",
-        version="0.2.0",
-        description="JWT-scoped, queue-only Polymarket automation control plane.",
+        title=(
+            "Polybot Personal Control API"
+            if api_settings.personal_mode
+            else "Polybot Tenant Control API"
+        ),
+        version="0.3.0",
+        description=(
+            "Owner-scoped personal Polymarket automation service."
+            if api_settings.personal_mode
+            else "JWT-scoped, queue-only Polymarket automation control plane."
+        ),
         lifespan=lifespan,
     )
     application.state.settings = api_settings
@@ -383,7 +658,13 @@ def create_app(
     application.state.job_repository = selected_jobs
     application.state.credential_repository = selected_credentials
     application.state.credential_service = credential_writer
+    application.state.personal_execution = selected_personal_execution
     application.state.rate_limiter = RequestRateLimiter()
+    application.state.personal_cycle_trigger = None
+    application.state.personal_worker_task = None
+    application.state.personal_cycle_requests = PersonalCycleRequestRegistry()
+    application.state.personal_cycle_count = 0
+    application.state.personal_last_cycle = None
 
     @application.middleware("http")
     async def reject_legacy_secret_transport(
@@ -401,6 +682,7 @@ def create_app(
                     "/v1/me/risk-policy",
                     "/v1/control",
                     "/v1/jobs/cycles",
+                    "/v1/personal",
                 )
             )
             limit = 30 if sensitive else 240 if request.url.path.startswith("/v1/") else 120
@@ -441,6 +723,7 @@ def create_app(
                 "/v1/jobs",
                 "/v1/control",
                 "/v1/worker",
+                "/v1/personal",
             )
         ):
             response.headers["Cache-Control"] = "no-store"
@@ -564,12 +847,39 @@ def create_app(
 
     @application.get("/worker-health")
     async def public_worker_health(repo: JobRepositoryDep) -> JSONResponse:
+        if api_settings.personal_mode:
+            ready = is_worker_ready()
+            return JSONResponse(
+                status_code=200 if ready else 503,
+                content={"ok": ready},
+                headers={"Cache-Control": "no-store"},
+            )
         snapshot = await repo.worker_status()
         ready = snapshot.online and snapshot.ready
         return JSONResponse(
             status_code=200 if ready else 503,
             content={"ok": ready},
             headers={"Cache-Control": "no-store"},
+        )
+
+    @application.get("/v1/personal/status", response_model=PersonalStatusResponse)
+    @application.get(
+        "/v1/personal-status",
+        response_model=PersonalStatusResponse,
+        include_in_schema=False,
+    )
+    async def personal_status(principal: PrincipalDep) -> PersonalStatusResponse:
+        del principal
+        binding = (
+            await selected_personal_execution.get_binding()
+            if selected_personal_execution is not None
+            else None
+        )
+        return _personal_status(
+            api_settings,
+            binding=binding,
+            cycle_count=application.state.personal_cycle_count,
+            last_cycle=application.state.personal_last_cycle,
         )
 
     @application.get("/v1/me", response_model=MeResponse)
@@ -580,7 +890,7 @@ def create_app(
             aal=principal.aal,
             runtime_profile=profile,
             capabilities={
-                "wallet_import": True,
+                "wallet_import": not api_settings.personal_mode,
                 "wallet_provisioning": False,
                 "automatic_cycles": True,
             },
@@ -779,7 +1089,10 @@ def create_app(
         principal: PrincipalDep,
         repo: JobRepositoryDep,
     ) -> PortfolioSnapshot:
-        return await repo.portfolio(principal.account_id)
+        return await repo.portfolio(
+            principal.account_id,
+            mode=api_settings.mode if api_settings.personal_mode else None,
+        )
 
     @application.get("/v1/me/notifications")
     async def list_notifications(
@@ -868,6 +1181,11 @@ def create_app(
         repo: JobRepositoryDep,
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ) -> CycleJob:
+        if api_settings.personal_mode:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "personal mode does not consume tenant jobs; use /v1/personal/cycles/run",
+            )
         if idempotency_key is None or not _IDEMPOTENCY_KEY.fullmatch(idempotency_key):
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -883,6 +1201,71 @@ def create_app(
             idempotency_key=idempotency_key,
             request=body,
         )
+
+    @application.post("/v1/personal/cycles/run", status_code=status.HTTP_202_ACCEPTED)
+    async def run_personal_cycle(
+        body: PersonalCycleRequest,
+        principal: PrincipalDep,
+        idempotency_key: Annotated[
+            str | None,
+            Header(alias="Idempotency-Key"),
+        ] = None,
+    ) -> dict[str, object]:
+        if not api_settings.personal_mode:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "personal mode is not enabled")
+        if idempotency_key is None or not _IDEMPOTENCY_KEY.fullmatch(idempotency_key):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "Idempotency-Key must contain 16-128 safe characters",
+            )
+        if not api_settings.personal_auto_run:
+            raise HTTPException(status.HTTP_409_CONFLICT, "personal worker is disabled")
+        if body.mode is not api_settings.mode:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "requested cycle mode does not match this deployment",
+            )
+        if api_settings.mode in {TradingMode.CANARY, TradingMode.LIVE}:
+            if selected_personal_execution is None:
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "personal live execution storage is unavailable",
+                )
+            binding = await selected_personal_execution.get_binding()
+            if binding is None:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "personal wallet has not been bound by the worker",
+                )
+            if binding.paused:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "personal live execution is paused; resume it first",
+                )
+        if not is_worker_ready():
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "personal worker is not ready")
+        cycle_trigger: asyncio.Event | None = application.state.personal_cycle_trigger
+        if cycle_trigger is None:
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "personal worker is starting")
+        cycle_requests: PersonalCycleRequestRegistry = application.state.personal_cycle_requests
+        try:
+            accepted, is_new = await cycle_requests.accept(
+                account_id=principal.account_id,
+                idempotency_key=idempotency_key,
+                mode=body.mode,
+            )
+        except PersonalCycleIdempotencyConflict as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        if is_new:
+            cycle_trigger.set()
+        return {
+            "accepted": True,
+            "id": accepted.request_id,
+            "request_id": accepted.request_id,
+            "mode": api_settings.mode.value,
+            "worker_ready": True,
+            "coalesced": not is_new,
+        }
 
     @application.get("/v1/jobs/{job_id}", response_model=CycleJob)
     async def get_cycle_job(
@@ -902,22 +1285,76 @@ def create_app(
     ) -> dict[str, object]:
         control = await repo.get_runtime_control(principal.account_id)
         profile = await repo.get_or_create_profile(principal.account_id)
-        risk = await repo.get_active_risk_policy(principal.account_id)
+        risk = (
+            None
+            if api_settings.personal_mode
+            else await repo.get_active_risk_policy(principal.account_id)
+        )
         latest_job_getter = getattr(repo, "get_latest_job", None)
         latest_job = (
             await latest_job_getter(account_id=principal.account_id)
             if callable(latest_job_getter)
             else None
         )
+        personal_snapshot = (
+            _personal_status(
+                api_settings,
+                binding=(
+                    await selected_personal_execution.get_binding()
+                    if selected_personal_execution is not None
+                    else None
+                ),
+                cycle_count=application.state.personal_cycle_count,
+                last_cycle=application.state.personal_last_cycle,
+            )
+            if api_settings.personal_mode
+            else None
+        )
+        profile_payload = profile.model_dump(mode="json")
+        if api_settings.personal_mode:
+            profile_payload.update(
+                {
+                    "ai_provider": api_settings.ai_provider,
+                    "ai_base_url": personal_snapshot.ai.base_url,
+                    "forecast_model": api_settings.forecast_model,
+                    "desired_mode": api_settings.mode.value,
+                    "auto_run_enabled": api_settings.personal_auto_run,
+                    "cycle_interval_seconds": api_settings.scan_interval_seconds,
+                }
+            )
         return {
             "account_id": principal.account_id,
-            "mode": profile.desired_mode.value,
-            "ai_provider": profile.ai_provider.value,
-            "forecast_model": profile.forecast_model,
+            "mode": (
+                api_settings.mode.value
+                if api_settings.personal_mode
+                else profile.desired_mode.value
+            ),
+            "ai_provider": (
+                api_settings.ai_provider
+                if api_settings.personal_mode
+                else profile.ai_provider.value
+            ),
+            "forecast_model": (
+                api_settings.forecast_model
+                if api_settings.personal_mode
+                else profile.forecast_model
+            ),
             "control": control.model_dump(mode="json"),
-            "runtime_profile": profile.model_dump(mode="json"),
+            "runtime_profile": profile_payload,
             "risk_limits": (
                 {
+                    "version": None,
+                    "min_edge": str(api_settings.min_edge),
+                    "max_order_usd": str(api_settings.max_order_usd),
+                    "max_trade_risk_pct": str(api_settings.max_trade_risk_pct),
+                    "max_event_exposure_pct": str(api_settings.max_event_exposure_pct),
+                    "max_bucket_exposure_pct": str(api_settings.max_bucket_exposure_pct),
+                    "max_gross_exposure_pct": str(api_settings.max_gross_exposure_pct),
+                    "daily_loss_limit_pct": str(api_settings.daily_loss_limit_pct),
+                    "max_drawdown_pct": str(api_settings.max_drawdown_pct),
+                }
+                if api_settings.personal_mode
+                else {
                     "version": risk.version,
                     "min_edge": str(risk.min_edge),
                     "max_order_usd": str(risk.max_order_usd),
@@ -931,20 +1368,81 @@ def create_app(
                 if risk
                 else None
             ),
-            "latest_job": (latest_job.model_dump(mode="json") if latest_job is not None else None),
-            "execution": "leased_worker_only",
+            "latest_job": (
+                {
+                    "id": personal_snapshot.last_cycle.id,
+                    "mode": api_settings.mode.value,
+                    "status": personal_snapshot.last_cycle.state,
+                    "created_at": personal_snapshot.last_cycle.started_at.isoformat(),
+                    "started_at": personal_snapshot.last_cycle.started_at.isoformat(),
+                    "completed_at": (
+                        personal_snapshot.last_cycle.completed_at.isoformat()
+                        if personal_snapshot.last_cycle.completed_at is not None
+                        else None
+                    ),
+                    "message": personal_snapshot.last_cycle.message,
+                    "result_summary": personal_snapshot.last_cycle.result_summary,
+                }
+                if personal_snapshot is not None and personal_snapshot.last_cycle is not None
+                else None
+                if personal_snapshot is not None
+                else latest_job.model_dump(mode="json")
+                if latest_job is not None
+                else None
+            ),
+            "execution": (
+                "personal_single_account_worker"
+                if api_settings.personal_mode
+                else "leased_worker_only"
+            ),
+            "personal": (
+                personal_snapshot.model_dump(mode="json") if personal_snapshot is not None else None
+            ),
         }
 
     @application.post("/v1/control/arm")
     async def arm(
         body: ArmRequest,
-        principal: AAL2PrincipalDep,
+        principal: PrincipalDep,
         repo: JobRepositoryDep,
     ) -> dict[str, object]:
         if body.mode not in {TradingMode.CANARY, TradingMode.LIVE}:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
                 "only canary/live controls can be armed",
+            )
+        if api_settings.personal_mode:
+            if not api_settings.personal_live_enabled or body.mode is not api_settings.mode:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "the requested mode is not enabled for this personal deployment",
+                )
+            if selected_personal_execution is None:
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "personal live execution storage is unavailable",
+                )
+            resumed = await selected_personal_execution.resume(
+                expected_version=body.expected_version
+            )
+            if resumed is None:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "runtime control changed concurrently or the personal wallet is not bound; "
+                    "refresh before resuming",
+                )
+            cycle_trigger: asyncio.Event | None = application.state.personal_cycle_trigger
+            if cycle_trigger is not None:
+                cycle_trigger.set()
+            return {
+                **resumed.model_dump(mode="json"),
+                "paused": False,
+                "resume_requested": True,
+            }
+        if not principal.is_aal2:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "AAL2 or recent MFA verification is required",
             )
         saved = await repo.arm(
             account_id=principal.account_id,
@@ -967,6 +1465,28 @@ def create_app(
         principal: PrincipalDep,
         repo: JobRepositoryDep,
     ) -> dict[str, object]:
+        if api_settings.personal_mode:
+            if selected_personal_execution is None:
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "personal live execution storage is unavailable",
+                )
+            binding = await selected_personal_execution.set_paused(True)
+            if binding is None:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "personal wallet has not been bound by the worker",
+                )
+            current = await selected_personal_execution.get_runtime_control()
+            cycle_trigger: asyncio.Event | None = application.state.personal_cycle_trigger
+            if cycle_trigger is not None:
+                cycle_trigger.set()
+            return {
+                **current.model_dump(mode="json"),
+                "paused": True,
+                "cancellation_verified": False,
+                "cancellation_pending_worker": current.cancellation_pending,
+            }
         current = await repo.get_runtime_control(principal.account_id)
         saved = await repo.disarm(
             account_id=principal.account_id,

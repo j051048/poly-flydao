@@ -5,8 +5,11 @@
   "deploy": {
     "env": {
       "PORT": "8080",
-      "SERVICE_ROLE": "api",
-      "WEB_CONCURRENCY": "1"
+      "SERVICE_ROLE": "personal",
+      "WEB_CONCURRENCY": "1",
+      "POLYBOT_MODE": "paper",
+      "POLYBOT_PERSONAL_AUTO_RUN": "true",
+      "POLYBOT_PERSONAL_LIVE_ENABLED": "false"
     }
   }
 }

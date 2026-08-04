@@ -264,7 +264,11 @@ class JobRepository(Protocol):
 
     async def assert_live_ready(self, account_id: str) -> None: ...
 
-    async def portfolio(self, account_id: str) -> PortfolioSnapshot: ...
+    async def portfolio(
+        self,
+        account_id: str,
+        mode: TradingMode | None = None,
+    ) -> PortfolioSnapshot: ...
 
     async def recent_analysis(
         self,
@@ -569,7 +573,7 @@ class SupabaseJobRepository:
                     "polybot_schema_version",
                     version_data.get("version"),
                 )
-            return version_data == 15
+            return version_data == 16
         except Exception:
             return False
 
@@ -775,7 +779,11 @@ class SupabaseJobRepository:
                 "active AI credential, verified wallet, and risk policy are required"
             )
 
-    async def portfolio(self, account_id: str) -> PortfolioSnapshot:
+    async def portfolio(
+        self,
+        account_id: str,
+        mode: TradingMode | None = None,
+    ) -> PortfolioSnapshot:
         (
             positions_response,
             orders_response,
@@ -881,6 +889,35 @@ class SupabaseJobRepository:
         if not isinstance(paper_state, dict):
             paper_state = {}
 
+        personal_binding: dict[str, Any] | None = None
+        if mode in {TradingMode.CANARY, TradingMode.LIVE}:
+            personal_response = await self._execute(
+                self._client.table("personal_runtime_bindings")
+                .select(
+                    "account_id,deposit_wallet_address,signer_address,chain_id,"
+                    "collateral_token,binding_version,paused,collateral_balance_pusd,"
+                    "allowances_ready,readiness_checked_at,updated_at"
+                )
+                .eq("account_id", account_id)
+                .limit(1)
+            )
+            personal_binding = self._first(personal_response)
+            if wallet is None and personal_binding is not None:
+                wallet = {
+                    "id": f"personal:{account_id}",
+                    "label": "Environment wallet",
+                    "deposit_wallet_address": personal_binding.get("deposit_wallet_address"),
+                    "signer_address": personal_binding.get("signer_address"),
+                    "chain_id": personal_binding.get("chain_id"),
+                    "collateral_token": personal_binding.get("collateral_token"),
+                    "status": ("paused" if personal_binding.get("paused") else "active"),
+                    "version": personal_binding.get("binding_version"),
+                    "collateral_balance_pusd": personal_binding.get("collateral_balance_pusd"),
+                    "allowances_ready": personal_binding.get("allowances_ready", False),
+                    "readiness_checked_at": personal_binding.get("readiness_checked_at"),
+                    "updated_at": personal_binding.get("updated_at"),
+                }
+
         for position in positions:
             market = position.pop("markets", None)
             if isinstance(market, dict):
@@ -953,6 +990,8 @@ class SupabaseJobRepository:
             Decimal("0"),
         )
         wallet_cash = _decimal_or_none(wallet.get("collateral_balance_pusd")) if wallet else None
+        if wallet_cash is None and personal_binding is not None:
+            wallet_cash = _decimal_or_none(personal_binding.get("collateral_balance_pusd"))
         live_equity = _decimal_or_none(risk_state.get("latest_equity_pusd"))
         if live_equity is None and wallet_cash is not None:
             live_equity = wallet_cash + live_position_value
@@ -1004,10 +1043,11 @@ class SupabaseJobRepository:
             "pnl_usd": _decimal_text(paper_realized),
             "updated_at": paper_row.get("updated_at"),
         }
-        try:
-            mode = TradingMode(str(profile.get("desired_mode") or "paper"))
-        except ValueError:
-            mode = TradingMode.PAPER
+        if mode is None:
+            try:
+                mode = TradingMode(str(profile.get("desired_mode") or "paper"))
+            except ValueError:
+                mode = TradingMode.PAPER
         shadow_summary: dict[str, Any] = {
             "position_count": 0,
             "open_order_count": 0,
@@ -1995,7 +2035,11 @@ class InMemoryJobRepository:
                 "active tenant AI credential, verified wallet, and risk policy are required"
             )
 
-    async def portfolio(self, account_id: str) -> PortfolioSnapshot:
+    async def portfolio(
+        self,
+        account_id: str,
+        mode: TradingMode | None = None,
+    ) -> PortfolioSnapshot:
         profile = await self.get_or_create_profile(account_id)
         state = self._paper_states.get(account_id, {})
         cash = _decimal_or_none(state.get("cash"))
@@ -2029,7 +2073,7 @@ class InMemoryJobRepository:
                 "unrealized_pnl_usd": "0" if equity is not None else None,
                 "pnl_usd": state.get("realized_pnl"),
             },
-            mode=profile.desired_mode,
+            mode=mode or profile.desired_mode,
         )
 
     async def recent_analysis(

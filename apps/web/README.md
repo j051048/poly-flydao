@@ -1,53 +1,43 @@
 # Polybot Web Console
 
-Next.js control plane for the tenant-scoped Zeabur backend. The browser never
-persists or repeatedly forwards AI keys or wallet private keys.
+Next.js owner console for the personal single-account backend. The browser logs in with Supabase Auth and reads sanitized runtime status; it never asks for, stores or forwards an AI API Key or EVM private key.
 
 ## Vercel environment
 
-Copy `.env.example` and configure:
+Copy `.env.example` and configure only:
 
-- `NEXT_PUBLIC_API_BASE_URL`: HTTPS Zeabur API origin.
-- `NEXT_PUBLIC_SUPABASE_URL`: public Supabase project URL.
-- `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`: public publishable key. The legacy
-  anon key variable is also supported.
+- `NEXT_PUBLIC_API_BASE_URL`：一个 Zeabur `SERVICE_ROLE=personal` 服务的 HTTPS origin；
+- `NEXT_PUBLIC_SUPABASE_URL`：Supabase project URL；
+- `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`：公开 publishable key。旧项目也支持 `NEXT_PUBLIC_SUPABASE_ANON_KEY`。
 
-Do not add the Supabase service-role key, AI provider keys, EVM keys, seed
-phrases, CLOB credentials, or shared administrator tokens to Vercel.
+不要把 Supabase service-role key、AI Key、EVM 私钥、seed phrase、CLOB credential、`PASSWORD`、admin token 或 credential RSA/fingerprint key 放入 Vercel。
 
-Add these URLs to the Supabase Auth redirect allow-list:
+Supabase Auth 回调白名单应包含：
 
 ```text
 http://localhost:3000/auth/callback
 https://YOUR_VERCEL_DOMAIN/auth/callback
 ```
 
-When the two Supabase public variables are absent, production builds still
-succeed and the registration/login forms show a disabled configuration notice.
-`/diagnostics` remains publicly accessible and reports only safe boolean
-connectivity results; it never returns configured values or secrets. After
-login, `/setup` guides the user through MFA, AI, a Paper run, safe automation,
-and only then the optional dedicated Canary wallet.
-`/analysis` turns the tenant-scoped forecast/evidence ledger into a readable
-probability, uncertainty, counter-evidence, invalidation, and source view.
+在 Supabase Dashboard 创建唯一 owner 后关闭公开注册，并把该用户的 Auth UUID 配置为 Zeabur 的 `POLYBOT_ACCOUNT_ID`。个人版不要求在前端绑定 MFA，因为前端没有保存 AI/EVM 秘密的接口。
 
-## Session and API boundary
+缺少 Supabase 公共变量时，生产构建仍可成功，但登录会显示“Auth 未配置”并 fail closed。`/diagnostics` 只返回安全的连通性/就绪状态，不返回任何环境变量值或秘密。
 
-The middleware calls `supabase.auth.getUser()` and writes refreshed auth cookies
-before protected pages render. Browser API calls obtain the current Supabase
-session and send only:
+## 会话与 API 边界
+
+Middleware 通过 `supabase.auth.getUser()` 校验并刷新会话。受保护页面调用 Zeabur 时只发送：
 
 ```text
 Authorization: Bearer <Supabase JWT>
 Content-Type: application/json
-Idempotency-Key: <random UUID>  # mutating jobs/actions
+Idempotency-Key: <random UUID>  # 状态变更操作
 ```
 
-The old `polybot_settings` local-storage item is deleted without being read.
-Secrets submitted from the credential page live in React memory until the
-one-time HTTPS request completes, then the input state is cleared.
+后端还会校验 JWT `sub` 必须等于 Zeabur 的 `POLYBOT_ACCOUNT_ID`。浏览器不能选择或覆盖账户 ID。
 
-## Verification
+配置中心只显示：AI provider/model/Base URL、AI 是否就绪、钱包公开地址、模式、自动周期和 Worker 状态。更换 Key、模型、Base URL 或私钥必须在 Zeabur 环境变量中完成并重新部署。
+
+## 验证
 
 ```bash
 npm ci
@@ -55,5 +45,4 @@ npm test
 npm run build
 ```
 
-The build is intentionally verified both without Supabase variables and with
-syntactically valid public test values.
+建议分别在无 Supabase 变量和合法公开测试变量下运行生产构建，确保配置缺失只禁用认证，不会阻断 Vercel 构建。

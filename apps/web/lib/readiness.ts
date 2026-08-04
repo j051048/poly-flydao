@@ -1,19 +1,19 @@
+import { parsePersonalRuntimeStatus } from "./personal-runtime";
+
 export type SetupStepState = "done" | "todo" | "working" | "blocked";
 
 export interface SetupStep {
-  key: "infrastructure" | "mfa" | "ai" | "paper" | "wallet" | "automation";
+  key: "infrastructure" | "environment" | "paper" | "automation";
   title: string;
   description: string;
   state: SetupStepState;
   actionLabel: string;
   href: string;
-  optional?: boolean;
 }
 
 interface ReadinessInput {
   health?: unknown;
-  me?: unknown;
-  credentials?: unknown;
+  personal?: unknown;
   status?: unknown;
 }
 
@@ -29,114 +29,76 @@ function text(...values: unknown[]): string | undefined {
   );
 }
 
-function activeItem(
-  values: unknown,
-  selectedId: string | undefined,
-): Record<string, unknown> {
-  const items = Array.isArray(values) ? values.map(record) : [];
-  return (
-    items.find((item) => text(item.id) === selectedId) ??
-    items.find((item) => text(item.status) === "active") ??
-    items.find((item) => !["revoked", "deleted"].includes(text(item.status) ?? "")) ??
-    {}
-  );
-}
-
 export function buildSetupSteps(input: ReadinessInput): SetupStep[] {
   const health = record(input.health);
-  const me = record(input.me);
-  const credentials = record(input.credentials);
   const status = record(input.status);
-  const profile = record(me.runtime_profile ?? status.runtime_profile);
+  const personal = parsePersonalRuntimeStatus(input.personal ?? status);
   const latestJob = record(status.latest_job);
-
-  const aiId = text(profile.ai_credential_id);
-  const walletId = text(profile.trading_wallet_id);
-  const ai = activeItem(credentials.ai_credentials, aiId);
-  const wallet = activeItem(credentials.wallets ?? credentials.trading_wallets, walletId);
-  const walletState = text(wallet.status);
-  const jobState = text(latestJob.status);
-  const jobMode = text(latestJob.mode);
-  const safeAutomatic =
-    profile.auto_run_enabled === true &&
-    ["paper", "shadow"].includes(text(profile.desired_mode) ?? "");
+  const jobState = text(personal.lastCycle?.state, latestJob.status);
+  const jobMode = personal.lastCycle ? personal.mode : text(latestJob.mode);
+  const realMoneyMode = ["canary", "live"].includes(personal.mode);
+  const environmentReady =
+    personal.enabled &&
+    personal.ai.configured &&
+    (!realMoneyMode || personal.wallet.configured);
+  const paperMode = personal.mode === "paper";
 
   return [
     {
       key: "infrastructure",
-      title: "系统连接正常",
-      description: "Vercel 能访问 Zeabur API，并且 Zeabur 已连接 Supabase。",
+      title: "三端连接正常",
+      description: "Vercel 能访问 Zeabur，Zeabur 也能访问 Supabase。",
       state: health.ok === true ? "done" : "blocked",
-      actionLabel: "检查三端部署",
+      actionLabel: "检查部署",
       href: "/diagnostics",
     },
     {
-      key: "mfa",
-      title: "保护高风险操作",
-      description: "绑定验证器，之后保存密钥、导入钱包或开启实盘都需要动态码。",
-      state: text(me.aal) === "aal2" ? "done" : "todo",
-      actionLabel: "绑定双因素验证",
-      href: "/settings#mfa",
-    },
-    {
-      key: "ai",
-      title: "连接你的 AI",
-      description: "选择提供商和模型，只提交一次 API Key；后续运行不会由浏览器重复携带。",
-      state:
-        aiId && text(ai.id) === aiId && text(ai.status) === "active"
-          ? "done"
-          : "todo",
-      actionLabel: "配置 AI",
-      href: "/settings#ai",
+      key: "environment",
+      title: "Zeabur 环境变量已生效",
+      description: personal.wallet.configured
+        ? "个人模式、AI 和专用钱包都已由后端环境变量托管。"
+        : "先开启个人模式并配置 AI；钱包私钥可在准备小额实盘时补上。",
+      state: environmentReady ? "done" : "todo",
+      actionLabel: "查看变量清单",
+      href: "/settings#environment",
     },
     {
       key: "paper",
-      title: "先完成一次模拟运行",
-      description: "Paper 模式不会发送真实订单，用它确认 AI、市场数据和 Worker 都能工作。",
+      title: "完成一次 Paper 模拟",
+      description: paperMode
+        ? "不会发送真实订单，用它确认 AI、市场数据和常驻 Worker 可以协同工作。"
+        : "当前后端不是 Paper。请先在 Zeabur 设置 POLYBOT_MODE=paper 并重新部署，向导绝不会把实盘伪装成模拟。",
       state:
-        jobMode === "paper" && jobState === "succeeded"
+        !paperMode
+          ? "blocked"
+          : jobMode === "paper" && jobState === "succeeded"
           ? "done"
           : jobMode === "paper" &&
               ["queued", "claimed", "running"].includes(jobState ?? "")
             ? "working"
             : "todo",
-      actionLabel: "去控制台试运行",
-      href: "/",
+      actionLabel: paperMode ? "运行安全模拟" : "查看模式变量",
+      href: paperMode ? "/" : "/settings#runtime",
     },
     {
       key: "automation",
-      title: "开启安全的自动周期",
-      description: "建议先让 Paper/Shadow 自动运行并观察至少数天，再考虑小额 Canary。",
-      state: safeAutomatic ? "done" : "todo",
-      actionLabel: "设置自动运行",
-      href: "/settings#automation",
-    },
-    {
-      key: "wallet",
-      title: "准备专属小额钱包",
-      description: "只有准备进入 Canary 时才需要。不要导入主钱包，先等地址验证成功再小额入金。",
+      title: "开启个人自动运行",
+      description: "由 Zeabur 常驻 Worker 定时运行；先保持 Paper 或 Shadow 观察。",
       state:
-        walletId && text(wallet.id) === walletId && walletState === "active"
+        personal.autoRunEnabled && personal.workerReady
           ? "done"
-          : walletId &&
-              ["provisioning", "pending_verification", "revocation_pending"].includes(
-                walletState ?? "",
-              )
+          : personal.autoRunEnabled
             ? "working"
             : "todo",
-      actionLabel: "配置专属钱包",
-      href: "/settings#wallet",
-      optional: true,
+      actionLabel: "查看运行状态",
+      href: "/settings#runtime",
     },
   ];
 }
 
 export function setupProgress(steps: SetupStep[]): number {
-  const requiredSteps = steps.filter((step) => !step.optional);
-  if (requiredSteps.length === 0) return 0;
+  if (steps.length === 0) return 0;
   return Math.round(
-    (requiredSteps.filter((step) => step.state === "done").length /
-      requiredSteps.length) *
-      100,
+    (steps.filter((step) => step.state === "done").length / steps.length) * 100,
   );
 }

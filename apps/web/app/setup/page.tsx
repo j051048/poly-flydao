@@ -3,7 +3,8 @@
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-import { apiRequest, readableApiError } from "../../lib/api";
+import { ApiError, apiRequest, readableApiError } from "../../lib/api";
+import { parsePersonalRuntimeStatus } from "../../lib/personal-runtime";
 import {
   buildSetupSteps,
   setupProgress,
@@ -12,8 +13,7 @@ import {
 
 interface Snapshot {
   health?: unknown;
-  me?: unknown;
-  credentials?: unknown;
+  personal?: unknown;
   status?: unknown;
 }
 
@@ -34,23 +34,35 @@ export default function SetupPage() {
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
-    const requests = await Promise.allSettled([
-      apiRequest<unknown>("/health", { authenticated: false }),
-      apiRequest<unknown>("/v1/me"),
-      apiRequest<unknown>("/v1/me/credentials/status"),
-      apiRequest<unknown>("/v1/status"),
-    ]);
+    const [healthResult, personalResult, statusResult] =
+      await Promise.allSettled([
+        apiRequest<unknown>("/health", { authenticated: false }),
+        apiRequest<unknown>("/v1/personal/status"),
+        apiRequest<unknown>("/v1/status"),
+      ]);
+
     const next: Snapshot = {};
-    const keys: Array<keyof Snapshot> = [
-      "health",
-      "me",
-      "credentials",
-      "status",
-    ];
-    requests.forEach((result, index) => {
-      if (result.status === "fulfilled") next[keys[index]] = result.value.data;
-    });
-    const failure = requests.find(
+    if (healthResult.status === "fulfilled") {
+      next.health = healthResult.value.data;
+    }
+    if (statusResult.status === "fulfilled") {
+      next.status = statusResult.value.data;
+    }
+    if (personalResult.status === "fulfilled") {
+      next.personal = personalResult.value.data;
+    } else if (
+      personalResult.reason instanceof ApiError &&
+      personalResult.reason.status === 404 &&
+      statusResult.status === "fulfilled"
+    ) {
+      next.personal = statusResult.value.data;
+    }
+
+    const failure = [
+      healthResult,
+      statusResult,
+      ...(next.personal ? [] : [personalResult]),
+    ].find(
       (result): result is PromiseRejectedResult => result.status === "rejected",
     );
     if (failure) setError(readableApiError(failure.reason));
@@ -63,52 +75,61 @@ export default function SetupPage() {
   }, [refresh]);
 
   const steps = useMemo(() => buildSetupSteps(snapshot), [snapshot]);
-  const coreSteps = steps.filter((step) => !step.optional);
   const progress = setupProgress(steps);
-  const nextStep = coreSteps.find((step) => step.state !== "done");
-  const completedCoreSteps = coreSteps.filter(
-    (step) => step.state === "done",
-  ).length;
-  const aiReady = steps.some((step) => step.key === "ai" && step.state === "done");
+  const nextStep = steps.find((step) => step.state !== "done");
+  const completedSteps = steps.filter((step) => step.state === "done").length;
+  const personalStatus = parsePersonalRuntimeStatus(snapshot.personal);
+  const paperMode = personalStatus.mode === "paper";
+  const aiReady = steps.some(
+    (step) => step.key === "environment" && step.state === "done",
+  );
 
   async function runFirstPaperCycle() {
-    const me = snapshot.me as Record<string, unknown> | undefined;
-    const profile = me?.runtime_profile as Record<string, unknown> | undefined;
-    if (!profile) {
-      setError("请先完成登录并刷新状态。");
-      return;
-    }
+    const cycleCountBefore = parsePersonalRuntimeStatus(
+      snapshot.personal,
+    ).cycleCount;
     setFirstRunBusy(true);
-    setFirstRunMessage("正在切换安全模拟模式并创建首次任务…");
+    setFirstRunMessage("正在创建首次 Paper 模拟任务…");
+    setError(null);
     try {
-      await apiRequest("/v1/me/runtime-profile", {
-        method: "PUT",
-        body: {
-          expected_version: Number(profile.version) || 1,
-          ai_provider: String(profile.ai_provider || "mock"),
-          ai_base_url: profile.ai_base_url ?? null,
-          forecast_model: String(profile.forecast_model || "gpt-5.6-terra"),
-          ai_credential_id: profile.ai_credential_id ?? null,
-          trading_wallet_id: profile.trading_wallet_id ?? null,
-          risk_policy_id: profile.risk_policy_id ?? null,
-          desired_mode: "paper",
-          auto_run_enabled: false,
-          cycle_interval_seconds: 300,
-        },
-      });
-      const queued = await apiRequest<unknown>("/v1/jobs/cycles", {
+      const queued = await apiRequest<unknown>("/v1/personal/cycles/run", {
         method: "POST",
         body: { mode: "paper" },
         idempotencyKey: `setup-paper:${crypto.randomUUID()}`,
       });
-      const jobId = String((queued.data as Record<string, unknown>).id || "");
-      if (!jobId) throw new Error("任务创建成功但没有返回 ID。");
+      const payload = queued.data as Record<string, unknown>;
+      const jobId = String(payload.id ?? payload.job_id ?? "");
+      if (!jobId) {
+        for (let attempt = 0; attempt < 45; attempt += 1) {
+          await new Promise((resolve) => window.setTimeout(resolve, 2000));
+          const response = await apiRequest<unknown>("/v1/personal/status");
+          const current = parsePersonalRuntimeStatus(response.data);
+          setSnapshot((previous) => ({ ...previous, personal: response.data }));
+          if (
+            current.cycleCount > cycleCountBefore &&
+            current.lastCycle?.state === "succeeded"
+          ) {
+            setFirstRunMessage("首次 Paper 周期完成，可以进入控制台查看结果。");
+            await refresh();
+            return;
+          }
+          if (
+            current.cycleCount > cycleCountBefore &&
+            current.lastCycle?.state === "failed"
+          ) {
+            throw new Error(current.lastCycle.message ?? "首次 Paper 周期失败。");
+          }
+        }
+        setFirstRunMessage("周期仍在运行，稍后点“重新检查”即可，不必停留在本页。");
+        return;
+      }
+
       for (let attempt = 0; attempt < 60; attempt += 1) {
         await new Promise((resolve) => window.setTimeout(resolve, 2000));
         const response = await apiRequest<unknown>(`/v1/jobs/${jobId}`);
         const job = response.data as Record<string, unknown>;
         if (job.status === "succeeded") {
-          setFirstRunMessage("首次 Paper 周期完成。现在可以查看分析与模拟资产。");
+          setFirstRunMessage("首次 Paper 周期完成，可以进入控制台查看结果。");
           await refresh();
           return;
         }
@@ -116,7 +137,7 @@ export default function SetupPage() {
           throw new Error(`首次任务失败：${String(job.error_code || "unknown")}`);
         }
       }
-      throw new Error("任务仍在排队，请到部署诊断检查 Worker 心跳。");
+      setFirstRunMessage("任务仍在运行，稍后可在控制台查看，不必停留在本页。");
     } catch (caught) {
       setError(readableApiError(caught));
       setFirstRunMessage(null);
@@ -129,8 +150,8 @@ export default function SetupPage() {
     <main className="page-shell">
       <header className="topbar">
         <div>
-          <p className="eyebrow">GUIDED START</p>
-          <h1>新手启动向导</h1>
+          <p className="eyebrow">PERSONAL START</p>
+          <h1>个人启动向导</h1>
         </div>
         <button
           className="secondary-button"
@@ -145,13 +166,13 @@ export default function SetupPage() {
       <section className="onboarding-hero">
         <div>
           <span className="onboarding-kicker">一次只做一件事</span>
-          <h2>{nextStep ? `现在只做：${nextStep.title}` : "安全启动已完成"}</h2>
+          <h2>{nextStep ? `现在只做：${nextStep.title}` : "个人机器人已经就绪"}</h2>
           <p>
             {nextStep
               ? nextStep.description
-              : "Paper 自动周期已经准备好；专属钱包是可选项，等你准备小额实盘时再配置。"}
+              : "AI、常驻 Worker 和 Paper 自动周期都已准备好，可以进入控制台。"}
           </p>
-          {nextStep?.key === "paper" ? (
+          {nextStep?.key === "paper" && paperMode ? (
             <button
               className="primary-button onboarding-primary-action"
               type="button"
@@ -159,8 +180,8 @@ export default function SetupPage() {
               disabled={
                 firstRunBusy ||
                 loading ||
-                !snapshot.me ||
                 !aiReady ||
+                !personalStatus.workerReady ||
                 nextStep.state === "working"
               }
             >
@@ -181,33 +202,33 @@ export default function SetupPage() {
             </Link>
           )}
           {nextStep && (
-            <p className="field-help">完成后回到这里，系统会自动给出下一步。</p>
+            <p className="field-help">完成后回来点“重新检查”，系统会自动推进。</p>
           )}
           {firstRunMessage && <p className="field-help">{firstRunMessage}</p>}
         </div>
-        <div className="progress-ring" style={{ "--progress": `${progress}%` } as React.CSSProperties}>
+        <div
+          className="progress-ring"
+          style={{ "--progress": `${progress}%` } as React.CSSProperties}
+        >
           <strong>{progress}%</strong>
-          <span>安全启动</span>
+          <span>个人启动</span>
         </div>
       </section>
 
       {error && (
         <div className="notice error page-notice" role="alert">
-          部分状态读取失败：{error}
+          状态读取失败：{error}
         </div>
       )}
 
-      <details className="setup-checklist">
+      <details className="setup-checklist" open>
         <summary>
-          <span>查看完整启动清单</span>
-          <strong>{completedCoreSteps} / {coreSteps.length} 个必需步骤</strong>
+          <span>四步启动清单</span>
+          <strong>{completedSteps} / {steps.length} 已完成</strong>
         </summary>
-        <section className="setup-steps" aria-label="启动步骤">
+        <section className="setup-steps" aria-label="个人启动步骤">
           {steps.map((step, index) => (
-            <article
-              className={`setup-step ${step.state} ${step.optional ? "optional" : ""}`}
-              key={step.key}
-            >
+            <article className={`setup-step ${step.state}`} key={step.key}>
               <div className="step-index" aria-hidden="true">
                 {step.state === "done" ? "✓" : index + 1}
               </div>
@@ -215,14 +236,12 @@ export default function SetupPage() {
                 <div className="step-title-row">
                   <h2>{step.title}</h2>
                   <span className={`pill setup-${step.state}`}>
-                    {step.optional && step.state === "todo"
-                      ? "实盘时再做"
-                      : STATE_LABELS[step.state]}
+                    {STATE_LABELS[step.state]}
                   </span>
                 </div>
                 <p>{step.description}</p>
               </div>
-              {step.state !== "done" && (
+              {step.state !== "done" && step.key !== "paper" && (
                 <Link className="secondary-button step-action" href={step.href}>
                   {step.actionLabel}
                 </Link>
@@ -236,18 +255,19 @@ export default function SetupPage() {
         <summary className="mode-explainer-summary">
           <div>
             <p className="eyebrow">MODE LADDER</p>
-            <h2>以后想升级真钱？先了解四种模式</h2>
+            <h2>个人版支持哪些模式？</h2>
           </div>
           <span className="read-only-chip">点击展开</span>
         </summary>
         <div className="mode-ladder">
-          <div><strong>Paper</strong><span>模拟成交，适合首次运行</span></div>
-          <div><strong>Shadow</strong><span>跟随实时盘口，但不发送订单</span></div>
-          <div><strong>Canary</strong><span>小额真钱，单笔硬上限 $5</span></div>
-          <div><strong>Live</strong><span>真实资金；必须经过长期验证</span></div>
+          <div><strong>Paper</strong><span>模拟成交，首次运行用它</span></div>
+          <div><strong>Shadow</strong><span>实时分析，但不发送订单</span></div>
+          <div><strong>Canary</strong><span>显式开启后的小额真钱模式</span></div>
+          <div><strong>Live</strong><span>显式开启后的完整实盘模式</span></div>
         </div>
         <p className="panel-note">
-          自动化只能稳定执行规则，不能保证盈利。是否升级应看费用后净收益、最大回撤和样本外表现，而不是只看胜率。
+          默认只允许 Paper / Shadow；配置 POLYBOT_PERSONAL_LIVE_ENABLED=true
+          且通过启动检查后才可使用 Canary / Live。自动执行不等于保证盈利。
         </p>
       </details>
     </main>

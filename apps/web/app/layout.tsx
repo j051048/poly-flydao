@@ -7,7 +7,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Polybot 控制台",
-  description: "Polymarket AI 多租户交易机器人控制台",
+  description: "个人 Polymarket AI 自动交易机器人控制台",
   robots: { index: false, follow: false },
 };
 
