@@ -33,6 +33,7 @@ from polybot.models import (
     WorkerLease,
     utc_now,
 )
+from polybot.schema import EXPECTED_SCHEMA_VERSION
 from polybot.stores.ledger import (
     FillLedgerSnapshot,
     IncompleteFillLedgerError,
@@ -333,7 +334,7 @@ class SupabaseStore:
                     "polybot_schema_version",
                     version_data.get("version"),
                 )
-            if version_data != 18:
+            if version_data != EXPECTED_SCHEMA_VERSION:
                 return False
             await self._execute(
                 self.client.table("runtime_controls")

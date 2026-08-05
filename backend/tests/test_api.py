@@ -188,6 +188,99 @@ def test_personal_status_is_owner_scoped_and_never_returns_secrets() -> None:
     assert disabled_worker.status_code == 409
 
 
+def test_equity_history_and_ai_usage_endpoints_require_auth() -> None:
+    owner = "11111111-1111-4111-8111-111111111111"
+    verifier = StaticTokenVerifier(
+        {
+            "owner": AuthPrincipal(
+                account_id=owner,
+                aal="aal1",
+                role="authenticated",
+                issuer="https://example.supabase.co/auth/v1",
+                audience=("authenticated",),
+            ),
+        }
+    )
+    app = create_app(
+        settings=Settings(_env_file=None),
+        auth_verifier=verifier,
+        jobs=InMemoryJobRepository(),
+        credentials=InMemoryCredentialRepository(),
+    )
+
+    with TestClient(app) as client:
+        denied_equity = client.get("/v1/me/equity-history")
+        denied_usage = client.get("/v1/me/ai-usage")
+        equity = client.get(
+            "/v1/me/equity-history?limit=10",
+            headers={"Authorization": "Bearer owner"},
+        )
+        usage = client.get(
+            "/v1/me/ai-usage?limit=10",
+            headers={"Authorization": "Bearer owner"},
+        )
+
+    assert denied_equity.status_code == 401
+    assert denied_usage.status_code == 401
+    assert equity.status_code == 200
+    assert equity.json() == {"items": []}
+    assert usage.status_code == 200
+    assert usage.json() == {"items": []}
+
+
+def test_risk_policy_preset_requires_aal2_and_applies_preset() -> None:
+    owner = "11111111-1111-4111-8111-111111111111"
+    verifier = StaticTokenVerifier(
+        {
+            "owner-aal1": AuthPrincipal(
+                account_id=owner,
+                aal="aal1",
+                role="authenticated",
+                issuer="https://example.supabase.co/auth/v1",
+                audience=("authenticated",),
+            ),
+            "owner-aal2": AuthPrincipal(
+                account_id=owner,
+                aal="aal2",
+                role="authenticated",
+                issuer="https://example.supabase.co/auth/v1",
+                audience=("authenticated",),
+            ),
+        }
+    )
+    jobs = InMemoryJobRepository()
+    app = create_app(
+        settings=Settings(_env_file=None),
+        auth_verifier=verifier,
+        jobs=jobs,
+        credentials=InMemoryCredentialRepository(),
+    )
+
+    with TestClient(app) as client:
+        profile = client.get(
+            "/v1/me",
+            headers={"Authorization": "Bearer owner-aal1"},
+        )
+        version = profile.json()["runtime_profile"]["version"]
+        blocked = client.put(
+            "/v1/me/risk-policy",
+            json={"expected_profile_version": version, "preset": "conservative"},
+            headers={"Authorization": "Bearer owner-aal1"},
+        )
+        applied = client.put(
+            "/v1/me/risk-policy",
+            json={"expected_profile_version": version, "preset": "conservative"},
+            headers={"Authorization": "Bearer owner-aal2"},
+        )
+
+    assert profile.status_code == 200
+    assert blocked.status_code == 403
+    assert applied.status_code == 200
+    policy = applied.json()
+    assert policy["max_order_usd"] == "2"
+    assert policy["daily_loss_limit_pct"] == "0.01"
+
+
 def test_personal_lifespan_runs_one_worker_and_manual_trigger(
     monkeypatch,
 ) -> None:

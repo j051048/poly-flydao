@@ -17,7 +17,7 @@ class LiteLLMForecastProvider:
         self.api_base = api_base
         self.timeout_seconds = timeout_seconds
         self._json_schema_unsupported_models: set[str] = set()
-        self._last_usage = None
+        self._usage_log: list = []
 
     async def forecast(self, request: ForecastRequest, *, model: str) -> Forecast:
         stopwatch = Stopwatch()
@@ -64,7 +64,7 @@ class LiteLLMForecastProvider:
         usage = getattr(response, "usage", None)
         input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
         output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
-        self._last_usage = build_usage(
+        self._usage_log.append(build_usage(
             provider="litellm",
             model=model,
             market_id=request.market.id,
@@ -72,7 +72,7 @@ class LiteLLMForecastProvider:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             latency_ms=stopwatch.elapsed_ms(),
-        )
+        ))
         content = response.choices[0].message.content
         if not content:
             raise RuntimeError("LiteLLM returned an empty forecast")
@@ -87,7 +87,12 @@ class LiteLLMForecastProvider:
         )
 
     def last_usage(self):
-        return self._last_usage
+        return self._usage_log[-1] if self._usage_log else None
+
+    def drain_usage(self) -> list:
+        records = self._usage_log
+        self._usage_log = []
+        return records
 
 
 def _structured_output_unsupported(exc: Exception) -> bool:

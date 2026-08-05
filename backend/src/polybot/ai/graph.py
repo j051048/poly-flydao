@@ -94,3 +94,12 @@ class ForecastGraph:
 
         last_usage = getattr(self.provider, "last_usage", None)
         return last_usage() if callable(last_usage) else None
+
+    def drain_usage(self) -> list:
+        """Return and clear all usage records produced by the last forecast."""
+
+        drain = getattr(self.provider, "drain_usage", None)
+        if callable(drain):
+            return drain()
+        usage = self.usage()
+        return [usage] if usage is not None else []

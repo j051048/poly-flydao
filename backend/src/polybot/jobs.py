@@ -14,6 +14,7 @@ from polybot.ai_endpoint import UnsafeAIBaseURLError, normalize_ai_base_url
 from polybot.config import TradingMode
 from polybot.credentials import AIProvider
 from polybot.models import AIUsageRecord, EquityHistoryPoint, RuntimeControl, utc_now
+from polybot.schema import EXPECTED_SCHEMA_VERSION
 
 
 class JobConflictError(RuntimeError):
@@ -581,7 +582,7 @@ class SupabaseJobRepository:
                     "polybot_schema_version",
                     version_data.get("version"),
                 )
-            return version_data == 18
+            return version_data == EXPECTED_SCHEMA_VERSION
         except Exception:
             return False
 

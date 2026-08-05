@@ -9,6 +9,7 @@ from polymarket import SecureClient
 from polybot.archive import ArchiveRunResult
 from polybot.cli import main
 from polybot.config import DEDICATED_WALLET_ACK_TEXT, get_settings
+from polybot.models import EngineCycleResult, TradingMode
 
 
 def test_generate_secrets_includes_dedicated_wallet_ack(monkeypatch, capsys) -> None:
@@ -55,6 +56,43 @@ def test_archive_once_runs_sweep_and_prints_json(monkeypatch, capsys) -> None:
     out = json.loads(capsys.readouterr().out)
     assert out["markets_saved"] == 1
     assert out["snapshots_saved"] == 2
+
+
+def test_archive_without_supabase_fails_closed(monkeypatch) -> None:
+    get_settings.cache_clear()
+    monkeypatch.delenv("POLYBOT_SUPABASE_URL", raising=False)
+    monkeypatch.delenv("POLYBOT_SUPABASE_SERVICE_ROLE_KEY", raising=False)
+    monkeypatch.setattr(sys, "argv", ["polybot", "archive", "--once"])
+
+    import pytest
+
+    with pytest.raises(ValueError, match="archive requires SUPABASE"):
+        main()
+
+
+def test_cycle_paper_runs_once_and_prints_report(monkeypatch, capsys) -> None:
+    class FakeEngine:
+        async def run_cycle(self):
+            return EngineCycleResult(run_id="cli-run", mode=TradingMode.PAPER)
+
+    class FakeRuntime:
+        engine = FakeEngine()
+
+        async def close(self) -> None:
+            return None
+
+    get_settings.cache_clear()
+    monkeypatch.delenv("POLYBOT_SUPABASE_URL", raising=False)
+    monkeypatch.delenv("POLYBOT_SUPABASE_SERVICE_ROLE_KEY", raising=False)
+    monkeypatch.setenv("POLYBOT_MODE", "paper")
+    monkeypatch.setattr(sys, "argv", ["polybot", "cycle"])
+    monkeypatch.setattr("polybot.cli.build_runtime", lambda settings: FakeRuntime())
+
+    main()
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["run_id"] == "cli-run"
+    assert out["mode"] == "paper"
 
 
 def test_wallet_bootstrap_sets_approvals_and_never_prints_private_key(

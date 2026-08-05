@@ -112,7 +112,7 @@ export default function SettingsPage() {
     if (me.status === "fulfilled") {
       const profile = (me.value.data as { runtime_profile?: Record<string, unknown> })
         ?.runtime_profile;
-      const version = Number(profile?.risk_policy_version);
+      const version = Number(profile?.version);
       setProfileVersion(Number.isInteger(version) && version > 0 ? version : null);
     } else {
       setProfileVersion(null);
@@ -178,11 +178,11 @@ export default function SettingsPage() {
           preset,
         },
       });
+      await refresh();
       setNotice({
         tone: "success",
         text: `已应用「${RISK_PRESETS.find((item) => item.value === preset)?.name ?? preset}」风控档位。`,
       });
-      await refresh();
     } catch (error) {
       setNotice({ tone: "error", text: readableApiError(error) });
     } finally {

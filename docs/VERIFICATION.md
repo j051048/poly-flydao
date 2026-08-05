@@ -1,18 +1,20 @@
 # 交付验证记录
 
-验证日期：2026-07-27。
+验证日期：2026-07-27（首版）；2026-08-05（审计循环 1 前基线）。
 
 ## 已通过
 
 | 检查 | 结果 |
 |---|---|
 | Python lint | 在 `backend` 工作目录执行 `ruff check .` 通过 |
-| Python 测试 | `129 passed` |
+| Python 测试 | `345 passed`（`pytest --cov=polybot` 实测覆盖率 74%） |
 | Web 生产构建 | Next.js `next build` 通过 |
 | Python 生产依赖审计 | `pip-audit`：`No known vulnerabilities found` |
 | Web 生产依赖审计 | `npm audit --audit-level=high`：0 个漏洞 |
 | Python 分发制品 | wheel 与 sdist 构建成功 |
 | 制品内容 | wheel 包含 GDELT Context collector、Public Suffix 去重、异步 SDK client 初始化、wallet bootstrap、trade ID 对账、数据库时钟 arm expiry CAS 和交易所侧 GTD 到期保护 |
+| 数据归档 | 新增只读 `polybot archive`（全量 L2 快照入库），迁移 0017 权益历史、0018 AI 用量台账，schema 版本升至 18 并由 `polybot.schema.EXPECTED_SCHEMA_VERSION` 集中管理 |
+| 前端 | 仪表盘净值曲线（Recharts）、设置页一键风控档位（conservative/balanced/advanced）、性能页 AI 成本台账 |
 | Polymarket 公共 API | 官方 SDK 0.2.0 成功读取当前市场与 outcome order book；当前 keyset 服务实测必须按数值 JSON 字段 `liquidityNum` 排序 |
 | Polymarket SDK contract | 下单、异步成交 ID、余额、订单/成交/activity/仓位与 WS 方法形状测试通过 |
 | Paper 端到端 | 实时公开行情扫描 3 个高流动性市场，生成 3 个 mock forecast，因无正净价值候选而 0 intent/0 order |
@@ -36,6 +38,12 @@ backend/dist/polybot-0.1.0.tar.gz
 - 当前环境没有 Docker CLI，未执行本机容器构建；Python 和 Next.js 制品已分别构建；
 - 没有提交真实订单，没有做小额 canary、成交/撤单/重启恢复和赎回验收；
 - 合成 JSONL 回测只验证计算链路，不构成策略收益证据。
+
+## 审计循环状态
+
+- 审计提示词：[`docs/AUDIT_PROMPT.md`](AUDIT_PROMPT.md)
+- 审计报告：`docs/audit/report-*.md`
+- 覆盖率门禁：CI `--cov-fail-under=72`（当前实测 74%，75% 目标列入后续循环）。
 
 ## 上线验收标准
 

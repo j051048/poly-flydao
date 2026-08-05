@@ -74,6 +74,8 @@ export default function EquityChart() {
 
   useEffect(() => {
     void refresh();
+    const timer = globalThis.setInterval(() => void refresh(), 20_000);
+    return () => globalThis.clearInterval(timer);
   }, [refresh]);
 
   const latest = points.at(-1)?.equityUsd;

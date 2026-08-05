@@ -11,6 +11,7 @@ from uuid import UUID
 
 from polybot.config import TradingMode
 from polybot.models import RuntimeControl
+from polybot.schema import EXPECTED_SCHEMA_VERSION
 from supabase import Client
 
 _EVM_ADDRESS = re.compile(r"^0x[0-9a-f]{40}$")
@@ -84,7 +85,7 @@ class PersonalExecutionRepository:
             data = data[0] if data else None
         if isinstance(data, dict):
             data = data.get("polybot_schema_version", data.get("version"))
-        return data == 18
+        return data == EXPECTED_SCHEMA_VERSION
 
     async def get_binding(self) -> PersonalRuntimeBinding | None:
         response = await self._execute(

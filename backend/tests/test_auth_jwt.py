@@ -101,3 +101,44 @@ async def test_supabase_jwt_rejects_tampered_signature() -> None:
             await verifier.verify(tampered)
     finally:
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_supabase_jwt_rejects_unknown_key_id() -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public = private_key.public_key().public_numbers()
+    jwks = {
+        "keys": [
+            {
+                "kty": "RSA",
+                "kid": "another-key",
+                "alg": "RS256",
+                "use": "sig",
+                "n": _b64(public.n.to_bytes((public.n.bit_length() + 7) // 8, "big")),
+                "e": _b64(public.e.to_bytes((public.e.bit_length() + 7) // 8, "big")),
+            }
+        ]
+    }
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json=jwks))
+    )
+    verifier = SupabaseJWTVerifier(issuer=ISSUER, client=client)
+    try:
+        with pytest.raises(JWTVerificationError):
+            await verifier.verify(_token(private_key, _claims()))
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_supabase_jwt_fails_closed_when_jwks_unavailable() -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(503))
+    )
+    verifier = SupabaseJWTVerifier(issuer=ISSUER, client=client)
+    try:
+        with pytest.raises(JWTVerificationError):
+            await verifier.verify(_token(private_key, _claims()))
+    finally:
+        await client.aclose()

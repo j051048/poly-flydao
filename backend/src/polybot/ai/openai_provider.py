@@ -45,7 +45,7 @@ class OpenAIForecastProvider:
         client: OpenAI | None = None,
     ):
         self.client = client or OpenAI(api_key=api_key, timeout=timeout_seconds, max_retries=1)
-        self._last_usage = None
+        self._usage_log: list = []
 
     async def forecast(self, request: ForecastRequest, *, model: str) -> Forecast:
         stopwatch = Stopwatch()
@@ -66,7 +66,7 @@ class OpenAIForecastProvider:
             store=False,
         )
         usage = getattr(response, "usage", None)
-        self._last_usage = build_usage(
+        self._usage_log.append(build_usage(
             provider="openai",
             model=model,
             market_id=request.market.id,
@@ -74,7 +74,7 @@ class OpenAIForecastProvider:
             input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
             output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
             latency_ms=stopwatch.elapsed_ms(),
-        )
+        ))
         parsed = response.output_parsed
         if parsed is None:
             raise RuntimeError("OpenAI returned no structured forecast")
@@ -87,4 +87,9 @@ class OpenAIForecastProvider:
         )
 
     def last_usage(self):
-        return self._last_usage
+        return self._usage_log[-1] if self._usage_log else None
+
+    def drain_usage(self) -> list:
+        records = self._usage_log
+        self._usage_log = []
+        return records

@@ -447,8 +447,8 @@ class TradingEngine:
         except Exception as exc:
             report.skip(f"forecast_generation_error:{type(exc).__name__}")
             return True
-        usage = self.forecaster.usage()
-        if usage is not None:
+        usage_records = self.forecaster.drain_usage()
+        for usage in usage_records:
             try:
                 await self.store.record_ai_usage(self.settings.account_id, usage)
             except Exception:

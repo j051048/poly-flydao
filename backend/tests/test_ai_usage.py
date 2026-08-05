@@ -36,19 +36,49 @@ def test_build_usage_clamps_negative_tokens() -> None:
 class UsageAwareProvider(StaticForecastProvider):
     def __init__(self, forecast):
         super().__init__(forecast)
-        self._last_usage = AIUsageRecord(
-            provider="test",
-            model="test-model",
-            market_id=forecast.market_id,
-            input_tokens=10,
-            output_tokens=20,
-            total_tokens=30,
-            latency_ms=42,
-            cost_usd=Decimal("0.00001"),
-        )
+        self._usage_log = [
+            AIUsageRecord(
+                provider="test",
+                model="test-model",
+                market_id=forecast.market_id,
+                input_tokens=10,
+                output_tokens=20,
+                total_tokens=30,
+                latency_ms=42,
+                cost_usd=Decimal("0.00001"),
+            ),
+            AIUsageRecord(
+                provider="test",
+                model="test-model",
+                market_id=forecast.market_id,
+                input_tokens=5,
+                output_tokens=8,
+                total_tokens=13,
+                latency_ms=33,
+            ),
+        ]
 
     def last_usage(self):
-        return self._last_usage
+        return self._usage_log[-1] if self._usage_log else None
+
+    def drain_usage(self):
+        records = self._usage_log
+        self._usage_log = []
+        return records
+
+
+async def test_graph_drain_returns_all_usage_records_and_clears(forecast, market) -> None:
+    graph = ForecastGraph(
+        UsageAwareProvider(forecast),
+        primary_model="primary",
+        critic_model="critic",
+    )
+    await graph.forecast(ForecastRequest(market=market, evidence=[]))
+
+    records = graph.drain_usage()
+    assert [record.total_tokens for record in records] == [30, 13]
+    assert graph.usage() is None
+    assert graph.drain_usage() == []
 
 
 async def test_graph_exposes_usage_from_usage_aware_provider(forecast, market) -> None:
@@ -61,7 +91,7 @@ async def test_graph_exposes_usage_from_usage_aware_provider(forecast, market) -
     usage = graph.usage()
     assert usage is not None
     assert usage.provider == "test"
-    assert usage.total_tokens == 30
+    assert usage.total_tokens == 13  # most recent model call
 
 
 async def test_graph_usage_is_none_for_plain_provider(forecast, market) -> None:

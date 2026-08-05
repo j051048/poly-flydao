@@ -54,4 +54,10 @@ npm test
 npm run build
 ```
 
+## 数据归档与审计
+
+- `polybot archive --once`：只读归档全量 L2 订单簿与市场元数据到 Supabase，为未来回测提供 point-in-time 数据；服务模式下默认每 300 秒自动执行。
+- 每次交易周期自动写入权益历史与 AI 调用台账（token/延迟/估算成本），可在控制台净值曲线与性能页查看。
+- 大厂级代码审计提示词见 [`docs/AUDIT_PROMPT.md`](docs/AUDIT_PROMPT.md)，历轮审计报告见 `docs/audit/`。
+
 原有 `api + tenant_queue worker` 多租户部署路径仍保留，供后续 SaaS 化使用；个人部署不需要它。

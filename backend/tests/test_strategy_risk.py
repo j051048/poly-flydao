@@ -125,3 +125,94 @@ def test_hard_risk_exit_does_not_require_a_new_forecast(
     )
     assert first.intent_hash == same_decision.intent_hash
     assert first.intent_hash != next_decision.intent_hash
+
+
+def test_risk_rejects_cash_caps_liquidity_and_fee_gaps(
+    settings, market, forecast, yes_book, no_book
+) -> None:
+    healthy = PortfolioState(bankroll_usd=Decimal("1000"), cash_usd=Decimal("1000"))
+    candidate = ValueStrategy(settings).choose(market, forecast, yes_book, no_book, healthy)
+    assert candidate is not None
+    portfolio = PortfolioState(
+        bankroll_usd=Decimal("1000"),
+        cash_usd=Decimal("1"),
+        gross_exposure_usd=Decimal("990"),
+        event_exposure_usd={"__unclassified_event__": Decimal("990")},
+        bucket_exposure_usd={"__unclassified__": Decimal("990")},
+    )
+    decision = RiskEngine(settings).evaluate_candidate(candidate, market, yes_book, portfolio)
+    assert not decision.approved
+    for code in (
+        "insufficient_cash",
+        "event_exposure_cap_exceeded",
+        "correlated_bucket_cap_exceeded",
+        "gross_exposure_cap_exceeded",
+    ):
+        assert code in decision.codes
+
+
+def test_risk_rejects_invalid_tick_and_minimum_size(
+    settings, market, forecast, yes_book, no_book
+) -> None:
+    portfolio = PortfolioState(bankroll_usd=Decimal("1000"), cash_usd=Decimal("1000"))
+    candidate = ValueStrategy(settings).choose(market, forecast, yes_book, no_book, portfolio)
+    assert candidate is not None
+    off_grid = candidate.model_copy(update={"limit_price": Decimal("0.405")})
+    decision = RiskEngine(settings).evaluate_candidate(off_grid, market, yes_book, portfolio)
+    assert "invalid_tick_price" in decision.codes
+
+    tiny = candidate.model_copy(update={"size": Decimal("0.0001")})
+    decision = RiskEngine(settings).evaluate_candidate(tiny, market, yes_book, portfolio)
+    assert "below_minimum_order_size" in decision.codes
+
+
+def test_risk_rejects_sell_exceeding_position(
+    settings, market, forecast, yes_book, no_book
+) -> None:
+    portfolio = PortfolioState(
+        bankroll_usd=Decimal("1000"),
+        cash_usd=Decimal("100"),
+        token_positions={market.yes_token_id: Decimal("1")},
+        peak_equity_usd=Decimal("1000"),
+        equity_usd=Decimal("900"),
+    )
+    bearish = forecast.model_copy(
+        update={
+            "probability_yes": Decimal("0.20"),
+            "probability_low": Decimal("0.10"),
+            "probability_high": Decimal("0.30"),
+        }
+    )
+    rich_bid = yes_book.model_copy(
+        update={"bids": [yes_book.bids[0].model_copy(update={"price": Decimal("0.55")})]}
+    )
+    candidate = ValueStrategy(settings).choose(market, bearish, rich_bid, no_book, portfolio)
+    assert candidate is not None
+    oversized = candidate.model_copy(update={"size": Decimal("5")})
+    decision = RiskEngine(settings).evaluate_candidate(oversized, market, rich_bid, portfolio)
+    assert "sell_exceeds_position" in decision.codes
+
+
+def test_risk_rejects_market_gates_and_empty_book(
+    settings, market, forecast, yes_book, no_book
+) -> None:
+    portfolio = PortfolioState(bankroll_usd=Decimal("1000"), cash_usd=Decimal("1000"))
+    candidate = ValueStrategy(settings).choose(market, forecast, yes_book, no_book, portfolio)
+    assert candidate is not None
+    closed = market.model_copy(update={"active": False, "closed": True})
+    decision = RiskEngine(settings).evaluate_candidate(candidate, closed, yes_book, portfolio)
+    assert "market_not_tradeable" in decision.codes
+
+    empty = yes_book.model_copy(update={"asks": []})
+    decision = RiskEngine(settings).evaluate_candidate(candidate, market, empty, portfolio)
+    assert "empty_ask_book" in decision.codes
+
+    daily_loss = portfolio.model_copy(
+        update={
+            "daily_risk_pnl_usd": Decimal("-30"),
+            "daily_loss_basis_usd": Decimal("1000"),
+            "realized_pnl_today_usd": Decimal("-30"),
+        }
+    )
+    decision = RiskEngine(settings).evaluate_candidate(candidate, market, yes_book, daily_loss)
+    assert "daily_loss_kill_switch" in decision.codes
