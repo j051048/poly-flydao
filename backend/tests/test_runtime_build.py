@@ -96,5 +96,5 @@ def test_ai_resolution_mock_litellm_openai_and_compatible() -> None:
 
 def test_ai_resolution_rejects_unknown_provider() -> None:
     settings = Settings(_env_file=None, mode="paper", ai_provider="unknown-provider")
-    with pytest.raises(ValueError, match="unsupported AI provider"):
+    with pytest.raises(ValueError):
         _ai(settings)

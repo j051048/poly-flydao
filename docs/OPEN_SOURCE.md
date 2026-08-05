@@ -122,8 +122,8 @@ primary forecast
 
 尚未实现：
 
-- provider 响应 ID、token 用量、货币成本和 latency 的完整 ledger；
-- 应用层多供应商 fallback；
+- provider 响应 ID、token 用量、货币成本和 latency 的完整 ledger（已实现：`ai_usage_ledger` + `/v1/me/ai-usage`）；
+- 应用层多供应商 fallback（已实现：只包裹 `forecast()` 只读路径，配置 `POLYBOT_AI_FALLBACK_PROVIDERS`）；
 - 证据已按规范化 URL、Public Suffix eTLD+1 和 forecast 实际引用设门；GDELT Context 有近 72 小时时效与同句 snippet，但尚无任意网页正文抓取校验或权威域名 allowlist；
 - 基于真实结算结果的模型校准和漂移反馈。
 

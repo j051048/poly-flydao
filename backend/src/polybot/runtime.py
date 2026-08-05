@@ -9,6 +9,7 @@ from polybot.ai.evidence import (
     NoopEvidenceCollector,
     OpenAIWebEvidenceCollector,
 )
+from polybot.ai.fallback import FallbackForecastProvider
 from polybot.ai.graph import ForecastGraph
 from polybot.ai.mock import SafeMockForecastProvider
 from polybot.ai.openai_provider import OpenAIForecastProvider
@@ -68,56 +69,53 @@ def _ai(settings: Settings) -> tuple[ForecastProvider, EvidenceCollector]:
     provider_name = settings.ai_provider.lower()
     if provider_name == "mock":
         return SafeMockForecastProvider(), NoopEvidenceCollector()
-    if provider_name == "openai":
-        key_setting = settings.effective_ai_api_key
-        if key_setting is None:
-            raise ValueError(
-                "OPENAI_API_KEY or POLYBOT_AI_API_KEY is required for "
-                "POLYBOT_AI_PROVIDER=openai"
-            )
-        key = key_setting.get_secret_value()
-        return (
-            OpenAIForecastProvider(key, timeout_seconds=settings.ai_timeout_seconds),
-            _evidence_collector(settings, default="openai_web"),
+    key_setting = settings.effective_ai_api_key
+    if key_setting is None:
+        raise ValueError(
+            "an AI API key is required for a non-mock provider"
         )
-    if provider_name == "litellm":
-        from polybot.ai.litellm_provider import LiteLLMForecastProvider
+    key = key_setting.get_secret_value()
 
-        key_setting = settings.effective_ai_api_key
-        if key_setting is None:
-            raise ValueError(
-                "LITELLM_API_KEY or POLYBOT_AI_API_KEY is required for "
-                "POLYBOT_AI_PROVIDER=litellm"
+    def named_provider(name: str):
+        if name == "openai":
+            return OpenAIForecastProvider(
+                key,
+                timeout_seconds=settings.ai_timeout_seconds,
             )
-        return (
-            LiteLLMForecastProvider(
-                api_key=key_setting.get_secret_value(),
+        if name == "litellm":
+            from polybot.ai.litellm_provider import LiteLLMForecastProvider
+
+            return LiteLLMForecastProvider(
+                api_key=key,
                 api_base=settings.litellm_base_url,
                 timeout_seconds=settings.ai_timeout_seconds,
-            ),
-            _evidence_collector(settings, default="gdelt"),
-        )
-    if provider_name == "openai_compatible":
-        from polybot.ai.openai_compatible_provider import (
-            OpenAICompatibleForecastProvider,
-        )
-
-        key_setting = settings.effective_ai_api_key
-        if key_setting is None:
-            raise ValueError(
-                "LITELLM_API_KEY or POLYBOT_AI_API_KEY is required for "
-                "POLYBOT_AI_PROVIDER=openai_compatible"
             )
-        return (
-            OpenAICompatibleForecastProvider(
-                api_key=key_setting.get_secret_value(),
+        if name == "openai_compatible":
+            from polybot.ai.openai_compatible_provider import (
+                OpenAICompatibleForecastProvider,
+            )
+
+            return OpenAICompatibleForecastProvider(
+                api_key=key,
                 api_base=settings.litellm_base_url,
                 timeout_seconds=settings.ai_timeout_seconds,
                 allowed_hosts=settings.custom_ai_allowed_hosts,
-            ),
-            _evidence_collector(settings, default="gdelt"),
-        )
-    raise ValueError(f"unsupported AI provider: {settings.ai_provider}")
+            )
+        raise ValueError(f"unsupported AI provider: {name}")
+
+    providers = [named_provider(provider_name)]
+    for name in settings.ai_fallback_providers.split(","):
+        name = name.strip().lower()
+        if not name or name == provider_name:
+            continue
+        providers.append(named_provider(name))
+    provider: ForecastProvider
+    if len(providers) > 1:
+        provider = FallbackForecastProvider(providers)
+    else:
+        provider = providers[0]
+    default_evidence = "openai_web" if provider_name == "openai" else "gdelt"
+    return provider, _evidence_collector(settings, default=default_evidence)
 
 
 def _evidence_collector(

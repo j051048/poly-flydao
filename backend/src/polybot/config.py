@@ -151,6 +151,7 @@ class Settings(BaseSettings):
     evidence_provider: Literal["auto", "openai_web", "gdelt", "none"] = "auto"
     forecast_model: str = "gpt-5.6-terra"
     critic_model: str = "gpt-5.6-sol"
+    ai_fallback_providers: str = ""
     ai_api_key: SecretStr | None = None
     ai_base_url: str | None = None
     ai_model: str | None = None
