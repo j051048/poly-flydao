@@ -74,6 +74,13 @@ POLYBOT_AI_MODEL=YOUR_MODEL_ID
 POLYMARKET_PRIVATE_KEY=0x64_HEX_CHARACTERS
 POLYBOT_BANKROLL_USD=100
 POLYBOT_MAX_ORDER_USD=2
+
+# 可选：数据归档（默认开启）、外部告警、AI fallback
+POLYBOT_ARCHIVE_ENABLED=true
+POLYBOT_ARCHIVE_MARKET_LIMIT=20
+POLYBOT_ARCHIVE_INTERVAL_SECONDS=300
+# POLYBOT_NOTIFY_WEBHOOK_URL=https://hooks.example.com/your-endpoint
+# POLYBOT_AI_FALLBACK_PROVIDERS=litellm,openai_compatible
 ```
 
 说明：
@@ -84,6 +91,8 @@ POLYBOT_MAX_ORDER_USD=2
 - 自定义 AI 中转站必须是公开 HTTPS、OpenAI Chat Completions 兼容接口。Base URL 通常填到 `/v1`；模型 ID 必须使用中转站实际接受的名称。
 - 提供 Base URL 时，后端自动使用 OpenAI-compatible 模式并把该 hostname 锁为 AI Key 的唯一目标，无需再填写 provider 或 allowlist。
 - 使用官方 OpenAI 时删除 `POLYBOT_AI_BASE_URL`，只填写 `POLYBOT_AI_API_KEY` 与明确的 `POLYBOT_AI_MODEL`；后端会自动识别。
+- `POLYBOT_AI_FALLBACK_PROVIDERS`：逗号分隔的只读预测 fallback 顺序（`openai` / `litellm` / `openai_compatible`），只影响 AI 预测，不影响签名与下单。
+- `POLYBOT_NOTIFY_WEBHOOK_URL`：Telegram/Discord 兼容 webhook，周期完成、失败与安全熔断会推送；不配置则完全静默。
 - 只使用全新、低余额、专门给机器人使用的钱包。不要使用主钱包或助记词。
 - 如果 Polymarket 账户使用独立 proxy/funder 地址，额外设置 `POLYMARKET_DEPOSIT_WALLET=0x...`；直接 EOA 可不填。
 
