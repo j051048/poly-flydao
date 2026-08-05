@@ -1,6 +1,7 @@
 """Step-by-step worker startup preflight diagnosis against a cloud Supabase.
 
-Reads credentials from backend/.env (git-ignored):
+Reads credentials from backend/.env.diagnose (git-ignored), falling back to
+backend/.env and process environment:
 
     SUPABASE_URL=https://<project-ref>.supabase.co
     SUPABASE_SERVICE_ROLE_KEY=...
@@ -13,30 +14,29 @@ from __future__ import annotations
 
 import asyncio
 import os
-import sys
 from pathlib import Path
-
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
 def _load_env() -> dict[str, str]:
     values: dict[str, str] = {}
-    env_file = ROOT / ".env"
-    if env_file.exists():
+    for env_file in (ROOT / ".env.diagnose", ROOT / ".env"):
+        if not env_file.exists():
+            continue
         for raw in env_file.read_text(encoding="utf-8").splitlines():
             line = raw.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, _, value = line.partition("=")
-            values[key.strip()] = value.strip().strip('"').strip("'")
+            values.setdefault(key.strip(), value.strip().strip('"').strip("'"))
     for key in (
         "SUPABASE_URL",
         "SUPABASE_SERVICE_ROLE_KEY",
         "POLYBOT_ACCOUNT_ID",
-        "SUPABASE_SERVICE_ROLE_KEY",
     ):
-        values.setdefault(key, os.environ.get(key, ""))
+        if key not in values:
+            values[key] = os.environ.get(key, "")
     return values
 
 
@@ -156,7 +156,7 @@ def main() -> None:
     ]
     if missing:
         raise SystemExit(
-            "missing in backend/.env: " + ", ".join(missing)
+            "missing in backend/.env.diagnose: " + ", ".join(missing)
         )
     asyncio.run(_run(values))
 

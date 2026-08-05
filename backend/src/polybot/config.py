@@ -3,6 +3,7 @@ from __future__ import annotations
 import ipaddress
 import re
 from base64 import urlsafe_b64encode
+from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
 from functools import lru_cache
@@ -121,6 +122,7 @@ class Settings(BaseSettings):
     )
     scan_interval_seconds: int = Field(default=60, ge=10)
     reconcile_interval_seconds: int = Field(default=30, ge=10, le=300)
+    reconcile_baseline_utc: str | None = None
     market_limit: int = Field(default=20, ge=1, le=200)
     max_ai_markets_per_cycle: int = Field(default=3, ge=1, le=20)
     ai_timeout_seconds: int = Field(default=45, ge=10, le=180)
@@ -384,6 +386,32 @@ class Settings(BaseSettings):
             if self.mode is TradingMode.CANARY and self.max_order_usd > Decimal("5"):
                 raise ValueError("canary mode hard-caps POLYBOT_MAX_ORDER_USD at 5 pUSD")
         return self
+
+    @model_validator(mode="after")
+    def validate_reconcile_baseline(self) -> Settings:
+        if self.reconcile_baseline_utc:
+            try:
+                parsed = datetime.fromisoformat(
+                    self.reconcile_baseline_utc.replace("Z", "+00:00")
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "POLYBOT_RECONCILE_BASELINE_UTC must be an ISO-8601 timestamp"
+                ) from exc
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise ValueError(
+                    "POLYBOT_RECONCILE_BASELINE_UTC must include a timezone (use Z or +00:00)"
+                )
+        return self
+
+    @property
+    def reconcile_baseline_datetime(self) -> datetime | None:
+        """Aware UTC cutoff; account trades matched before it are ignored."""
+
+        if not self.reconcile_baseline_utc:
+            return None
+        parsed = datetime.fromisoformat(self.reconcile_baseline_utc.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo is None else parsed.astimezone(UTC)
 
     def validated_copy(self, **updates: object) -> Settings:
         """Rebuild settings through validation instead of Pydantic's unchecked model_copy."""

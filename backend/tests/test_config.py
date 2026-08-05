@@ -135,6 +135,20 @@ def test_dashboard_origins_are_exact_origins_without_paths_or_wildcards() -> Non
     ]
 
 
+def test_reconcile_baseline_utc_validation() -> None:
+    valid = Settings(
+        _env_file=None,
+        reconcile_baseline_utc="2026-08-05T00:00:00Z",
+    )
+    assert valid.reconcile_baseline_datetime is not None
+    assert valid.reconcile_baseline_datetime.tzinfo is not None
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, reconcile_baseline_utc="not-a-timestamp")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, reconcile_baseline_utc="2026-08-05T00:00:00")
+
+
 def test_canary_worker_accepts_one_litellm_key_and_derives_wallet() -> None:
     settings = Settings(
         _env_file=None,

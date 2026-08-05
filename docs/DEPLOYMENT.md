@@ -81,6 +81,9 @@ POLYBOT_ARCHIVE_MARKET_LIMIT=20
 POLYBOT_ARCHIVE_INTERVAL_SECONDS=300
 # POLYBOT_NOTIFY_WEBHOOK_URL=https://hooks.example.com/your-endpoint
 # POLYBOT_AI_FALLBACK_PROVIDERS=litellm,openai_compatible
+# 可选：忽略该 UTC 时间之前的账户历史成交（仅用于"专用钱包历史手动交易"豁免，
+# 之后的任何成交仍必须映射机器人订单）。格式：2026-08-05T00:00:00Z
+# POLYBOT_RECONCILE_BASELINE_UTC=2026-08-05T00:00:00Z
 ```
 
 说明：
@@ -93,6 +96,7 @@ POLYBOT_ARCHIVE_INTERVAL_SECONDS=300
 - 使用官方 OpenAI 时删除 `POLYBOT_AI_BASE_URL`，只填写 `POLYBOT_AI_API_KEY` 与明确的 `POLYBOT_AI_MODEL`；后端会自动识别。
 - `POLYBOT_AI_FALLBACK_PROVIDERS`：逗号分隔的只读预测 fallback 顺序（`openai` / `litellm` / `openai_compatible`），只影响 AI 预测，不影响签名与下单。
 - `POLYBOT_NOTIFY_WEBHOOK_URL`：Telegram/Discord 兼容 webhook，周期完成、失败与安全熔断会推送；不配置则完全静默。
+- `POLYBOT_RECONCILE_BASELINE_UTC`：仅在你确认旧钱包上存在"机器人之外的历史手动成交"且已清仓时使用。设置后，该时间之前的账户成交会在对账时被忽略（不落库、不告警），该时间之后的新成交仍然严格校验必须来自机器人订单。**使用前请确认钱包当前无任何 token 持仓，只保留 USDC。**
 - 只使用全新、低余额、专门给机器人使用的钱包。不要使用主钱包或助记词。
 - 如果 Polymarket 账户使用独立 proxy/funder 地址，额外设置 `POLYMARKET_DEPOSIT_WALLET=0x...`；直接 EOA 可不填。
 

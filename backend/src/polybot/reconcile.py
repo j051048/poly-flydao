@@ -41,6 +41,7 @@ class OrderReconciler:
         client: Any | None = None,
         market_data: MarketData | None = None,
         fill_callback: FillCallback | None = None,
+        baseline_utc: datetime | None = None,
     ):
         self.client = client
         self._private_key = private_key
@@ -51,6 +52,11 @@ class OrderReconciler:
         self.interval_seconds = interval_seconds
         self.market_data = market_data
         self.fill_callback = fill_callback
+        if baseline_utc is not None and (
+            baseline_utc.tzinfo is None or baseline_utc.utcoffset() is None
+        ):
+            raise ValueError("baseline_utc must be timezone-aware")
+        self._baseline_utc = baseline_utc
         self._known_position_conditions: set[str] = set()
         self.healthy = asyncio.Event()
         self._reconcile_lock = asyncio.Lock()
@@ -326,6 +332,13 @@ class OrderReconciler:
         reconciliation replay retries it after the core fill ledger is safe.
         """
 
+        if (
+            self._baseline_utc is not None
+            and update.matched_at.tzinfo is not None
+            and update.matched_at.utcoffset() is not None
+            and update.matched_at < self._baseline_utc
+        ):
+            return
         await self.store.reconcile_trade(update, self.account_id)
         if self.fill_callback is None:
             return
@@ -423,6 +436,13 @@ class OrderReconciler:
         return taker_updates + maker_updates
 
     async def _account_trade_updates(self, value: Any) -> list[UserTradeUpdate]:
+        if self._baseline_utc is not None:
+            matched_at = getattr(value, "matched_at", None)
+            if matched_at is not None:
+                if matched_at.tzinfo is None or matched_at.utcoffset() is None:
+                    matched_at = matched_at.replace(tzinfo=UTC)
+                if matched_at < self._baseline_utc:
+                    return []
         updates = self._trade_updates(value)
         candidates = {
             order_id for update in updates for order_id in update.candidate_order_ids if order_id

@@ -176,6 +176,7 @@ def build_runtime(
             store=store,
             interval_seconds=settings.reconcile_interval_seconds,
             market_data=market_data,
+            baseline_utc=settings.reconcile_baseline_datetime,
         )
     engine = TradingEngine(
         settings=settings,

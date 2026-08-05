@@ -1,6 +1,7 @@
 """Check and apply Supabase migrations against a cloud project.
 
-Reads credentials from backend/.env (git-ignored):
+Reads credentials from backend/.env.diagnose (git-ignored), falling back to
+backend/.env and process environment:
 
     SUPABASE_URL=https://<project-ref>.supabase.co
     SUPABASE_SERVICE_ROLE_KEY=...
@@ -26,23 +27,24 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parent.parent
 MIGRATIONS = ROOT / "supabase" / "migrations"
 
 
 def _load_env() -> dict[str, str]:
     values: dict[str, str] = {}
-    env_file = ROOT / ".env"
-    if env_file.exists():
+    for env_file in (ROOT / ".env.diagnose", ROOT / ".env"):
+        if not env_file.exists():
+            continue
         for raw in env_file.read_text(encoding="utf-8").splitlines():
             line = raw.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, _, value = line.partition("=")
-            values[key.strip()] = value.strip().strip('"').strip("'")
+            values.setdefault(key.strip(), value.strip().strip('"').strip("'"))
     for key in ("SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_ACCESS_TOKEN"):
-        values.setdefault(key, os.environ.get(key, ""))
+        if key not in values:
+            values[key] = os.environ.get(key, "")
     return values
 
 
@@ -50,7 +52,7 @@ def _require(values: dict[str, str], *keys: str) -> None:
     missing = [key for key in keys if not values.get(key)]
     if missing:
         raise SystemExit(
-            "missing in backend/.env: " + ", ".join(missing)
+            "missing in backend/.env.diagnose: " + ", ".join(missing)
         )
 
 

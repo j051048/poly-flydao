@@ -17,6 +17,7 @@
 | 前端 | 仪表盘净值曲线（Recharts，懒加载）、设置页一键风控档位（conservative/balanced/advanced）、性能页 AI 成本台账 |
 | 可观测性 | `/metrics` Prometheus 文本端点、`POLYBOT_NOTIFY_WEBHOOK_URL` 外部告警（周期/熔断） |
 | AI | 多 provider 只读 fallback（`POLYBOT_AI_FALLBACK_PROVIDERS`）、每次预测 token/延迟/成本台账 |
+| 对账 | 可选 `POLYBOT_RECONCILE_BASELINE_UTC`：豁免基准时间前的历史手动成交（其余成交仍严格映射机器人订单） |
 | Polymarket 公共 API | 官方 SDK 0.2.0 成功读取当前市场与 outcome order book；当前 keyset 服务实测必须按数值 JSON 字段 `liquidityNum` 排序 |
 | Polymarket SDK contract | 下单、异步成交 ID、余额、订单/成交/activity/仓位与 WS 方法形状测试通过 |
 | Paper 端到端 | 实时公开行情扫描 3 个高流动性市场，生成 3 个 mock forecast，因无正净价值候选而 0 intent/0 order |
