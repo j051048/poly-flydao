@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from polybot.ai_endpoint import UnsafeAIBaseURLError, normalize_ai_base_url
 from polybot.config import TradingMode
 from polybot.credentials import AIProvider
-from polybot.models import RuntimeControl, utc_now
+from polybot.models import AIUsageRecord, EquityHistoryPoint, RuntimeControl, utc_now
 
 
 class JobConflictError(RuntimeError):
@@ -305,6 +305,14 @@ class JobRepository(Protocol):
 
     async def set_ai_budget_limit(self, *, account_id: str, request_limit: int) -> int: ...
 
+    async def list_equity_history(
+        self, account_id: str, *, limit: int = 200
+    ) -> list[EquityHistoryPoint]: ...
+
+    async def list_ai_usage(
+        self, account_id: str, *, limit: int = 50
+    ) -> list[AIUsageRecord]: ...
+
 
 class WorkerJobRepository(Protocol):
     async def enqueue_due_jobs(self, *, limit: int = 100) -> int: ...
@@ -573,7 +581,7 @@ class SupabaseJobRepository:
                     "polybot_schema_version",
                     version_data.get("version"),
                 )
-            return version_data == 16
+            return version_data == 18
         except Exception:
             return False
 
@@ -1475,6 +1483,62 @@ class SupabaseJobRepository:
             raise JobConflictError("AI budget limit was not saved")
         return int(data)
 
+    async def list_equity_history(
+        self, account_id: str, *, limit: int = 200
+    ) -> list[EquityHistoryPoint]:
+        if not 1 <= limit <= 1000:
+            raise ValueError("equity history limit out of range")
+        response = await self._execute(
+            self._client.table("equity_history")
+            .select("recorded_at,equity_usd,source")
+            .eq("account_id", account_id)
+            .order("recorded_at", desc=True)
+            .limit(limit)
+        )
+        rows = [row for row in (getattr(response, "data", None) or []) if isinstance(row, dict)]
+        return [
+            EquityHistoryPoint(
+                recorded_at=datetime.fromisoformat(str(row["recorded_at"])),
+                equity_usd=Decimal(str(row["equity_usd"])),
+                source=str(row["source"]),
+            )
+            for row in reversed(rows)
+        ]
+
+    async def list_ai_usage(
+        self, account_id: str, *, limit: int = 50
+    ) -> list[AIUsageRecord]:
+        if not 1 <= limit <= 500:
+            raise ValueError("AI usage limit out of range")
+        response = await self._execute(
+            self._client.table("ai_usage_ledger")
+            .select(
+                "market_id,provider,model,request_id,input_tokens,output_tokens,"
+                "total_tokens,latency_ms,cost_usd,created_at"
+            )
+            .eq("account_id", account_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+        )
+        rows = [row for row in (getattr(response, "data", None) or []) if isinstance(row, dict)]
+        return [
+            AIUsageRecord(
+                provider=str(row["provider"]),
+                model=str(row["model"]),
+                market_id=row.get("market_id"),
+                request_id=row.get("request_id"),
+                input_tokens=int(row.get("input_tokens") or 0),
+                output_tokens=int(row.get("output_tokens") or 0),
+                total_tokens=int(row.get("total_tokens") or 0),
+                latency_ms=row.get("latency_ms"),
+                cost_usd=(
+                    Decimal(str(row["cost_usd"])) if row.get("cost_usd") is not None else None
+                ),
+                created_at=datetime.fromisoformat(str(row["created_at"])),
+            )
+            for row in reversed(rows)
+        ]
+
     async def save_paper_state(
         self,
         *,
@@ -1858,6 +1922,8 @@ class InMemoryJobRepository:
         self._ai_diagnostics: dict[UUID, AIDiagnosticJob] = {}
         self._ai_usage: dict[str, int] = {}
         self._notifications: dict[str, list[dict[str, Any]]] = {}
+        self._equity_history: dict[str, list[EquityHistoryPoint]] = {}
+        self._ai_usage_records: dict[str, list[AIUsageRecord]] = {}
         self._worker_status = WorkerStatusSnapshot(online=False, ready=False)
         self.live_ready_accounts: set[str] = set()
 
@@ -2201,6 +2267,20 @@ class InMemoryJobRepository:
         self._ai_usage.setdefault(f"{account_id}:limit", request_limit)
         self._ai_usage[f"{account_id}:limit"] = request_limit
         return request_limit
+
+    async def list_equity_history(
+        self, account_id: str, *, limit: int = 200
+    ) -> list[EquityHistoryPoint]:
+        if limit < 1:
+            raise ValueError("equity history limit must be positive")
+        return self._equity_history.get(account_id, [])[-limit:]
+
+    async def list_ai_usage(
+        self, account_id: str, *, limit: int = 50
+    ) -> list[AIUsageRecord]:
+        if limit < 1:
+            raise ValueError("AI usage limit must be positive")
+        return self._ai_usage_records.get(account_id, [])[-limit:]
 
     async def save_paper_state(
         self,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from uuid import uuid4
@@ -24,6 +25,8 @@ from polybot.models import (
 from polybot.risk import RiskEngine
 from polybot.stores.base import StateStore
 from polybot.strategy import ValueStrategy
+
+LOGGER = logging.getLogger(__name__)
 
 
 class LiveSafetyLatchError(RuntimeError):
@@ -207,6 +210,19 @@ class TradingEngine:
             report.skip(f"portfolio_unavailable:{type(exc).__name__}")
             report.completed_at = utc_now()
             return report
+
+        if cycle_portfolio.equity_usd is not None:
+            try:
+                await self.store.record_equity_history(
+                    self.settings.account_id,
+                    cycle_portfolio.equity_usd,
+                    source=f"{self.settings.mode.value}_cycle",
+                )
+            except Exception:
+                LOGGER.exception(
+                    "equity history recording failed; cycle continues",
+                    extra={"run_id": run_id},
+                )
 
         hard_risk_breach = self.strategy.hard_risk_breached(cycle_portfolio)
         if hard_risk_breach:
@@ -431,6 +447,15 @@ class TradingEngine:
         except Exception as exc:
             report.skip(f"forecast_generation_error:{type(exc).__name__}")
             return True
+        usage = self.forecaster.usage()
+        if usage is not None:
+            try:
+                await self.store.record_ai_usage(self.settings.account_id, usage)
+            except Exception:
+                LOGGER.exception(
+                    "AI usage ledger write failed; cycle continues",
+                    extra={"market_id": market.id},
+                )
         try:
             await self.store.save_forecast(forecast, self.settings.account_id)
         except Exception as exc:

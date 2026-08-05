@@ -15,6 +15,8 @@ from polybot.fees import matched_taker_fee_usd
 from polybot.models import (
     AccountActivityUpdate,
     AccountPositionUpdate,
+    AIUsageRecord,
+    EquityHistoryPoint,
     EquityRiskState,
     EvidenceItem,
     ExecutionResult,
@@ -331,7 +333,7 @@ class SupabaseStore:
                     "polybot_schema_version",
                     version_data.get("version"),
                 )
-            if version_data != 16:
+            if version_data != 18:
                 return False
             await self._execute(
                 self.client.table("runtime_controls")
@@ -1085,6 +1087,106 @@ class SupabaseStore:
             day_start_equity_usd=Decimal(str(value["day_start_equity_pusd"])),
             risk_day=value["risk_day"],
         )
+
+    async def record_equity_history(
+        self,
+        account_id: str,
+        equity_usd: Decimal,
+        source: str,
+    ) -> None:
+        if equity_usd < 0:
+            raise ValueError("equity history must be non-negative")
+        if not source.strip():
+            raise ValueError("equity history source must be non-empty")
+        await self._execute(
+            self.client.table("equity_history").insert(
+                {
+                    "account_id": account_id,
+                    "recorded_at": utc_now().isoformat(),
+                    "equity_usd": str(equity_usd),
+                    "source": source,
+                }
+            )
+        )
+
+    async def list_equity_history(
+        self,
+        account_id: str,
+        limit: int,
+    ) -> list[EquityHistoryPoint]:
+        if limit < 1:
+            raise ValueError("equity history limit must be positive")
+        response = await self._execute(
+            self.client.table("equity_history")
+            .select("recorded_at,equity_usd,source")
+            .eq("account_id", account_id)
+            .order("recorded_at", desc=True)
+            .limit(min(limit, 1000))
+        )
+        rows = list(reversed(response.data or []))
+        return [
+            EquityHistoryPoint(
+                recorded_at=datetime.fromisoformat(str(row["recorded_at"])),
+                equity_usd=Decimal(str(row["equity_usd"])),
+                source=str(row["source"]),
+            )
+            for row in rows
+        ]
+
+    async def record_ai_usage(self, account_id: str, usage: AIUsageRecord) -> None:
+        if usage.total_tokens < 0:
+            raise ValueError("AI usage tokens must be non-negative")
+        await self._execute(
+            self.client.table("ai_usage_ledger").insert(
+                {
+                    "account_id": account_id,
+                    "market_id": usage.market_id,
+                    "provider": usage.provider,
+                    "model": usage.model,
+                    "request_id": usage.request_id,
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "total_tokens": usage.total_tokens,
+                    "latency_ms": usage.latency_ms,
+                    "cost_usd": str(usage.cost_usd) if usage.cost_usd is not None else None,
+                    "created_at": usage.created_at.isoformat(),
+                }
+            )
+        )
+
+    async def list_ai_usage(
+        self, account_id: str, limit: int
+    ) -> list[AIUsageRecord]:
+        if limit < 1:
+            raise ValueError("AI usage limit must be positive")
+        response = await self._execute(
+            self.client.table("ai_usage_ledger")
+            .select(
+                "market_id,provider,model,request_id,input_tokens,output_tokens,"
+                "total_tokens,latency_ms,cost_usd,created_at"
+            )
+            .eq("account_id", account_id)
+            .order("created_at", desc=True)
+            .limit(min(limit, 1000))
+        )
+        rows = [row for row in (response.data or []) if isinstance(row, dict)]
+        return [
+            AIUsageRecord(
+                provider=str(row["provider"]),
+                model=str(row["model"]),
+                market_id=row.get("market_id"),
+                request_id=row.get("request_id"),
+                input_tokens=int(row.get("input_tokens") or 0),
+                output_tokens=int(row.get("output_tokens") or 0),
+                total_tokens=int(row.get("total_tokens") or 0),
+                latency_ms=row.get("latency_ms"),
+                cost_usd=(
+                    Decimal(str(row["cost_usd"])) if row.get("cost_usd") is not None else None
+                ),
+                created_at=datetime.fromisoformat(str(row["created_at"])),
+            )
+            for row in reversed(rows)
+        ]
 
     async def realized_pnl_since(self, account_id: str, since: datetime) -> Decimal:
         self._require_account(account_id)

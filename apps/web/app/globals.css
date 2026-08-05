@@ -2054,6 +2054,43 @@ footer {
   margin-top: 14px;
 }
 
+.risk-preset-card {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: rgba(3, 15, 11, 0.32);
+}
+
+.risk-preset-card.working {
+  border-color: rgba(255, 209, 102, 0.34);
+}
+
+.risk-preset-card > div {
+  display: grid;
+  gap: 3px;
+}
+
+.risk-preset-card strong {
+  font-size: 0.86rem;
+}
+
+.risk-preset-card span {
+  color: var(--green);
+  font-size: 0.64rem;
+}
+
+.risk-preset-card p {
+  color: var(--muted);
+  font-size: 0.68rem;
+  line-height: 1.55;
+}
+
+.risk-preset-card .secondary-button {
+  justify-self: start;
+}
+
 .budget-control {
   border-top: 1px solid var(--line);
   display: grid;
@@ -2108,6 +2145,19 @@ footer {
   top: -3px;
   transform: translateX(-50%);
   width: 13px;
+}
+
+.equity-chart-panel {
+  margin-bottom: 16px;
+}
+
+.equity-chart-wrap {
+  width: 100%;
+  min-width: 0;
+}
+
+.equity-chart-wrap svg {
+  overflow: visible;
 }
 
 .forecast-mark {

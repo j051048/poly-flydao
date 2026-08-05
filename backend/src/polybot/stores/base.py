@@ -7,6 +7,8 @@ from typing import Protocol
 from polybot.models import (
     AccountActivityUpdate,
     AccountPositionUpdate,
+    AIUsageRecord,
+    EquityHistoryPoint,
     EquityRiskState,
     EvidenceItem,
     ExecutionResult,
@@ -113,6 +115,31 @@ class StateStore(Protocol):
         account_id: str,
         equity_usd: Decimal,
     ) -> EquityRiskState: ...
+
+    async def record_equity_history(
+        self,
+        account_id: str,
+        equity_usd: Decimal,
+        source: str,
+    ) -> None: ...
+
+    async def list_equity_history(
+        self,
+        account_id: str,
+        limit: int,
+    ) -> list[EquityHistoryPoint]: ...
+
+    async def record_ai_usage(
+        self,
+        account_id: str,
+        usage: AIUsageRecord,
+    ) -> None: ...
+
+    async def list_ai_usage(
+        self,
+        account_id: str,
+        limit: int,
+    ) -> list[AIUsageRecord]: ...
 
     async def realized_pnl_since(self, account_id: str, since: datetime) -> Decimal: ...
 

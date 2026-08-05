@@ -25,6 +25,18 @@ interface PerformanceSnapshot {
   warning: string;
 }
 
+interface AIUsageRow {
+  provider: string;
+  model: string;
+  marketId?: string;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  latencyMs?: number | null;
+  costUsd?: number | null;
+  createdAt: string;
+}
+
 function percent(value?: number | null): string {
   if (value === null || value === undefined) return "—";
   return new Intl.NumberFormat("zh-CN", {
@@ -40,6 +52,7 @@ function score(value?: number | null): string {
 
 export default function PerformancePage() {
   const [snapshot, setSnapshot] = useState<PerformanceSnapshot | null>(null);
+  const [usageRows, setUsageRows] = useState<AIUsageRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -49,6 +62,29 @@ export default function PerformancePage() {
     try {
       const result = await apiRequest<PerformanceSnapshot>("/v1/me/performance");
       setSnapshot(result.data);
+      const usageResult = await apiRequest<unknown>("/v1/me/ai-usage?limit=10");
+      const rows = (usageResult.data as { items?: unknown[] })?.items ?? [];
+      setUsageRows(
+        rows
+          .map((value) => {
+            const row = value as Record<string, unknown>;
+            const cost = row.cost_usd;
+            return {
+              provider: String(row.provider ?? ""),
+              model: String(row.model ?? ""),
+              marketId: row.market_id ? String(row.market_id) : undefined,
+              inputTokens: Number(row.input_tokens ?? 0),
+              outputTokens: Number(row.output_tokens ?? 0),
+              totalTokens: Number(row.total_tokens ?? 0),
+              latencyMs: row.latency_ms === null || row.latency_ms === undefined
+                ? null
+                : Number(row.latency_ms),
+              costUsd: cost === null || cost === undefined ? null : Number(cost),
+              createdAt: String(row.created_at ?? ""),
+            };
+          })
+          .filter((row) => row.provider),
+      );
     } catch (caught) {
       setError(readableApiError(caught));
     } finally {
@@ -160,6 +196,52 @@ export default function PerformancePage() {
                 </p>
               </article>
             ))}
+          </div>
+        )}
+      </section>
+
+      <section className="panel calibration-panel" aria-label="AI 调用成本台账">
+        <div className="section-heading">
+          <div>
+            <p className="eyebrow">AI COST LEDGER</p>
+            <h2>最近 AI 调用</h2>
+          </div>
+          <span className="pill">{usageRows.length} 条</span>
+        </div>
+        {usageRows.length === 0 ? (
+          <div className="empty-state">
+            <p>暂无 AI 调用记录。运行包含 AI 预测的周期后，这里会显示 token 用量、延迟与估算成本。</p>
+          </div>
+        ) : (
+          <div className="table-scroll">
+            <table className="positions-table ai-usage-table">
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>模型</th>
+                  <th>输入 token</th>
+                  <th>输出 token</th>
+                  <th>延迟</th>
+                  <th>估算成本</th>
+                </tr>
+              </thead>
+              <tbody>
+                {usageRows.map((row, index) => (
+                  <tr key={`${row.createdAt}-${index}`}>
+                    <td>{row.createdAt ? new Date(row.createdAt).toLocaleString("zh-CN") : "—"}</td>
+                    <td title={`${row.provider} / ${row.marketId ?? ""}`}>{row.model}</td>
+                    <td>{row.inputTokens.toLocaleString()}</td>
+                    <td>{row.outputTokens.toLocaleString()}</td>
+                    <td>{row.latencyMs === null ? "—" : `${row.latencyMs} ms`}</td>
+                    <td>
+                      {typeof row.costUsd !== "number"
+                        ? "—"
+                        : `$${row.costUsd.toFixed(6)}`}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         )}
       </section>

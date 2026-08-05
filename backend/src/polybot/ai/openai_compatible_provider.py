@@ -8,6 +8,7 @@ import httpx
 from openai import AsyncOpenAI, BadRequestError
 
 from polybot.ai.openai_provider import SYSTEM_PROMPT, request_json
+from polybot.ai.usage import Stopwatch, build_usage
 from polybot.ai_endpoint import AddressResolver, validate_public_ai_base_url
 from polybot.models import Forecast, ForecastPayload, ForecastRequest
 
@@ -55,6 +56,7 @@ class OpenAICompatibleForecastProvider:
     ):
         self.api_base = api_base
         self._json_schema_unsupported_models: set[str] = set()
+        self._last_usage = None
         self._endpoint_validator = endpoint_validator or (
             lambda value: validate_public_ai_base_url(
                 value,
@@ -89,6 +91,7 @@ class OpenAICompatibleForecastProvider:
         # This second check runs after profile validation and immediately before
         # the SDK call. The HTTP transport performs the same check once more.
         await self._endpoint_validator(self.api_base)
+        stopwatch = Stopwatch()
         schema = ForecastPayload.model_json_schema()
         serialized_schema = json.dumps(
             schema,
@@ -133,6 +136,18 @@ class OpenAICompatibleForecastProvider:
                 self._json_schema_unsupported_models.add(model)
                 response = await self.client.chat.completions.create(**options)
 
+        usage = getattr(response, "usage", None)
+        input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+        self._last_usage = build_usage(
+            provider="openai_compatible",
+            model=model,
+            market_id=request.market.id,
+            request_id=getattr(response, "id", None),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            latency_ms=stopwatch.elapsed_ms(),
+        )
         content = response.choices[0].message.content
         if not content:
             raise RuntimeError("OpenAI-compatible relay returned an empty forecast")
@@ -146,6 +161,9 @@ class OpenAICompatibleForecastProvider:
             ],
             model=model,
         )
+
+    def last_usage(self):
+        return self._last_usage
 
     async def close(self) -> None:
         if self._owns_client:

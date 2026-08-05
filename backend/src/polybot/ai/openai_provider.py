@@ -5,6 +5,7 @@ import json
 
 from openai import OpenAI
 
+from polybot.ai.usage import Stopwatch, build_usage
 from polybot.models import Forecast, ForecastPayload, ForecastRequest
 
 SYSTEM_PROMPT = """You are a calibrated prediction-market forecaster.
@@ -44,8 +45,10 @@ class OpenAIForecastProvider:
         client: OpenAI | None = None,
     ):
         self.client = client or OpenAI(api_key=api_key, timeout=timeout_seconds, max_retries=1)
+        self._last_usage = None
 
     async def forecast(self, request: ForecastRequest, *, model: str) -> Forecast:
+        stopwatch = Stopwatch()
         response = await asyncio.to_thread(
             self.client.responses.parse,
             model=model,
@@ -62,6 +65,16 @@ class OpenAIForecastProvider:
             max_output_tokens=1800,
             store=False,
         )
+        usage = getattr(response, "usage", None)
+        self._last_usage = build_usage(
+            provider="openai",
+            model=model,
+            market_id=request.market.id,
+            request_id=getattr(response, "id", None),
+            input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
+            output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
+            latency_ms=stopwatch.elapsed_ms(),
+        )
         parsed = response.output_parsed
         if parsed is None:
             raise RuntimeError("OpenAI returned no structured forecast")
@@ -72,3 +85,6 @@ class OpenAIForecastProvider:
             source_ids=[source_id for source_id in parsed.source_ids if source_id in allowed_ids],
             model=model,
         )
+
+    def last_usage(self):
+        return self._last_usage

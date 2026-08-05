@@ -73,7 +73,7 @@ class PersonalExecutionRepository:
         return data if isinstance(data, dict) else None
 
     async def schema_ready(self) -> bool:
-        """Return false when migration 0016 has not reached Supabase."""
+        """Return false when migration 0018 has not reached Supabase."""
 
         try:
             response = await self._execute(self._client.rpc("polybot_schema_version", {}))
@@ -84,7 +84,7 @@ class PersonalExecutionRepository:
             data = data[0] if data else None
         if isinstance(data, dict):
             data = data.get("polybot_schema_version", data.get("version"))
-        return data == 16
+        return data == 18
 
     async def get_binding(self) -> PersonalRuntimeBinding | None:
         response = await self._execute(

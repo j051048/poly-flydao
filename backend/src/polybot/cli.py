@@ -79,6 +79,15 @@ def parser() -> argparse.ArgumentParser:
         help="run the P2 event-level L2 maker replay (research only)",
     )
     pair_replay.add_argument("--input", type=Path, required=True)
+    archive = commands.add_parser(
+        "archive",
+        help="run the read-only market archive (L2 snapshots for research)",
+    )
+    archive.add_argument(
+        "--once",
+        action="store_true",
+        help="run exactly one archive sweep and exit",
+    )
     return root
 
 
@@ -198,18 +207,33 @@ def main() -> None:
         print(inspect_nautilus_runtime().model_dump_json(indent=2))
         return
     if args.command == "cycle":
+        settings = get_settings()
         if settings.mode in {TradingMode.CANARY, TradingMode.LIVE}:
-            raise SystemExit("real-money cycles are restricted to the leased polybot-worker")
-        report = asyncio.run(_run_cycle(settings))
+            raise SystemExit(
+                "polybot cycle refuses to run in canary/live; use the service worker"
+            )
+        runtime = build_runtime(settings)
+
+        async def _run_cycle_once(runtime) -> object:
+            try:
+                return await runtime.engine.run_cycle()
+            finally:
+                await runtime.close()
+
+        report = asyncio.run(_run_cycle_once(runtime))
         print(json.dumps(report.model_dump(mode="json"), ensure_ascii=False, indent=2))
+        return
+    if args.command == "archive":
+        settings = get_settings()
+        from polybot.archive import build_archive_worker
 
-
-async def _run_cycle(settings):
-    runtime = build_runtime(settings)
-    try:
-        return await runtime.engine.run_cycle()
-    finally:
-        await runtime.close()
+        worker = build_archive_worker(settings)
+        if args.once:
+            result = asyncio.run(worker.run_once())
+            print(result.model_dump_json(indent=2))
+        else:
+            asyncio.run(worker.serve(asyncio.Event()))
+        return
 
 
 if __name__ == "__main__":

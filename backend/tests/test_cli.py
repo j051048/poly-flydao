@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from polymarket import SecureClient
 
+from polybot.archive import ArchiveRunResult
 from polybot.cli import main
 from polybot.config import DEDICATED_WALLET_ACK_TEXT, get_settings
 
@@ -19,6 +20,41 @@ def test_generate_secrets_includes_dedicated_wallet_ack(monkeypatch, capsys) -> 
         f"POLYBOT_DEDICATED_WALLET_ACK={DEDICATED_WALLET_ACK_TEXT}"
         in capsys.readouterr().out
     )
+
+
+def test_config_check_prints_safe_summary(monkeypatch, capsys) -> None:
+    get_settings.cache_clear()
+    monkeypatch.delenv("POLYBOT_SUPABASE_URL", raising=False)
+    monkeypatch.delenv("POLYBOT_SUPABASE_SERVICE_ROLE_KEY", raising=False)
+    monkeypatch.setenv("POLYBOT_MODE", "paper")
+    monkeypatch.setattr(sys, "argv", ["polybot", "config-check"])
+
+    main()
+
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    assert payload["valid"] is True
+    assert payload["mode"] == "paper"
+    assert "secret" not in out.lower()
+    assert "PRIVATE" not in out
+
+
+def test_archive_once_runs_sweep_and_prints_json(monkeypatch, capsys) -> None:
+    class FakeWorker:
+        async def run_once(self) -> ArchiveRunResult:
+            return ArchiveRunResult(markets_seen=1, markets_saved=1, snapshots_saved=2)
+
+    get_settings.cache_clear()
+    monkeypatch.delenv("POLYBOT_SUPABASE_URL", raising=False)
+    monkeypatch.delenv("POLYBOT_SUPABASE_SERVICE_ROLE_KEY", raising=False)
+    monkeypatch.setattr(sys, "argv", ["polybot", "archive", "--once"])
+    monkeypatch.setattr("polybot.archive.build_archive_worker", lambda settings: FakeWorker())
+
+    main()
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["markets_saved"] == 1
+    assert out["snapshots_saved"] == 2
 
 
 def test_wallet_bootstrap_sets_approvals_and_never_prints_private_key(

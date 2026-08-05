@@ -126,6 +126,9 @@ class Settings(BaseSettings):
     ai_timeout_seconds: int = Field(default=45, ge=10, le=180)
     forecast_cooldown_seconds: int = Field(default=900, ge=60, le=86400)
     resolution_poll_seconds: int = Field(default=300, ge=30, le=3600)
+    archive_enabled: bool = True
+    archive_market_limit: int = Field(default=20, ge=1, le=100)
+    archive_interval_seconds: int = Field(default=300, ge=60, le=86400)
 
     bankroll_usd: Decimal = Field(default=Decimal("1000"), gt=0)
     min_liquidity_usd: Decimal = Field(default=Decimal("10000"), ge=0)

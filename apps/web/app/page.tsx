@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import EquityChart from "../components/EquityChart";
 import {
   API_BASE_URL,
   apiRequest,
@@ -672,6 +673,8 @@ export default function HomePage() {
           </p>
         </article>
       </section>
+
+      <EquityChart />
 
       {notifications.some((item) => !item.read) && (
         <section className="panel notification-panel" aria-label="系统提醒">

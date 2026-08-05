@@ -27,6 +27,34 @@ const MODES: Array<{
   { value: "live", name: "Live", description: "按环境风控执行实盘" },
 ];
 
+type RiskPreset = "conservative" | "balanced" | "advanced";
+
+const RISK_PRESETS: Array<{
+  value: RiskPreset;
+  name: string;
+  description: string;
+  summary: string;
+}> = [
+  {
+    value: "conservative",
+    name: "保守",
+    description: "单笔 2 USD，日损 1%，回撤 4%，需要 ≥6% 净优势",
+    summary: "适合验证期与小额资金",
+  },
+  {
+    value: "balanced",
+    name: "均衡",
+    description: "单笔 5 USD，日损 2%，回撤 8%，需要 ≥4% 净优势",
+    summary: "默认档位，适合常规运行",
+  },
+  {
+    value: "advanced",
+    name: "进取",
+    description: "单笔 10 USD，日损 3%，回撤 10%，需要 ≥3% 净优势",
+    summary: "仅在你充分理解回撤风险后使用",
+  },
+];
+
 async function fetchPersonalStatus(): Promise<PersonalRuntimeStatus> {
   try {
     const response = await apiRequest<unknown>("/v1/personal/status");
@@ -45,6 +73,8 @@ export default function SettingsPage() {
   const [loading, setLoading] = useState(true);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [accountCopied, setAccountCopied] = useState(false);
+  const [profileVersion, setProfileVersion] = useState<number | null>(null);
+  const [presetBusy, setPresetBusy] = useState<RiskPreset | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -56,6 +86,7 @@ export default function SettingsPage() {
       fetchPersonalStatus(),
       supabase ? supabase.auth.getSession() : Promise.resolve(null),
     ]);
+    const meResult = await Promise.allSettled([apiRequest<unknown>("/v1/me")]);
 
     if (healthResult.status === "fulfilled") {
       const health = healthResult.value.data as Record<string, unknown>;
@@ -75,6 +106,16 @@ export default function SettingsPage() {
       setSession(sessionResult.value.data.session);
     } else {
       setSession(null);
+    }
+
+    const me = meResult[0];
+    if (me.status === "fulfilled") {
+      const profile = (me.value.data as { runtime_profile?: Record<string, unknown> })
+        ?.runtime_profile;
+      const version = Number(profile?.risk_policy_version);
+      setProfileVersion(Number.isInteger(version) && version > 0 ? version : null);
+    } else {
+      setProfileVersion(null);
     }
 
     setLoading(false);
@@ -121,6 +162,33 @@ export default function SettingsPage() {
     status?.workerReady === true,
     status?.autoRunEnabled === true,
   ].filter(Boolean).length;
+
+  async function applyRiskPreset(preset: RiskPreset) {
+    if (!profileVersion) {
+      setNotice({ tone: "error", text: "无法读取当前风控版本，请先确认 API 可用。" });
+      return;
+    }
+    setPresetBusy(preset);
+    setNotice(null);
+    try {
+      await apiRequest("/v1/me/risk-policy", {
+        method: "PUT",
+        body: {
+          expected_profile_version: profileVersion,
+          preset,
+        },
+      });
+      setNotice({
+        tone: "success",
+        text: `已应用「${RISK_PRESETS.find((item) => item.value === preset)?.name ?? preset}」风控档位。`,
+      });
+      await refresh();
+    } catch (error) {
+      setNotice({ tone: "error", text: readableApiError(error) });
+    } finally {
+      setPresetBusy(null);
+    }
+  }
 
   async function copyAccountId() {
     const accountId = session?.user.id;
@@ -312,6 +380,48 @@ export default function SettingsPage() {
           </div>
           <p className="panel-note">
             Vercel 只保留公开的站点与 Supabase 配置；AI Key 和钱包私钥均属于 Zeabur 后端变量。
+          </p>
+        </section>
+
+        <section className="panel" id="risk-presets">
+          <div className="section-heading">
+            <div>
+              <p className="eyebrow">RISK PRESETS</p>
+              <h2>风控档位</h2>
+            </div>
+            <span className={`pill ${profileVersion ? "online" : "degraded"}`}>
+              {profileVersion ? `策略版本 v${profileVersion}` : "无法读取版本"}
+            </span>
+          </div>
+          <p className="field-help">
+            一键应用完整风控参数组合。切换到实盘模式前，请先用保守档位完成 Paper / Shadow
+            验证；应用档位会立即更新后端风控策略。
+          </p>
+          <div className="risk-preset-grid">
+            {RISK_PRESETS.map((preset) => (
+              <article
+                className={`risk-preset-card ${presetBusy === preset.value ? "working" : ""}`}
+                key={preset.value}
+              >
+                <div>
+                  <strong>{preset.name}</strong>
+                  <span>{preset.summary}</span>
+                </div>
+                <p>{preset.description}</p>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  disabled={presetBusy !== null || !profileVersion}
+                  onClick={() => void applyRiskPreset(preset.value)}
+                >
+                  {presetBusy === preset.value ? "应用中…" : "应用此档位"}
+                </button>
+              </article>
+            ))}
+          </div>
+          <p className="panel-note">
+            档位对应：单笔上限 / 单次风险 / 单事件敞口 / 桶敞口 / 总敞口 / 日损熔断 /
+            最大回撤 / 最小净优势。现有档位以 Paper 本金 100 USD 为参考，调整本金时请按比例复核。
           </p>
         </section>
 

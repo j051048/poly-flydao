@@ -27,7 +27,7 @@ class Query:
     def execute(self):
         self.client.executions.append((self.source, self.column))
         if self.source == "rpc:polybot_schema_version":
-            return SimpleNamespace(data=16)
+            return SimpleNamespace(data=18)
         return SimpleNamespace(data=[])
 
 

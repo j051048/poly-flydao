@@ -390,7 +390,7 @@ class _AnalysisClient:
 
 @pytest.mark.asyncio
 async def test_supabase_health_requires_latest_schema_sentinel() -> None:
-    assert await SupabaseJobRepository(_HealthClient(16)).health()
+    assert await SupabaseJobRepository(_HealthClient(18)).health()
     assert not await SupabaseJobRepository(_HealthClient(15)).health()
 
 

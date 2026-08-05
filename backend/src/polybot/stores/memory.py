@@ -9,6 +9,8 @@ from polybot.fees import matched_taker_fee_usd
 from polybot.models import (
     AccountActivityUpdate,
     AccountPositionUpdate,
+    AIUsageRecord,
+    EquityHistoryPoint,
     EquityRiskState,
     EvidenceItem,
     ExecutionResult,
@@ -48,6 +50,8 @@ class MemoryStore:
         self.durable_orders: dict[str, str] = {}
         self.order_missing_confirmations: dict[str, int] = {}
         self.equity_states: dict[str, EquityRiskState] = {}
+        self.equity_history: dict[str, list[EquityHistoryPoint]] = {}
+        self.ai_usage: dict[str, list[AIUsageRecord]] = {}
         self._lock = asyncio.Lock()
 
     async def health(self) -> bool:
@@ -384,6 +388,46 @@ class MemoryStore:
             )
         self.equity_states[account_id] = state
         return state
+
+    async def record_equity_history(
+        self,
+        account_id: str,
+        equity_usd: Decimal,
+        source: str,
+    ) -> None:
+        if equity_usd < 0:
+            raise ValueError("equity history must be non-negative")
+        if not source.strip():
+            raise ValueError("equity history source must be non-empty")
+        self.equity_history.setdefault(account_id, []).append(
+            EquityHistoryPoint(
+                recorded_at=utc_now(),
+                equity_usd=equity_usd,
+                source=source,
+            )
+        )
+
+    async def list_equity_history(
+        self,
+        account_id: str,
+        limit: int,
+    ) -> list[EquityHistoryPoint]:
+        if limit < 1:
+            raise ValueError("equity history limit must be positive")
+        points = self.equity_history.get(account_id, [])
+        return points[-limit:]
+
+    async def record_ai_usage(self, account_id: str, usage: AIUsageRecord) -> None:
+        if usage.total_tokens < 0:
+            raise ValueError("AI usage tokens must be non-negative")
+        self.ai_usage.setdefault(account_id, []).append(usage)
+
+    async def list_ai_usage(
+        self, account_id: str, limit: int
+    ) -> list[AIUsageRecord]:
+        if limit < 1:
+            raise ValueError("AI usage limit must be positive")
+        return self.ai_usage.get(account_id, [])[-limit:]
 
     async def realized_pnl_since(self, account_id: str, since: datetime) -> Decimal:
         return (await self.fill_ledger_snapshot(account_id, since)).realized_pnl_usd

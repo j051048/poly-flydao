@@ -546,6 +546,25 @@ class EquityRiskState(BaseModel):
     risk_day: date
 
 
+class EquityHistoryPoint(BaseModel):
+    recorded_at: datetime
+    equity_usd: Decimal = Field(ge=0)
+    source: str = Field(min_length=1)
+
+
+class AIUsageRecord(BaseModel):
+    provider: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    market_id: str | None = None
+    request_id: str | None = None
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    total_tokens: int = Field(default=0, ge=0)
+    latency_ms: int | None = Field(default=None, ge=0)
+    cost_usd: Decimal | None = Field(default=None, ge=0)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
 class WorkerLease(BaseModel):
     account_id: str
     owner_id: str

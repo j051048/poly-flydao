@@ -45,7 +45,14 @@ jobs:
         run: uv run --python 3.12 --frozen --no-editable ruff check .
 
       - name: Test
-        run: uv run --python 3.12 --frozen --no-editable python -m pytest
+        run: uv run --python 3.12 --frozen --no-editable python -m pytest --cov=polybot --cov-fail-under=75 --cov-report=term-missing
+
+      - name: Generate SBOM (Python)
+        run: |
+          uv export --frozen --no-dev --no-emit-project --format requirements-txt --output-file "${RUNNER_TEMP}/polybot-requirements.txt" --quiet
+          python -m pip install cyclonedx-bom --quiet
+          cyclonedx-py --requirements "${RUNNER_TEMP}/polybot-requirements.txt" --output-format json --output-file dist/sbom.python.json
+        continue-on-error: true
 
       - name: Audit Python production dependencies
         run: |
@@ -91,6 +98,10 @@ jobs:
 
       - name: Audit production dependencies
         run: npm audit --omit=dev --audit-level=high
+
+      - name: Generate SBOM (Node)
+        run: npm ls --all --json > "${RUNNER_TEMP}/sbom.node.json"
+        continue-on-error: true
 
   container:
     name: Backend / container-build

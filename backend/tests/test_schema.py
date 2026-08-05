@@ -100,6 +100,24 @@ def test_upgrade_migration_adds_exchange_side_order_expiry() -> None:
     assert "grant select (expires_at) on public.orders to authenticated" in sql
 
 
+def test_equity_history_migration_bumps_schema_version() -> None:
+    sql = Path("supabase/migrations/0017_equity_history.sql").read_text(encoding="utf-8").lower()
+    assert "create table if not exists public.equity_history" in sql
+    assert "equity_history_equity_nonnegative" in sql
+    assert "equity_history_owner_select" in sql
+    assert "select 17;" in sql
+    assert "grant execute on function public.polybot_schema_version()" in sql
+
+
+def test_ai_usage_ledger_migration_bumps_schema_version() -> None:
+    sql = Path("supabase/migrations/0018_ai_usage_ledger.sql").read_text(encoding="utf-8").lower()
+    assert "create table if not exists public.ai_usage_ledger" in sql
+    assert "ai_usage_ledger_tokens_nonnegative" in sql
+    assert "ai_usage_ledger_owner_select" in sql
+    assert "select 18;" in sql
+    assert "grant execute on function public.polybot_schema_version()" in sql
+
+
 def test_secure_multitenant_migration_is_fenced_and_service_role_only() -> None:
     sql = (
         Path("supabase/migrations/0007_secure_multitenant.sql").read_text(encoding="utf-8").lower()

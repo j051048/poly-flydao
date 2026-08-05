@@ -558,9 +558,12 @@ def create_app(
     async def lifespan(application: FastAPI):
         configure_secure_logging(api_settings.log_level)
         personal_worker_stop = asyncio.Event()
+        archive_stop = asyncio.Event()
         personal_cycle_trigger = asyncio.Event()
         personal_worker_task: asyncio.Task[None] | None = None
+        archive_task: asyncio.Task[None] | None = None
         application.state.personal_worker_task = None
+        application.state.archive_task = None
         application.state.personal_cycle_trigger = personal_cycle_trigger
         application.state.personal_cycle_requests = PersonalCycleRequestRegistry()
         application.state.personal_cycle_count = 0
@@ -626,14 +629,47 @@ def create_app(
 
             personal_worker_task.add_done_callback(observe_personal_worker)
             application.state.personal_worker_task = personal_worker_task
+        if api_settings.personal_mode and api_settings.archive_enabled:
+            try:
+                from polybot.archive import build_archive_worker
+
+                archive_worker = build_archive_worker(api_settings)
+            except Exception:
+                LOGGER.critical(
+                    "archive worker failed to start; trading continues without data archive",
+                    exc_info=True,
+                )
+            else:
+                archive_task = asyncio.create_task(
+                    archive_worker.serve(archive_stop),
+                    name="polybot-archive-worker",
+                )
+
+                def observe_archive(task: asyncio.Task[None]) -> None:
+                    if task.cancelled():
+                        return
+                    error = task.exception()
+                    if error is not None:
+                        LOGGER.critical(
+                            "archive worker exited unexpectedly",
+                            exc_info=(type(error), error, error.__traceback__),
+                        )
+
+                archive_task.add_done_callback(observe_archive)
+                application.state.archive_task = archive_task
         try:
             yield
         finally:
             personal_worker_stop.set()
+            archive_stop.set()
             if personal_worker_task is not None:
                 with suppress(asyncio.CancelledError, Exception):
                     await personal_worker_task
+            if archive_task is not None:
+                with suppress(asyncio.CancelledError, Exception):
+                    await archive_task
             application.state.personal_worker_task = None
+            application.state.archive_task = None
             application.state.personal_cycle_trigger = None
             verifier: TokenVerifier | None = application.state.auth_verifier
             if verifier is not None:
@@ -1157,6 +1193,32 @@ def create_app(
         repo: JobRepositoryDep,
     ) -> PerformanceSnapshot:
         return await repo.performance(principal.account_id)
+
+    @application.get("/v1/me/equity-history")
+    async def equity_history(
+        principal: PrincipalDep,
+        repo: JobRepositoryDep,
+        limit: Annotated[int, Query(ge=2, le=1000)] = 200,
+    ) -> dict[str, object]:
+        return {
+            "items": await repo.list_equity_history(
+                principal.account_id,
+                limit=limit,
+            )
+        }
+
+    @application.get("/v1/me/ai-usage")
+    async def ai_usage(
+        principal: PrincipalDep,
+        repo: JobRepositoryDep,
+        limit: Annotated[int, Query(ge=1, le=500)] = 50,
+    ) -> dict[str, object]:
+        return {
+            "items": await repo.list_ai_usage(
+                principal.account_id,
+                limit=limit,
+            )
+        }
 
     @application.put("/v1/me/ai-budget")
     async def update_ai_budget(

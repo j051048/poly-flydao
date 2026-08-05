@@ -88,3 +88,9 @@ class ForecastGraph:
     async def forecast(self, request: ForecastRequest) -> Forecast:
         result = await self.graph.ainvoke({"request": request})
         return result["final"]
+
+    def usage(self):
+        """Return the most recent provider usage record, if the provider reports it."""
+
+        last_usage = getattr(self.provider, "last_usage", None)
+        return last_usage() if callable(last_usage) else None
