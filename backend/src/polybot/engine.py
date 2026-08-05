@@ -12,6 +12,7 @@ from polybot.ai.graph import ForecastGraph
 from polybot.brokers.base import Broker
 from polybot.config import Settings, TradingMode
 from polybot.market import MarketData
+from polybot.metrics import Metrics
 from polybot.models import (
     EngineCycleResult,
     ExecutionResult,
@@ -27,6 +28,7 @@ from polybot.stores.base import StateStore
 from polybot.strategy import ValueStrategy
 
 LOGGER = logging.getLogger(__name__)
+METRICS = Metrics()
 
 
 class LiveSafetyLatchError(RuntimeError):
@@ -183,6 +185,7 @@ class TradingEngine:
     async def run_cycle(self) -> EngineCycleResult:
         run_id = str(uuid4())
         report = EngineCycleResult(run_id=run_id, mode=self.settings.mode)
+        METRICS.increment("polybot_cycles_total", {"mode": self.settings.mode.value})
         if not await self.store.health():
             report.skip("state_store_unhealthy")
             report.completed_at = utc_now()
@@ -300,6 +303,8 @@ class TradingEngine:
             except Exception as exc:
                 # A single malformed market/model response must not terminate the cycle.
                 report.skip(f"market_error:{type(exc).__name__}")
+        for code, count in report.skipped.items():
+            METRICS.increment("polybot_cycle_skips_total", {"code": code}, amount=count)
         report.completed_at = utc_now()
         return report
 
@@ -451,6 +456,11 @@ class TradingEngine:
         for usage in usage_records:
             try:
                 await self.store.record_ai_usage(self.settings.account_id, usage)
+                METRICS.increment(
+                    "polybot_ai_calls_total",
+                    {"provider": usage.provider, "model": usage.model},
+                )
+                METRICS.observe("polybot_ai_latency_ms", float(usage.latency_ms or 0))
             except Exception:
                 LOGGER.exception(
                     "AI usage ledger write failed; cycle continues",

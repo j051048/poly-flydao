@@ -101,3 +101,14 @@ AI 只产出结构化概率、置信区间、论据、反方证据和有限方�
 ## 高级/旧多租户模式
 
 仓库仍保留 `Control API + Tenant Worker` 两服务、账户队列、RSA envelope、租户凭证/钱包生命周期和原子 tenant submission gate。它适用于未来 SaaS 化，但会增加部署和密钥管理复杂度，不是个人模式默认路径。
+
+## 数据归档与可观测性
+
+个人模式进程内还运行一个只读 `MarketArchiveWorker`（或 `polybot archive` 命令）：
+
+- 每 `POLYBOT_ARCHIVE_INTERVAL_SECONDS`（默认 300s）抓取前 `POLYBOT_ARCHIVE_MARKET_LIMIT` 个高流动性市场；
+- 保存市场元数据（upsert）与 YES/NO 双侧完整 L2 订单簿（append-only `snapshots`）；
+- 永不签名、不下单、不撤单；单市场失败只记录 skip，不影响交易循环；
+- 这是未来 point-in-time 回测与模型校准的数据地基，任何交易模式下都安全启用。
+
+每个交易周期自动追加权益历史（`equity_history`），每次预测自动追加 AI 调用台账（`ai_usage_ledger`，含 token/延迟/估算成本）；`/metrics` 暴露进程级 Prometheus 文本指标（周期数、skip 原因、AI 调用、归档快照、HTTP 计数），不含账号与密钥。

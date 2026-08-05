@@ -69,6 +69,7 @@ from polybot.jobs import (
     WorkerStatusSnapshot,
     arm_expiry,
 )
+from polybot.metrics import Metrics
 from polybot.models import utc_now
 from polybot.personal_execution import (
     PersonalExecutionRepository,
@@ -690,6 +691,7 @@ def create_app(
         lifespan=lifespan,
     )
     application.state.settings = api_settings
+    application.state.metrics = Metrics()
     application.state.auth_verifier = selected_verifier
     application.state.job_repository = selected_jobs
     application.state.credential_repository = selected_credentials
@@ -752,6 +754,11 @@ def create_app(
                 },
             )
         response = await call_next(request)
+        metrics: Metrics = application.state.metrics
+        metrics.increment(
+            "polybot_http_requests_total",
+            {"method": request.method, "status": str(response.status_code)},
+        )
         if request.url.path.startswith(
             (
                 "/v1/me",
@@ -779,6 +786,17 @@ def create_app(
             )
         )
         return response
+
+    @application.get("/metrics")
+    async def metrics_endpoint() -> Response:
+        """Expose generic process counters for uptime monitoring."""
+
+        metrics: Metrics = application.state.metrics
+        return Response(
+            content=metrics.render(),
+            media_type="text/plain; version=0.0.4",
+            headers={"Cache-Control": "no-store"},
+        )
 
     if api_settings.allowed_dashboard_origins:
         application.add_middleware(

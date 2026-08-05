@@ -8,8 +8,11 @@ from typing import Protocol
 from pydantic import BaseModel, Field
 
 from polybot.config import Settings
+from polybot.metrics import Metrics
 from polybot.models import MarketSpec, OrderBookSnapshot
 from polybot.stores.base import StateStore
+
+METRICS = Metrics()
 
 
 def build_archive_worker(settings: Settings) -> MarketArchiveWorker:
@@ -92,6 +95,7 @@ class MarketArchiveWorker:
             )
             return result
         result.markets_seen = len(markets)
+        METRICS.observe("polybot_archive_markets_seen", result.markets_seen)
 
         for market in markets:
             try:
@@ -110,6 +114,7 @@ class MarketArchiveWorker:
                 )
                 continue
             result.markets_saved += 1
+            METRICS.increment("polybot_archive_markets_saved_total")
 
             for token_id in (market.yes_token_id, market.no_token_id):
                 try:
@@ -129,6 +134,7 @@ class MarketArchiveWorker:
                     )
                     continue
                 result.snapshots_saved += 1
+                METRICS.increment("polybot_archive_snapshots_saved_total")
         return result
 
     async def serve(self, stop: asyncio.Event) -> None:

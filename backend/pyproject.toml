@@ -64,6 +64,7 @@ packages = ["src/polybot"]
 [tool.pytest.ini_options]
 addopts = "-q --strict-markers"
 asyncio_mode = "auto"
+asyncio_default_test_loop_scope = "function"
 testpaths = ["tests"]
 pythonpath = ["src"]
 

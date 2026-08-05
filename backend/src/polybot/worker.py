@@ -712,7 +712,7 @@ async def run_worker(
         await runtime.close()
         raise RuntimeError(
             "state store startup preflight failed; verify the Supabase Auth user, "
-            "account UUID, migrations through 0016, URL, and service-role key"
+            "account UUID, migrations through 0018, URL, and service-role key"
         )
     if isinstance(runtime.broker, PolymarketBroker):
         logger.info(
@@ -733,7 +733,7 @@ async def run_worker(
         )
         if not await personal_execution.schema_ready():
             await runtime.close()
-            raise RuntimeError("personal runtime requires Supabase migration 0016")
+            raise RuntimeError("personal runtime requires Supabase migration 0018")
         if settings.mode in {TradingMode.CANARY, TradingMode.LIVE}:
             runtime.store.bind_personal_execution_scope(
                 PersonalExecutionScope(owner_id=owner_id, mode=settings.mode)

@@ -45,6 +45,24 @@ def test_control_api_safe_defaults_and_auth_gate() -> None:
         assert denied.status_code == 401
 
 
+def test_metrics_endpoint_exposes_generic_counters_without_secrets() -> None:
+    app = create_app(
+        settings=Settings(_env_file=None),
+        jobs=InMemoryJobRepository(),
+        credentials=InMemoryCredentialRepository(),
+    )
+    with TestClient(app) as client:
+        client.get("/health")
+        response = client.get("/metrics")
+        body = response.text
+
+    assert response.status_code == 200
+    assert "polybot_http_requests_total" in body
+    assert 'method="GET"' in body
+    assert "service-role" not in body
+    assert "PRIVATE" not in body
+
+
 def test_request_rate_limiter_blocks_after_the_bounded_window_quota() -> None:
     limiter = RequestRateLimiter()
     assert limiter.allow("tenant:sensitive", limit=2)[0]
