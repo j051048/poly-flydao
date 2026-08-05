@@ -1,14 +1,18 @@
 "use client";
 
 import Link from "next/link";
+import dynamic from "next/dynamic";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import EquityChart from "../components/EquityChart";
 import {
   API_BASE_URL,
   apiRequest,
   readableApiError,
 } from "../lib/api";
+
+const EquityChart = dynamic(() => import("../components/EquityChart"), {
+  ssr: false,
+});
 
 type JsonRecord = Record<string, unknown>;
 type BusyAction = "cycle" | "arm" | "disarm" | null;

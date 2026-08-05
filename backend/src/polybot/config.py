@@ -198,6 +198,7 @@ class Settings(BaseSettings):
     credential_fingerprint_key: SecretStr | None = None
     geoblock_url: str = OFFICIAL_GEOBLOCK_URL
     auto_redeem_resolved: bool = False
+    notify_webhook_url: str | None = None
     live_ack: str = ""
     beta_sdk_ack: str = ""
     dedicated_wallet_ack: str = ""

@@ -45,10 +45,8 @@ jobs:
         run: uv run --python 3.12 --frozen --no-editable ruff check .
 
       - name: Test
-        # Gate is intentionally below the current local measurement (74%)
-        # until the heavy legacy modules (tenant_execution, supabase_store,
-        # credentials) gain focused tests. Tighten as coverage rises.
-        run: uv run --python 3.12 --frozen --no-editable python -m pytest --cov=polybot --cov-fail-under=72 --cov-report=term-missing
+        # Local measurement is 75%; keep 1pt of headroom for CI variance.
+        run: uv run --python 3.12 --frozen --no-editable python -m pytest --cov=polybot --cov-fail-under=74 --cov-report=term-missing
 
       - name: Generate SBOM (Python)
         run: |

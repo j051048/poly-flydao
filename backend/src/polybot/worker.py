@@ -17,6 +17,7 @@ from polybot.brokers.polymarket import PolymarketBroker
 from polybot.config import Settings, TradingMode, get_settings
 from polybot.engine import LiveSafetyLatchError
 from polybot.models import utc_now
+from polybot.notify import NotificationMessage, build_notifier
 from polybot.personal_execution import PersonalExecutionRepository
 from polybot.runtime import build_runtime
 from polybot.security_logging import configure_secure_logging, safe_json
@@ -683,6 +684,29 @@ async def run_worker(
     if settings.component == "api":
         raise RuntimeError("POLYBOT_COMPONENT=api cannot run the signer worker")
     configure_secure_logging(settings.log_level)
+    notifier = build_notifier(settings.notify_webhook_url)
+
+    async def notify_cycle(snapshot: dict[str, object]) -> None:
+        if notifier is None:
+            return
+        state = str(snapshot.get("state") or "unknown")
+        summary = snapshot.get("result_summary")
+        detail = ""
+        if isinstance(summary, dict):
+            detail = (
+                f"markets={summary.get('markets_scanned')} "
+                f"forecasts={summary.get('forecasts_created')} "
+                f"intents={summary.get('intents_approved')} "
+                f"executions={summary.get('executions')} "
+                f"skips={len(summary.get('skipped') or {})}"
+            )
+        await notifier.send(
+            NotificationMessage(
+                title=f"Polybot cycle {state}",
+                message=f"{snapshot.get('message') or ''} {detail}".strip(),
+                severity="error" if state == "failed" else "info",
+            )
+        )
     if settings.worker_execution_model == "tenant_queue":
         from polybot.tenant_execution import run_tenant_queue_worker
 
@@ -707,6 +731,8 @@ async def run_worker(
             cycle_observer(snapshot)
         except Exception:
             logger.exception("personal cycle status observer failed")
+        if snapshot.get("state") in {"succeeded", "failed"}:
+            asyncio.get_running_loop().create_task(notify_cycle(snapshot))
 
     if not await _wait_for_store_startup(runtime.store, logger):
         await runtime.close()
@@ -1072,6 +1098,19 @@ async def run_worker(
                                 "manual review and a resume are required"
                             )
                             await pause_personal_live("deterministic live safety latch")
+                            if notifier is not None:
+                                asyncio.get_running_loop().create_task(
+                                    notifier.send(
+                                        NotificationMessage(
+                                            title="Polybot live safety latch",
+                                            message=(
+                                                "real-money execution stopped by "
+                                                "deterministic safety latch"
+                                            ),
+                                            severity="critical",
+                                        )
+                                    )
+                                )
                         else:
                             redeemed = await runtime.broker.redeem_resolved()
                             if redeemed:
