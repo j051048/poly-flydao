@@ -1,21 +1,54 @@
-:root {
+:root,
+[data-theme="dark"] {
   color-scheme: dark;
-  --bg: #07110f;
-  --surface: rgba(15, 31, 27, 0.84);
-  --surface-strong: #11241f;
-  --line: rgba(178, 255, 218, 0.13);
-  --line-strong: rgba(178, 255, 218, 0.24);
-  --text: #f1f8f4;
-  --muted: #8fa79c;
-  --green: #53f2a7;
-  --green-soft: rgba(83, 242, 167, 0.1);
-  --yellow: #ffd166;
-  --yellow-soft: rgba(255, 209, 102, 0.11);
-  --red: #ff6b6b;
-  --red-soft: rgba(255, 107, 107, 0.1);
-  --blue: #76baff;
-  --radius: 18px;
-  --shadow: 0 24px 70px rgba(0, 0, 0, 0.3);
+  --bg: #090b10;
+  --surface: rgba(18, 22, 33, 0.82);
+  --surface-strong: #141a29;
+  --surface-hover: rgba(26, 33, 50, 0.95);
+  --line: rgba(148, 163, 196, 0.12);
+  --line-strong: rgba(148, 163, 196, 0.24);
+  --text: #f0f3f9;
+  --text-secondary: #c2cbdc;
+  --muted: #7886a0;
+  --green: #2cd49b;
+  --green-soft: rgba(44, 212, 155, 0.12);
+  --yellow: #f5bc51;
+  --yellow-soft: rgba(245, 188, 81, 0.12);
+  --red: #ff5c77;
+  --red-soft: rgba(255, 92, 119, 0.12);
+  --blue: #5ca1ff;
+  --blue-soft: rgba(92, 161, 255, 0.12);
+  --radius: 16px;
+  --shadow: 0 20px 60px rgba(0, 0, 0, 0.45), 0 0 1px rgba(255, 255, 255, 0.1) inset;
+  --body-bg: radial-gradient(circle at 15% 0%, rgba(92, 161, 255, 0.08), transparent 38rem),
+              radial-gradient(circle at 85% 15%, rgba(44, 212, 155, 0.06), transparent 32rem),
+              linear-gradient(180deg, #090b10 0%, #07090d 50%, #050608 100%);
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f4f6fb;
+  --surface: rgba(255, 255, 255, 0.88);
+  --surface-strong: #ffffff;
+  --surface-hover: rgba(255, 255, 255, 1);
+  --line: rgba(180, 195, 215, 0.35);
+  --line-strong: rgba(150, 170, 195, 0.55);
+  --text: #111827;
+  --text-secondary: #374151;
+  --muted: #64748b;
+  --green: #059669;
+  --green-soft: rgba(5, 150, 105, 0.1);
+  --yellow: #d97706;
+  --yellow-soft: rgba(217, 119, 6, 0.1);
+  --red: #e11d48;
+  --red-soft: rgba(225, 29, 72, 0.1);
+  --blue: #2563eb;
+  --blue-soft: rgba(37, 99, 235, 0.1);
+  --radius: 16px;
+  --shadow: 0 16px 40px rgba(100, 115, 140, 0.1), 0 1px 3px rgba(0, 0, 0, 0.05);
+  --body-bg: radial-gradient(circle at 12% 0%, rgba(37, 99, 235, 0.06), transparent 40rem),
+              radial-gradient(circle at 90% 10%, rgba(5, 150, 105, 0.05), transparent 35rem),
+              linear-gradient(180deg, #f8fafd 0%, #f4f6fb 50%, #eef1f7 100%);
 }
 
 * {
@@ -25,18 +58,18 @@
 html {
   min-width: 320px;
   background: var(--bg);
+  transition: background-color 0.28s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 body {
   min-height: 100vh;
   margin: 0;
   color: var(--text);
-  background:
-    radial-gradient(circle at 14% 0%, rgba(38, 153, 107, 0.18), transparent 34rem),
-    radial-gradient(circle at 92% 9%, rgba(54, 111, 105, 0.14), transparent 30rem),
-    linear-gradient(180deg, #081410 0%, #07100e 46%, #060c0b 100%);
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: var(--body-bg);
+  font-family: "Outfit", "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   -webkit-font-smoothing: antialiased;
+  letter-spacing: -0.01em;
+  transition: color 0.25s ease-out, background 0.25s ease-out;
 }
 
 button,
@@ -821,6 +854,10 @@ footer {
   *::after {
     scroll-behavior: auto !important;
     transition-duration: 0.01ms !important;
+  }
+
+  .brand-dot {
+    animation: none !important;
   }
 }
 
@@ -2523,4 +2560,309 @@ footer {
     align-items: flex-start;
     flex-direction: column;
   }
+}
+
+/* ==========================================================================
+   超顶级品控级光度时景与沉浸微交控增强引擎 (Sublime UI/UX Polish Engine)
+   ========================================================================== */
+
+/* 1. 全天候无缝丝顺光变主题手把件 (.theme-toggle-btn) */
+.sidebar-theme-wrapper {
+  margin: 8px 18px 20px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.theme-toggle-skeleton {
+  height: 42px;
+  border-radius: 99px;
+  background: var(--line);
+  opacity: 0.3;
+}
+
+.theme-toggle-btn {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  height: 42px;
+  padding: 4px;
+  border: 1px solid var(--line-strong);
+  border-radius: 99px;
+  background: var(--surface-strong);
+  color: var(--text);
+  box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.25), 0 2px 10px rgba(0, 0, 0, 0.08);
+  transition: all 0.28s cubic-bezier(0.34, 1.56, 0.64, 1);
+  overflow: hidden;
+  position: relative;
+}
+
+.theme-toggle-btn:hover {
+  transform: translateY(-1px);
+  border-color: var(--green);
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.1), 0 6px 18px rgba(0, 0, 0, 0.15);
+}
+
+.theme-toggle-btn.light {
+  background: linear-gradient(135deg, #ffffff, #f1f5fa);
+  border-color: rgba(180, 195, 215, 0.6);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.04), 0 4px 14px rgba(130, 150, 180, 0.18);
+}
+
+.toggle-track {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 0 8px;
+  gap: 10px;
+  position: relative;
+}
+
+.toggle-indicator {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: linear-gradient(145deg, var(--green-soft), var(--surface));
+  border: 1px solid var(--line-strong);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+  font-size: 1.05rem;
+  transition: transform 0.35s cubic-bezier(0.34, 1.56, 0.64, 1), background 0.3s ease;
+}
+
+.theme-toggle-btn.light .toggle-indicator {
+  background: #ffffff;
+  border-color: #f7d283;
+  box-shadow: 0 2px 8px rgba(230, 160, 40, 0.28);
+}
+
+.theme-toggle-btn:active .toggle-indicator {
+  transform: scale(0.9);
+}
+
+.toggle-label-text {
+  font-size: 0.82rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+  transition: color 0.25s ease;
+}
+
+.theme-toggle-btn:hover .toggle-label-text {
+  color: var(--text);
+}
+
+/* 2. 极致前行视线标冠层改整 */
+.sidebar-brand {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 22px 18px 12px;
+  position: relative;
+}
+
+.brand-mark {
+  position: relative;
+  overflow: visible !important;
+}
+
+.brand-dot {
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 10px var(--green), 0 0 20px var(--green);
+  animation: radar-pulse 3s infinite ease-in-out;
+}
+
+@keyframes radar-pulse {
+  0%, 100% { transform: scale(1); opacity: 0.95; }
+  50% { transform: scale(1.35); opacity: 0.6; }
+}
+
+.brand-text h1 {
+  font-size: 1.4rem;
+  font-weight: 850;
+  letter-spacing: -0.04em;
+  background: linear-gradient(135deg, var(--text) 30%, var(--muted) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+/* 3. 主导航列表项高动向悬触 (Silky Navigation Micro-interactions) */
+.nav-link {
+  display: flex;
+  align-items: center;
+  position: relative;
+  gap: 12px;
+  padding: 12px 18px;
+  border-radius: var(--radius);
+  font-weight: 600;
+  color: var(--muted);
+  transition: all 0.22s cubic-bezier(0.25, 0.8, 0.25, 1);
+  text-decoration: none;
+  overflow: hidden;
+}
+
+.nav-link:hover {
+  color: var(--text);
+  background: var(--surface);
+  transform: translateX(3px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+}
+
+.nav-link.active {
+  color: var(--green);
+  background: var(--green-soft);
+  font-weight: 750;
+  box-shadow: inset 0 0 0 1px rgba(44, 212, 155, 0.25);
+}
+
+.nav-item-indicator {
+  display: block;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--line-strong);
+  transition: transform 0.25s ease, background 0.25s ease, box-shadow 0.25s ease;
+}
+
+.nav-link:hover .nav-item-indicator {
+  transform: scale(1.4);
+  background: var(--text);
+}
+
+.nav-link.active .nav-item-indicator {
+  background: var(--green);
+  transform: scale(1.6);
+  box-shadow: 0 0 8px var(--green);
+}
+
+/* 4. 底栏实时运转指示点和信息层 */
+.user-profile-widget {
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  margin-bottom: 12px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
+}
+
+.live-pulse-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #10b981;
+  margin-right: 8px;
+  vertical-align: middle;
+  box-shadow: 0 0 8px #10b981;
+}
+
+.session-email {
+  font-size: 0.84rem;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-bottom: 8px;
+}
+
+.logout-btn {
+  font-size: 0.78rem !important;
+  color: var(--red) !important;
+  opacity: 0.88;
+  transition: opacity 0.2s;
+}
+
+.logout-btn:hover {
+  opacity: 1;
+  text-decoration: underline;
+}
+
+.login-link-btn {
+  background: linear-gradient(135deg, var(--green-soft), transparent) !important;
+  border: 1px solid var(--green) !important;
+  color: var(--green) !important;
+  text-align: center;
+  justify-content: center;
+}
+
+.sidebar-copyright p {
+  font-size: 0.76rem;
+  opacity: 0.65;
+  letter-spacing: 0.02em;
+}
+
+/* 5. 卡片普遍无感霜冻悬浮翻新 (Universal Frosted Glass & Card Polish) */
+[data-theme="light"] .global-sidebar {
+  background: rgba(255, 255, 255, 0.85);
+  backdrop-filter: blur(16px);
+  border-right: 1px solid var(--line);
+  box-shadow: 1px 0 20px rgba(150, 165, 190, 0.1);
+}
+
+[data-theme="dark"] .global-sidebar {
+  background: rgba(14, 18, 28, 0.75);
+  backdrop-filter: blur(16px);
+  border-right: 1px solid var(--line);
+  box-shadow: 4px 0 30px rgba(0, 0, 0, 0.4);
+}
+
+/* ==========================================================================
+   Light theme hardcoded-color corrections
+   The original palette hard-codes light text/dark surfaces that become
+   unreadable on a white card; remap them to theme variables in light mode.
+   ========================================================================== */
+[data-theme="light"] .risk-row dd,
+[data-theme="light"] .metric dd,
+[data-theme="light"] .detail-list dd,
+[data-theme="light"] .positions-table td,
+[data-theme="light"] .analysis-rationale,
+[data-theme="light"] .ai-current-connection strong,
+[data-theme="light"] .personal-status-grid strong,
+[data-theme="light"] .setup-checklist > summary,
+[data-theme="light"] .field-label,
+[data-theme="light"] .safety-banner strong,
+[data-theme="light"] .source-list strong {
+  color: var(--text);
+}
+
+[data-theme="light"] .risk-row dt,
+[data-theme="light"] .detail-list dt,
+[data-theme="light"] .metric dt,
+[data-theme="light"] .field-help,
+[data-theme="light"] .panel-note {
+  color: var(--muted);
+}
+
+[data-theme="light"] .source-list a,
+[data-theme="light"] .account-id-callout code,
+[data-theme="light"] .env-variable-list code {
+  color: var(--green);
+}
+
+[data-theme="light"] .metric {
+  background: rgba(245, 247, 252, 0.7);
+  border-color: var(--line);
+}
+
+[data-theme="light"] .api-address {
+  background: rgba(255, 255, 255, 0.72);
+  border-color: var(--line);
+}
+
+[data-theme="light"] .getting-started-banner {
+  background: rgba(255, 255, 255, 0.86);
+  border-color: var(--line);
+}
+
+[data-theme="light"] .safety-banner {
+  background: linear-gradient(90deg, rgba(5, 150, 105, 0.07), rgba(5, 150, 105, 0.02));
+  border-color: rgba(5, 150, 105, 0.2);
 }
