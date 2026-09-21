@@ -13,7 +13,7 @@
 | Web 端到端冒烟 | `npm run test:e2e`（Playwright，chromium）4 项通过：登录表单、未授权重定向、`/api/deployment-check`、诊断页渲染 |
 | Web 生产构建 | Next.js `next build` 通过 |
 | Python 生产依赖审计 | `pip-audit`：`No known vulnerabilities found` |
-| Web 生产依赖审计 | `npm audit --audit-level=high`：0 个漏洞 |
+| Web 生产依赖审计 | `npm audit --omit=dev --audit-level=high`：0 个 high/critical（`sharp` 已通过 override 升到 0.35.4；仅剩 2 个 moderate，来自 `postcss` 尚未发布修复的上游 advisory） |
 | Python 分发制品 | wheel 与 sdist 构建成功 |
 | 制品内容 | wheel 包含 GDELT Context collector、Public Suffix 去重、异步 SDK client 初始化、wallet bootstrap、trade ID 对账、数据库时钟 arm expiry CAS 和交易所侧 GTD 到期保护 |
 | 数据归档 | 只读 `polybot archive`（全量 L2 快照入库），迁移 0017 权益历史、0018 AI 用量台账，schema 版本由 `polybot.schema.EXPECTED_SCHEMA_VERSION` 集中管理（当前 20） |
