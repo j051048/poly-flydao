@@ -1,0 +1,52 @@
+/* ==========================================================================
+   Light theme hardcoded-color corrections
+   The original palette hard-codes light text/dark surfaces that become
+   unreadable on a white card; remap them to theme variables in light mode.
+   ========================================================================== */
+[data-theme="light"] .risk-row dd,
+[data-theme="light"] .metric dd,
+[data-theme="light"] .detail-list dd,
+[data-theme="light"] .positions-table td,
+[data-theme="light"] .analysis-rationale,
+[data-theme="light"] .ai-current-connection strong,
+[data-theme="light"] .personal-status-grid strong,
+[data-theme="light"] .setup-checklist > summary,
+[data-theme="light"] .field-label,
+[data-theme="light"] .safety-banner strong,
+[data-theme="light"] .source-list strong {
+  color: var(--text);
+}
+
+[data-theme="light"] .risk-row dt,
+[data-theme="light"] .detail-list dt,
+[data-theme="light"] .metric dt,
+[data-theme="light"] .field-help,
+[data-theme="light"] .panel-note {
+  color: var(--muted);
+}
+
+[data-theme="light"] .source-list a,
+[data-theme="light"] .account-id-callout code,
+[data-theme="light"] .env-variable-list code {
+  color: var(--green);
+}
+
+[data-theme="light"] .metric {
+  background: rgba(245, 247, 252, 0.7);
+  border-color: var(--line);
+}
+
+[data-theme="light"] .api-address {
+  background: rgba(255, 255, 255, 0.72);
+  border-color: var(--line);
+}
+
+[data-theme="light"] .getting-started-banner {
+  background: rgba(255, 255, 255, 0.86);
+  border-color: var(--line);
+}
+
+[data-theme="light"] .safety-banner {
+  background: linear-gradient(90deg, rgba(5, 150, 105, 0.07), rgba(5, 150, 105, 0.02));
+  border-color: rgba(5, 150, 105, 0.2);
+}

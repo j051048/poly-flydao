@@ -4,6 +4,10 @@ import type { ReactNode } from "react";
 import LegacySecretCleanup from "../components/LegacySecretCleanup";
 import Sidebar from "../components/Sidebar";
 import "./globals.css";
+import "./styles/toasts.css";
+// Loaded last on purpose: these two files must keep overriding the base sheet.
+import "./styles/polish.css";
+import "./styles/light-corrections.css";
 
 export const metadata: Metadata = {
   title: "Polybot 控制台 | AI 量化投资与决策中心",

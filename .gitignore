@@ -19,6 +19,11 @@ build/
 node_modules/
 .next/
 coverage/
+playwright-report/
+test-results/
+blob-report/
+.playwright/
+*.tsbuildinfo
 data/*.db
 data/*.jsonl
 .pytest-*

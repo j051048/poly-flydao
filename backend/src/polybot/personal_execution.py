@@ -10,7 +10,7 @@ from typing import Any
 from uuid import UUID
 
 from polybot.config import TradingMode
-from polybot.models import RuntimeControl
+from polybot.models import QuarantineRecord, RuntimeControl
 from polybot.schema import EXPECTED_SCHEMA_VERSION
 from supabase import Client
 
@@ -36,6 +36,10 @@ class PersonalRuntimeBinding:
     readiness_fencing_token: int | None
     last_seen_at: datetime
     updated_at: datetime
+    # ``None`` means "no durable baseline yet": the reconciler then falls back
+    # to the deployment-level POLYBOT_RECONCILE_BASELINE_UTC value. The default
+    # keeps existing fixtures and hand-built bindings valid.
+    reconcile_baseline_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +100,93 @@ class PersonalExecutionRepository:
         )
         row = self._first(response)
         return _binding_from_row(row) if row else None
+
+    async def get_reconcile_baseline(self) -> datetime | None:
+        binding = await self.get_binding()
+        return binding.reconcile_baseline_at if binding is not None else None
+
+    async def get_desired_mode(self) -> TradingMode | None:
+        """Read the durable mode request written by the dashboard.
+
+        The worker applies this at a cycle boundary, which is what makes the mode
+        selector real instead of a switch that only reports success.
+        """
+
+        response = await self._execute(
+            self._client.table("runtime_profiles")
+            .select("desired_mode")
+            .eq("account_id", self.account_id)
+            .limit(1)
+        )
+        row = self._first(response)
+        if not row:
+            return None
+        raw = row.get("desired_mode")
+        if raw is None:
+            return None
+        try:
+            return TradingMode(str(raw))
+        except ValueError:
+            return None
+
+    async def set_reconcile_baseline(self, baseline: datetime) -> datetime:
+        """Move the durable ignore-before timestamp.
+
+        The RPC refuses while the runtime is armed or a non-terminal order
+        exists, so this cannot be used to paper over live exposure.
+        """
+
+        if baseline.tzinfo is None or baseline.utcoffset() is None:
+            raise ValueError("reconcile baseline must be timezone-aware")
+        response = await self._execute(
+            self._client.rpc(
+                "set_personal_reconcile_baseline",
+                {
+                    "p_account_id": self.account_id,
+                    "p_baseline": baseline.isoformat(),
+                },
+            )
+        )
+        row = self._first(response)
+        if row is None:
+            raise RuntimeError("reconcile baseline was not persisted")
+        binding = _binding_from_row(row)
+        if binding.reconcile_baseline_at is None:
+            raise RuntimeError("reconcile baseline was not persisted")
+        return binding.reconcile_baseline_at
+
+    async def list_quarantine(self, limit: int = 200) -> list[QuarantineRecord]:
+        response = await self._execute(
+            self._client.table("reconciliation_quarantine")
+            .select("*")
+            .eq("account_id", self.account_id)
+            .order("created_at", desc=True)
+            .limit(max(1, min(limit, 500)))
+        )
+        return [
+            QuarantineRecord(
+                kind=row.get("kind") or "trade",
+                external_key=str(row.get("external_key") or ""),
+                reason=str(row.get("reason") or "unknown"),
+                condition_id=row.get("condition_id"),
+                token_id=row.get("token_id"),
+                side=row.get("side"),
+                size=(
+                    None
+                    if row.get("size") is None
+                    else _nonnegative_decimal(row["size"], "quarantine size")
+                ),
+                price=(None if row.get("price") is None else Decimal(str(row["price"]))),
+                notional_usd=(
+                    None
+                    if row.get("notional_usd") is None
+                    else _nonnegative_decimal(row["notional_usd"], "quarantine notional")
+                ),
+                occurred_at=_optional_datetime(row.get("occurred_at"), "quarantine occurred at"),
+                detail=row.get("detail") or {},
+            )
+            for row in response.data or []
+        ]
 
     async def bind_wallet(
         self,
@@ -420,6 +511,10 @@ def _binding_from_row(row: dict[str, Any]) -> PersonalRuntimeBinding:
         readiness_checked_at=_optional_datetime(
             row.get("readiness_checked_at"),
             "readiness checked at",
+        ),
+        reconcile_baseline_at=_optional_datetime(
+            row.get("reconcile_baseline_at"),
+            "reconcile baseline",
         ),
         readiness_owner_id=(
             str(row["readiness_owner_id"]) if row.get("readiness_owner_id") is not None else None

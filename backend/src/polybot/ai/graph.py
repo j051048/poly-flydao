@@ -6,6 +6,7 @@ from typing import TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from polybot.ai.base import ForecastProvider
+from polybot.ai.calibration import Calibrator
 from polybot.models import Forecast, ForecastRequest
 
 
@@ -25,10 +26,15 @@ class ForecastGraph:
         *,
         primary_model: str,
         critic_model: str,
+        calibrator: Calibrator | None = None,
     ):
         self.provider = provider
         self.primary_model = primary_model
         self.critic_model = critic_model
+        # Reliability curve driven by the account's own resolved forecasts. It
+        # is swapped in place by the worker, so an uncalibrated graph is always
+        # the safe default.
+        self.calibrator = calibrator
         builder = StateGraph(ForecastState)
         builder.add_node("primary", self._primary)
         builder.add_node("critic", self._critic)
@@ -38,6 +44,11 @@ class ForecastGraph:
         builder.add_edge("critic", "aggregate")
         builder.add_edge("aggregate", END)
         self.graph = builder.compile()
+
+    def set_calibrator(self, calibrator: Calibrator | None) -> None:
+        """Hot-swap the reliability curve used by the next aggregation."""
+
+        self.calibrator = calibrator
 
     async def _primary(self, state: ForecastState) -> ForecastState:
         request = state["request"].model_copy(
@@ -57,13 +68,23 @@ class ForecastGraph:
     async def _aggregate(self, state: ForecastState) -> ForecastState:
         first = state["primary"]
         second = state["critic"]
-        probability = (first.probability_yes + second.probability_yes) / Decimal("2")
+        raw_probability = (first.probability_yes + second.probability_yes) / Decimal("2")
         disagreement = abs(first.probability_yes - second.probability_yes)
         confidence = min(first.confidence, second.confidence) * max(
             Decimal("0"), Decimal("1") - disagreement
         )
-        low = min(first.probability_low, second.probability_low, probability)
-        high = max(first.probability_high, second.probability_high, probability)
+        calibrator = self.calibrator
+        probability = raw_probability
+        calibration_note = ""
+        if calibrator is not None:
+            probability = calibrator.apply(raw_probability)
+            if probability != raw_probability:
+                calibration_note = (
+                    f" Reliability calibration moved the estimate from "
+                    f"{raw_probability} to {probability} ({calibrator.describe()})."
+                )
+        low = min(first.probability_low, second.probability_low, raw_probability, probability)
+        high = max(first.probability_high, second.probability_high, raw_probability, probability)
         combined = Forecast(
             market_id=first.market_id,
             probability_yes=probability,
@@ -81,6 +102,7 @@ class ForecastGraph:
             rationale=(
                 f"Deterministic two-pass ensemble; absolute disagreement={disagreement}. "
                 "Intervals were unioned and confidence was penalized."
+                f"{calibration_note}"
             ),
         )
         return {"final": combined}

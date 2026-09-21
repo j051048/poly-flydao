@@ -78,8 +78,54 @@ describe("buildSetupSteps", () => {
     );
   });
 
-  it("blocks the safe-paper action when the deployment is in a real-money mode", () => {
-    const paper = buildSetupSteps({
+  it("turns the validation step into a canary check instead of blocking it", () => {
+    const steps = buildSetupSteps({
+      health: { ok: true },
+      personal: {
+        enabled: true,
+        mode: "canary",
+        auto_run_enabled: true,
+        ai: { configured: true },
+        wallet: { configured: true },
+      },
+      status: { latest_job: { mode: "paper", status: "succeeded" } },
+    });
+    const paper = steps.find((step) => step.key === "paper");
+
+    // A canary deployment is never stuck behind a Paper run again.
+    expect(paper?.state).not.toBe("blocked");
+    expect(paper?.state).toBe("todo");
+    expect(paper?.title).toContain("Canary");
+    expect(paper?.href).toBe("/");
+    expect(setupProgress(steps)).toBeGreaterThanOrEqual(50);
+  });
+
+  it("marks the canary check done once a canary cycle succeeds", () => {
+    const steps = buildSetupSteps({
+      health: { ok: true },
+      personal: {
+        enabled: true,
+        mode: "canary",
+        desired_mode: "canary",
+        auto_run_enabled: true,
+        worker_ready: true,
+        ai: { configured: true },
+        wallet: { configured: true, bound: true },
+      },
+      status: { latest_job: { mode: "canary", status: "succeeded" } },
+    });
+
+    expect(steps.map((step) => [step.key, step.state])).toEqual([
+      ["infrastructure", "done"],
+      ["environment", "done"],
+      ["paper", "done"],
+      ["automation", "done"],
+    ]);
+    expect(setupProgress(steps)).toBe(100);
+  });
+
+  it("ignores a stale paper cycle when the deployment moved to canary", () => {
+    const canary = buildSetupSteps({
       health: { ok: true },
       personal: {
         enabled: true,
@@ -91,8 +137,51 @@ describe("buildSetupSteps", () => {
       status: { latest_job: { mode: "paper", status: "succeeded" } },
     }).find((step) => step.key === "paper");
 
-    expect(paper?.state).toBe("blocked");
-    expect(paper?.href).toBe("/settings#runtime");
-    expect(paper?.description).toContain("POLYBOT_MODE=paper");
+    expect(canary?.state).toBe("todo");
+  });
+
+  it("explains a clamped mode request instead of hiding it", () => {
+    const steps = buildSetupSteps({
+      health: { ok: true },
+      personal: {
+        enabled: true,
+        mode: "paper",
+        desired_mode: "canary",
+        mode_note: "本部署未开启实盘能力。",
+        auto_run_enabled: true,
+        ai: { configured: true },
+        wallet: { configured: true },
+      },
+    });
+    const paper = steps.find((step) => step.key === "paper");
+
+    expect(paper?.description).toContain("本部署未开启实盘能力");
+    expect(paper?.description).toContain("Paper 模拟");
+  });
+
+  it("surfaces quarantined reconciliation activity through the parsed status", () => {
+    const steps = buildSetupSteps({
+      health: { ok: true },
+      personal: {
+        enabled: true,
+        mode: "paper",
+        auto_run_enabled: true,
+        ai: { configured: true },
+        wallet: { configured: true },
+        reconciliation: {
+          baseline_at: "2026-09-21T00:00:00+00:00",
+          quarantined_count: 2,
+          quarantined_items: [
+            {
+              kind: "trade",
+              external_key: "manual-1",
+              reason: "unmapped_account_trade",
+            },
+          ],
+        },
+      },
+    });
+
+    expect(steps).toHaveLength(4);
   });
 });

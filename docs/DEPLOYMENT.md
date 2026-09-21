@@ -83,6 +83,7 @@ POLYBOT_ARCHIVE_INTERVAL_SECONDS=300
 # POLYBOT_AI_FALLBACK_PROVIDERS=litellm,openai_compatible
 # 可选：忽略该 UTC 时间之前的账户历史成交（仅用于"专用钱包历史手动交易"豁免，
 # 之后的任何成交仍必须映射机器人订单）。格式：2026-08-05T00:00:00Z
+# 建议改用控制台「重置对账基准」：无需重新部署，且在 armed 或有未结订单时会被拒绝。
 # POLYBOT_RECONCILE_BASELINE_UTC=2026-08-05T00:00:00Z
 ```
 
@@ -97,6 +98,13 @@ POLYBOT_ARCHIVE_INTERVAL_SECONDS=300
 - `POLYBOT_AI_FALLBACK_PROVIDERS`：逗号分隔的只读预测 fallback 顺序（`openai` / `litellm` / `openai_compatible`），只影响 AI 预测，不影响签名与下单。
 - `POLYBOT_NOTIFY_WEBHOOK_URL`：Telegram/Discord 兼容 webhook，周期完成、失败与安全熔断会推送；不配置则完全静默。
 - `POLYBOT_RECONCILE_BASELINE_UTC`：仅在你确认旧钱包上存在"机器人之外的历史手动成交"且已清仓时使用。设置后，该时间之前的账户成交会在对账时被忽略（不落库、不告警），该时间之后的新成交仍然严格校验必须来自机器人订单。**使用前请确认钱包当前无任何 token 持仓，只保留 USDC。**
+- `POLYBOT_MARKET_FILTER`：默认 `none`（按流动性取 top-N 市场）。设为 `crypto_updown` 后，每轮只保留短周期加密 Up/Down 窗口（默认 BTC/ETH 5 分钟市场），`POLYBOT_CRYPTO_UPDOWN_ASSETS` 支持 `BTC`/`ETH`/`SOL`/`XRP`。该过滤器只会**减少**市场，永远不会扩大风险敞口；过滤掉但仍有持仓的市场保持"只减仓"退出。
+- `POLYBOT_CALIBRATION_REFRESH_SECONDS`：AI 可靠性校准曲线从已结算预测中重建的间隔（默认 900 秒）。样本不足时曲线保持关闭，AI 不会用噪声修正自己。
+- `POLYBOT_AI_CYCLE_UNITS_ALERT` / `POLYBOT_AI_CYCLE_COST_ALERT_USD`：单周期 AI 请求数或预估成本超过阈值时推送一次告警（每小时最多一次）。当日预算本身在每次调用前原子扣减，用尽即**硬停**新预测，已持仓仍按风控退出，UTC 零点自动恢复。
+- `POLYBOT_RETENTION_*`：`ai_usage_ledger`、`equity_history`、`snapshots` 三张只增历史表的保留窗口（默认 90/365/30 天）与执行间隔（默认 86400 秒）。裁剪走数据库 `prune_polybot_history`（service_role-only、分批、窗口有硬下限），订单、成交、预测、持仓和对账台账属于真实资金审计轨迹，永不被删除。关闭裁剪可设 `POLYBOT_RETENTION_ENABLED=false`。
+- `POLYBOT_READINESS_ALERT_SECONDS`：worker 连续未就绪超过该秒数后，通过 `POLYBOT_NOTIFY_WEBHOOK_URL` 推送一次阻塞原因（含门控名与修复建议），同一轮故障最多每 6 小时重复一次，恢复时再推送一条恢复消息。进程存活但永远不交易时，这是唯一的对外信号。
+- 高级/遗留参数（个人模板刻意不写入 `.env.example`，因为个人模式会自动推断 provider，写入反而会造成误配）：`POLYBOT_MARKET_LIMIT`（每轮扫描市场数，默认 20）、`POLYBOT_RESOLUTION_POLL_SECONDS`（默认 300）、`POLYBOT_AI_TIMEOUT_SECONDS`（默认 45）、`POLYBOT_MIN_EDGE`（默认 0.04）、`POLYBOT_MIN_FORECAST_CONFIDENCE`（默认 0.55）、`POLYBOT_MAX_TRADE_RISK_PCT` / `POLYBOT_MAX_EVENT_EXPOSURE_PCT` / `POLYBOT_MAX_GROSS_EXPOSURE_PCT` / `POLYBOT_DAILY_LOSS_LIMIT_PCT` / `POLYBOT_MAX_DRAWDOWN_PCT`（默认 0.005 / 0.02 / 0.10 / 0.02 / 0.08，控制台风控档位会批量覆盖）、`POLYBOT_SUPABASE_TIMEOUT_SECONDS`（默认 15，避免数据库卡死拖住周期）、`POLYBOT_API_HOST`（默认 0.0.0.0）、`POLYBOT_EVIDENCE_PROVIDER`（`auto|openai_web|gdelt|none`）、`POLYBOT_CRITIC_MODEL`。
+- 非个人（多租户）实盘路径额外要求三个确认串，personal 模式不需要：`POLYBOT_LIVE_ACK=I_UNDERSTAND_REAL_FUNDS_CAN_BE_LOST`、`POLYBOT_BETA_SDK_ACK=I_ACCEPT_BETA_SDK_CANARY_ONLY`、`POLYBOT_DEDICATED_WALLET_ACK=I_CONFIRM_DEDICATED_WALLET_NO_EXTERNAL_FLOWS`，以及 `POLYBOT_SIGNED_PAYLOAD_KEY` 与凭证解密密钥。该路径的 AI provider 需显式给出 `POLYBOT_AI_PROVIDER`（`mock|openai|litellm|openai_compatible`）、`POLYBOT_OPENAI_API_KEY`、`POLYBOT_LITELLM_BASE_URL`、`POLYBOT_LITELLM_API_KEY`、`POLYBOT_CUSTOM_AI_ALLOWED_HOSTS`。**个人部署不要设置这些变量。**
 - 只使用全新、低余额、专门给机器人使用的钱包。不要使用主钱包或助记词。
 - 如果 Polymarket 账户使用独立 proxy/funder 地址，额外设置 `POLYMARKET_DEPOSIT_WALLET=0x...`；直接 EOA 可不填。
 
@@ -106,9 +114,11 @@ POLYBOT_ARCHIVE_INTERVAL_SECONDS=300
 GET https://YOUR_ZEABUR_DOMAIN/livez
 GET https://YOUR_ZEABUR_DOMAIN/health
 GET https://YOUR_ZEABUR_DOMAIN/worker-health
+GET https://YOUR_ZEABUR_DOMAIN/readyz
 ```
 
-`/livez` 仅表示进程存在；`/health` 与 `/worker-health` 分别检查 Supabase 控制面和内嵌 Worker。
+`/livez` 仅表示进程存在；`/health` 检查 Supabase 控制面；`/worker-health` 与 `/readyz`
+返回同一份结构化就绪体（含 `gates` / `blockers` / `warnings`），任何角色都可用。
 
 ## 3. 部署 Vercel
 
@@ -143,14 +153,23 @@ POLYBOT_PERSONAL_LIVE_ENABLED=false
 
 ## 5. 显式开启 Canary/Live
 
-真实资金不是 UI 中的隐藏开关。Zeabur 必须同时设置：
+真实资金能力仍由 Zeabur 上的单一开关授权，但**模式本身可以热切换**：
 
 ```dotenv
 POLYBOT_PERSONAL_LIVE_ENABLED=true
-POLYBOT_MODE=canary
+POLYBOT_MODE=paper
 ```
 
-稳定验证后，若确实接受更高风险，才把 `canary` 改为 `live`。每次变更都需要重新部署。只设置其中一个会 fail closed；AI 不能修改这些环境变量。
+重启一次后，`paper` / `shadow` / `canary` / `live` 全部在控制台切换（写入
+`runtime_profiles.desired_mode`），常驻 Worker 在下一个周期边界自动对齐，**不需要再改环境变量、也不需要重新部署**。
+
+- `POLYBOT_PERSONAL_LIVE_ENABLED=false` 时请求 `canary`/`live` 会被 API 以 409 明确拒绝
+  （不再是"界面提示成功但什么都没变"）；若数据库里残留了实盘模式，实际运行会被降级为 `paper`，
+  并在 `/v1/status` 的 `mode_note` 与向导里写明原因。
+- 建议始终保持 `POLYBOT_MODE=paper`：进程永远以安全模式启动，实盘只能由控制台显式切换。
+- 从实盘切回 `paper`/`shadow` 时，Worker 会先撤单、确认零开放单并写入 disarm 后字才继续模拟周期。
+
+稳定验证后，若确实接受更高风险，在控制台切到 `live` 即可。AI 不能修改任何环境变量，也不能修改模式。
 
 Canary/Live 仍会检查数据库运行控制、Worker 租约、控制版本、钱包余额/allowance 就绪时间、风险限制、未解决订单、官方地理限制和盘口新鲜度。`POLYBOT_PERSONAL_LIVE_ENABLED=true` 是 owner 的部署级授权，不是盈利证明，也不会解除 P2 research-only 闸门。
 
@@ -169,6 +188,49 @@ Canary/Live 仍会检查数据库运行控制、Worker 租约、控制版本、�
 - EVM 私钥是 `0x` 加 64 个十六进制字符；
 - AI Base URL 是公开 HTTPS；个人模式会自动把该 hostname 设为唯一允许的 AI Key 目标；
 - `POLYBOT_MODE=canary/live` 时同时设置了 `POLYBOT_PERSONAL_LIVE_ENABLED=true`。
+
+### 容器健康检查与就绪探针
+
+- Docker 镜像自带 `HEALTHCHECK`（`python -m polybot.healthcheck`），只探测 `/livez`。
+  **故意不探测 `/readyz`**：一个"没丢钱但还没就绪"的部署（钱包未绑定、未充值、存在隔离成交）
+  必须继续运行并把原因报出来，而不是被平台判定为不健康后重启。
+- Zeabur 服务的 Health Check Path 建议填 `/livez`（存活）；把 `/readyz` 用于人工/外部监控：
+
+```text
+GET https://YOUR_ZEABUR_DOMAIN/livez    # 200 = 进程存活（平台探针用这个）
+GET https://YOUR_ZEABUR_DOMAIN/readyz   # 200 = Worker 全部就绪；503 = 见 blockers
+```
+
+`/readyz`（与 `/worker-health` 同源）在任何 `SERVICE_ROLE` 下都可用，返回结构化原因：
+
+```json
+{
+  "ready": false,
+  "gates": { "store": true, "lease": true, "runtime_control": true, "reconciliation": false },
+  "blockers": [
+    {
+      "code": "unmapped_account_trade",
+      "gate": "reconciliation",
+      "message": "账户里存在无法映射到机器人订单的成交。",
+      "fix": "在官网清仓后于「诊断」页重置对账基准。"
+    }
+  ],
+  "warnings": [{"code": "reconciliation_quarantine", "message": "1 笔成交处于隔离区"}],
+  "not_ready_seconds": 180
+}
+```
+
+建议对 `/readyz` 配置外部监控（UptimeRobot / Better Stack 等）：连续返回 503 超过
+`POLYBOT_NOTIFY_WEBHOOK_URL` 告警阈值时人工介入，而不是重启容器。
+
+### 对账隔离区与基准重置
+
+- 机器人无法证明属于自己、且**不在机器人自身 token 足迹内**的成交/持仓会进入
+  `reconciliation_quarantine`：不计入机器人权益、不参与成本基础，也不会阻塞你的第一次运行。
+- 一旦成交落在机器人交易过的 token 上，仍按原样 fail closed（隔离区不能掩盖真实分歧）。
+- 控制台「重置对账基准」（`POST /v1/personal/reconciliation/baseline`）等价于设置
+  `POLYBOT_RECONCILE_BASELINE_UTC`，但无需重新部署，且被数据库函数拒绝于
+  armed / `accept_new_intents` / 撤单进行中 / 存在非终态订单的状态。
 
 新镜像会在启动 Uvicorn 前运行脱敏配置检查。优先查找 Zeabur 日志中的
 `POLYBOT_CONFIG_ERROR field=... message=...`；它会指出规则但不会打印 Key。不要只复制
@@ -199,7 +261,17 @@ uv run python -m polybot.config_check
 
 ### Worker 一直未就绪
 
-确认只有一个 Zeabur 副本、`WEB_CONCURRENCY=1`、`SERVICE_ROLE=personal`，并查看 Zeabur 启动日志。个人模式不需要第二个 `worker` 服务。
+不要再靠读日志猜：直接看 `/readyz` 的 `blockers`，每一项都带 `code`、中文原因和 `fix`。
+
+- `store_unhealthy`：Supabase 不可达、service-role key 错误或 migration 未跑完；
+- `lease_unavailable`：有第二个副本在抢租约，确认只有一个副本且 `WEB_CONCURRENCY=1`；
+- `runtime_control_blocked`：暂停中或撤单未确认，在控制台解除暂停后自动恢复；
+- `unmapped_account_trade` / `fill_ledger_position_mismatch` / `fill_ledger_incomplete`：
+  钱包里有机器人之外的历史成交。已清仓时点「诊断 → 重置对账基准」即可，无需重新部署；
+  未清仓请先在官网卖出。落在机器人自身 token 上的分歧仍会 fail closed，不会被隔离掩盖。
+
+`warnings` 里的 `reconciliation_quarantine` 表示部分成交/持仓被隔离：机器人会继续运行，
+但这些仓位不计入权益、相关市场也不会被交易。
 
 ## 7. 部署前验证
 

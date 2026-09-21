@@ -1,19 +1,27 @@
 # 交付验证记录
 
-验证日期：2026-07-27（首版）；2026-08-05（审计循环 5 收尾基线）。
+验证日期：2026-07-27（首版）；2026-08-05（审计循环 5 收尾基线）；2026-09-21（P1/P2 全量整改收尾）。
 
 ## 已通过
 
 | 检查 | 结果 |
 |---|---|
-| Python lint | 在 `backend` 工作目录执行 `ruff check .` 通过 |
-| Python 测试 | `362 passed`（`pytest --cov=polybot` 实测覆盖率 75%） |
+| Python lint | 在 `backend` 工作目录执行 `ruff check src/ tests/` 通过 |
+| Python 测试 | `443 passed`（P1/P2 整改后全量回归，`pytest -q`） |
+| Web lint | 在 `apps/web` 执行 `npm run lint`（ESLint 9 + `next/core-web-vitals`）通过 |
+| Web 单元测试 | `npm test`（Vitest）12 个文件 / 79 项通过 |
+| Web 端到端冒烟 | `npm run test:e2e`（Playwright，chromium）4 项通过：登录表单、未授权重定向、`/api/deployment-check`、诊断页渲染 |
 | Web 生产构建 | Next.js `next build` 通过 |
 | Python 生产依赖审计 | `pip-audit`：`No known vulnerabilities found` |
 | Web 生产依赖审计 | `npm audit --audit-level=high`：0 个漏洞 |
 | Python 分发制品 | wheel 与 sdist 构建成功 |
 | 制品内容 | wheel 包含 GDELT Context collector、Public Suffix 去重、异步 SDK client 初始化、wallet bootstrap、trade ID 对账、数据库时钟 arm expiry CAS 和交易所侧 GTD 到期保护 |
-| 数据归档 | 只读 `polybot archive`（全量 L2 快照入库），迁移 0017 权益历史、0018 AI 用量台账，schema 版本 18 由 `polybot.schema.EXPECTED_SCHEMA_VERSION` 集中管理 |
+| 数据归档 | 只读 `polybot archive`（全量 L2 快照入库），迁移 0017 权益历史、0018 AI 用量台账，schema 版本由 `polybot.schema.EXPECTED_SCHEMA_VERSION` 集中管理（当前 20） |
+| 数据保留 | 迁移 0020 `prune_polybot_history`（service_role-only、分批、窗口硬下限）只裁剪 `ai_usage_ledger`/`equity_history`/`snapshots`；worker 每日执行，订单/成交/预测/持仓/对账台账永不被删除 |
+| 外部存活监控 | `polybot.monitor`：worker 连续未就绪超过 `POLYBOT_READINESS_ALERT_SECONDS` 推送阻塞原因（每轮故障一次，最长每 6 小时重复），恢复时推送恢复消息 |
+| 就绪可解释性 | `/readyz` 与 `/worker-health` 返回 `gates`/`blockers`/`warnings`；每条阻塞项都带 `code` 与可执行修复建议 |
+| AI 闭环 | 可靠性校准曲线（`polybot.ai.calibration`）由已结算预测重建并作用于集成概率；当日预算在调用前原子扣减，用尽即硬停 |
+| 模块划分 | 后端不再有 >1500 行模块：`jobs/` 拆包，`api_models`/`api_dependencies`、`credentials_types`/`credentials_crypto`、`stores/payloads`/`supabase_rows`/`supabase_reconcile`、`personal_cycle`、`monitor`、`retention`、`performance` 各自独立 |
 | 前端 | 仪表盘净值曲线（Recharts，懒加载）、设置页一键风控档位（conservative/balanced/advanced）、性能页 AI 成本台账 |
 | 可观测性 | `/metrics` Prometheus 文本端点、`POLYBOT_NOTIFY_WEBHOOK_URL` 外部告警（周期/熔断） |
 | AI | 多 provider 只读 fallback（`POLYBOT_AI_FALLBACK_PROVIDERS`）、每次预测 token/延迟/成本台账 |

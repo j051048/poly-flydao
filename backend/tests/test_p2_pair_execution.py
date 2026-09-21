@@ -9,6 +9,11 @@ from polybot.execution.order_manager import (
     OrderGroupState,
     PairOrderManager,
 )
+from polybot.experimental.crypto_direction import (
+    CryptoDirectionSignal,
+    DirectionalOverlay,
+    DirectionalOverlayConfig,
+)
 from polybot.inventory.pair_book import PairFill, PairInventoryBook
 from polybot.models import (
     LiquidityRole,
@@ -19,11 +24,6 @@ from polybot.models import (
     OrderLegStatus,
     Outcome,
     utc_now,
-)
-from polybot.signals.crypto_direction import (
-    CryptoDirectionSignal,
-    DirectionalOverlay,
-    DirectionalOverlayConfig,
 )
 
 

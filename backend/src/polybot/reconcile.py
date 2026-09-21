@@ -6,6 +6,7 @@ import hashlib
 import logging
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -15,6 +16,8 @@ from polybot.models import (
     AccountActivityUpdate,
     AccountPositionUpdate,
     Outcome,
+    QuarantineKind,
+    QuarantineRecord,
     UserOrderUpdate,
     UserTradeUpdate,
     utc_now,
@@ -25,6 +28,30 @@ from polybot.stores.ledger import IncompleteFillLedgerError
 logger = logging.getLogger(__name__)
 
 FillCallback = Callable[[UserTradeUpdate], Awaitable[None]]
+
+FAILURE_UNMAPPED_TRADE = "unmapped_account_trade"
+FAILURE_POSITION_MISMATCH = "fill_ledger_position_mismatch"
+FAILURE_LEDGER_INCOMPLETE = "fill_ledger_incomplete"
+FAILURE_UNAVAILABLE = "reconciliation_error"
+
+
+@dataclass(frozen=True)
+class ReconciliationFailure:
+    """Stable, operator-facing classification of the last reconciliation error."""
+
+    code: str
+    message: str
+
+
+def classify_reconciliation_failure(exc: Exception) -> ReconciliationFailure:
+    if isinstance(exc, IncompleteFillLedgerError):
+        text = str(exc)
+        if "does not map to a durable bot order" in text:
+            return ReconciliationFailure(code=FAILURE_UNMAPPED_TRADE, message=text)
+        if "live position does not match" in text:
+            return ReconciliationFailure(code=FAILURE_POSITION_MISMATCH, message=text)
+        return ReconciliationFailure(code=FAILURE_LEDGER_INCOMPLETE, message=text)
+    return ReconciliationFailure(code=FAILURE_UNAVAILABLE, message=f"{type(exc).__name__}: {exc}")
 
 
 class OrderReconciler:
@@ -42,6 +69,7 @@ class OrderReconciler:
         market_data: MarketData | None = None,
         fill_callback: FillCallback | None = None,
         baseline_utc: datetime | None = None,
+        quarantine_enabled: bool = True,
     ):
         self.client = client
         self._private_key = private_key
@@ -69,6 +97,42 @@ class OrderReconciler:
         # wallet, so startup cost is preferred over an unprovable ledger.
         self._trade_after = "0"
         self._activity_start = 1
+        self.last_failure: ReconciliationFailure | None = None
+        self.quarantine_enabled = quarantine_enabled
+        self._quarantined_tokens: set[str] = set()
+        self._quarantined_conditions: set[str] = set()
+        self._bot_tokens_cache: set[str] | None = None
+        self.quarantine_count = 0
+
+    @property
+    def baseline_utc(self) -> datetime | None:
+        return self._baseline_utc
+
+    def set_baseline(self, value: datetime | None) -> None:
+        """Adopt a new ignore-before timestamp and replay the account history.
+
+        Resetting the baseline is the operator's escape hatch for a wallet that
+        was used manually before the bot existed. It only ever *ignores* older
+        activity; anything after the new baseline is still strictly validated.
+        """
+
+        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+            raise ValueError("baseline must be timezone-aware")
+        self._baseline_utc = value
+        self._trade_after = "0"
+        self._activity_start = 1
+        self.healthy.clear()
+
+    @property
+    def quarantined_token_ids(self) -> frozenset[str]:
+        return frozenset(self._quarantined_tokens)
+
+    def _record_failure(self, exc: Exception) -> None:
+        self.last_failure = classify_reconciliation_failure(exc)
+        self.healthy.clear()
+
+    def _clear_failure(self) -> None:
+        self.last_failure = None
 
     async def run(self) -> None:
         periodic = asyncio.create_task(self._periodic_rest(), name="polymarket-rest-reconcile")
@@ -82,6 +146,7 @@ class OrderReconciler:
 
                     self._handle = await client.subscribe(UserSpec(markets=None))
                     self.healthy.set()
+                    self._clear_failure()
                     backoff = 1.0
                     async for event in self._handle:
                         if self._closed:
@@ -89,8 +154,8 @@ class OrderReconciler:
                         await self._apply_user_event(event)
                 except asyncio.CancelledError:
                     raise
-                except Exception:
-                    self.healthy.clear()
+                except Exception as exc:
+                    self._record_failure(exc)
                     if self._closed:
                         break
                     logger.exception("authenticated Polymarket reconciliation failed")
@@ -115,8 +180,9 @@ class OrderReconciler:
                 await self.reconcile_rest()
                 if self._handle is not None:
                     self.healthy.set()
-            except Exception:
-                self.healthy.clear()
+                    self._clear_failure()
+            except Exception as exc:
+                self._record_failure(exc)
                 if not self._closed:
                     logger.exception("periodic Polymarket REST reconciliation failed")
 
@@ -149,6 +215,9 @@ class OrderReconciler:
         return self.client
 
     async def _reconcile_rest_once(self) -> None:
+        # The bot's durable token footprint can change as new orders are signed,
+        # so re-read it once per pass instead of trusting a stale snapshot.
+        self._bot_tokens_cache = None
         order_count = 0
         open_order_ids: set[str] = set()
         async for order in self.client.list_open_orders().iter_items():
@@ -300,20 +369,69 @@ class OrderReconciler:
             if position.size > 0 and position.condition_id not in ledger.redeemed_condition_ids
         }
         tolerance = Decimal("0.000001")
+        foreign_token_ids: set[str] = set()
         for token_id in set(live_quantities).union(ledger.token_quantities):
             live_size = live_quantities.get(token_id, Decimal("0"))
             ledger_size = ledger.token_quantities.get(token_id, Decimal("0"))
-            if abs(live_size - ledger_size) > tolerance:
-                raise IncompleteFillLedgerError(
-                    "live position does not match the complete durable fill ledger "
-                    f"for token {token_id}"
+            if abs(live_size - ledger_size) <= tolerance:
+                continue
+            if self.quarantine_enabled and await self._is_foreign_token(token_id):
+                await self._quarantine_foreign_position(
+                    token_id=token_id,
+                    live_size=live_size,
+                    positions=positions,
                 )
-        await self.store.reconcile_positions(positions, self.account_id)
+                foreign_token_ids.add(token_id)
+                continue
+            raise IncompleteFillLedgerError(
+                "live position does not match the complete durable fill ledger "
+                f"for token {token_id}"
+            )
+        # Foreign inventory must never enter the durable position table: it is
+        # not bot capital and would corrupt equity, risk, and PnL.
+        owned_positions = [
+            position for position in positions if position.token_id not in foreign_token_ids
+        ]
+        await self.store.reconcile_positions(owned_positions, self.account_id)
         # Advance only after orders, fills, positions, and the independent
         # quantity check all succeed. Failures force the next pass to replay the
         # same complete window.
         self._trade_after = next_trade_after
         self._activity_start = next_activity_start
+
+    async def _quarantine_foreign_position(
+        self,
+        *,
+        token_id: str,
+        live_size: Decimal,
+        positions: list[AccountPositionUpdate],
+    ) -> None:
+        """Record position inventory the bot's ledger cannot explain."""
+
+        match = next((item for item in positions if item.token_id == token_id), None)
+        record = QuarantineRecord(
+            kind=QuarantineKind.POSITION,
+            external_key=token_id,
+            reason="foreign_position",
+            condition_id=match.condition_id if match is not None else None,
+            token_id=token_id,
+            size=live_size,
+            price=match.mark_price if match is not None else None,
+            notional_usd=(
+                live_size * match.mark_price
+                if match is not None and match.mark_price is not None
+                else None
+            ),
+            detail={"note": "position held outside the bot's durable fill ledger"},
+        )
+        await self.store.record_quarantine(self.account_id, record)
+        self._quarantined_tokens.add(token_id)
+        self.quarantine_count += 1
+        logger.warning(
+            "quarantined %s foreign position shares in token %s",
+            live_size,
+            token_id,
+        )
 
     async def _apply_user_event(self, event: Any) -> None:
         if event.type == "order":
@@ -463,10 +581,78 @@ class OrderReconciler:
                 )
         if account_updates:
             return account_updates
+        if self.quarantine_enabled and await self._quarantine_unmapped_trade(value, updates):
+            return []
         raise IncompleteFillLedgerError(
             "account trade does not map to a durable bot order; dedicated-wallet "
             "ledger integrity cannot be proven"
         )
+
+    async def _bot_tokens(self) -> set[str]:
+        """Cache the bot's durable token footprint for one reconciliation pass."""
+
+        if self._bot_tokens_cache is None:
+            self._bot_tokens_cache = await self.store.durable_token_ids(self.account_id)
+        return self._bot_tokens_cache
+
+    async def _is_foreign_token(self, token_id: str) -> bool:
+        """True when the bot has never signed an intent or order for this token.
+
+        Only then is unattributable activity provably *not* the bot's own
+        inventory. Any overlap with the bot's durable footprint keeps the
+        original fail-closed error.
+        """
+
+        if token_id in self._quarantined_tokens:
+            return True
+        return token_id not in await self._bot_tokens()
+
+    async def _quarantine_unmapped_trade(
+        self,
+        value: Any,
+        updates: list[UserTradeUpdate],
+    ) -> bool:
+        """Quarantine an unattributable trade instead of deadlocking the worker.
+
+        Quarantined activity is never counted as bot inventory and never feeds
+        cost basis; it merely stops one pre-existing manual trade from making a
+        dedicated wallet permanently unusable.
+        """
+
+        if not updates:
+            return False
+        tokens = {update.token_id for update in updates if update.token_id}
+        if not tokens:
+            return False
+        for token_id in tokens:
+            if not await self._is_foreign_token(token_id):
+                return False
+        trade_id = str(getattr(value, "id", "") or "")
+        for update in updates:
+            record = QuarantineRecord(
+                kind=QuarantineKind.TRADE,
+                external_key=f"{trade_id or update.clob_trade_id}:{update.token_id}",
+                reason="unmapped_account_trade",
+                condition_id=update.condition_id,
+                token_id=update.token_id,
+                side=str(update.side),
+                size=update.size,
+                price=update.price,
+                notional_usd=update.size * update.price,
+                occurred_at=update.matched_at,
+                detail={"candidate_order_ids": list(update.candidate_order_ids)},
+            )
+            await self.store.record_quarantine(self.account_id, record)
+            self._quarantined_tokens.add(update.token_id)
+            if update.condition_id:
+                self._quarantined_conditions.add(update.condition_id)
+            self.quarantine_count += 1
+        logger.warning(
+            "quarantined %d unattributable account trade(s) touching %d foreign token(s)",
+            len(updates),
+            len(tokens),
+        )
+        return True
 
     @staticmethod
     def _is_not_found(exc: Exception) -> bool:

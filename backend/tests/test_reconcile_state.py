@@ -5,12 +5,12 @@ import pytest
 
 from polybot.models import ExecutionResult, ExecutionStatus, Side, UserTradeUpdate, utc_now
 from polybot.stores.ledger import IncompleteFillLedgerError
-from polybot.stores.supabase_store import (
-    SupabaseStore,
+from polybot.stores.payloads import (
     _aggregate_order_fill_payload,
     _merge_execution_order_payload,
     _merge_fill_payload,
 )
+from polybot.stores.supabase_store import SupabaseStore
 
 
 def test_duplicate_execution_save_cannot_regress_confirmed_order() -> None:

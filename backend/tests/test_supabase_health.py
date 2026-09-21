@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 
+from polybot.schema import EXPECTED_SCHEMA_VERSION
 from polybot.stores.supabase_store import SupabaseStore, TenantScopeError
 
 
@@ -27,7 +28,7 @@ class Query:
     def execute(self):
         self.client.executions.append((self.source, self.column))
         if self.source == "rpc:polybot_schema_version":
-            return SimpleNamespace(data=18)
+            return SimpleNamespace(data=EXPECTED_SCHEMA_VERSION)
         return SimpleNamespace(data=[])
 
 

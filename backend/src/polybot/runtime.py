@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import inspect
+import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from polybot.ai.base import EvidenceCollector, ForecastProvider
@@ -14,17 +16,25 @@ from polybot.ai.graph import ForecastGraph
 from polybot.ai.mock import SafeMockForecastProvider
 from polybot.ai.openai_provider import OpenAIForecastProvider
 from polybot.brokers.base import Broker
+from polybot.brokers.mode_aware import ModeAwareBroker
 from polybot.brokers.paper import ControlPlaneBroker, PaperBroker, ShadowBroker
 from polybot.brokers.polymarket import PolymarketBroker
 from polybot.config import Settings, TradingMode, get_settings
 from polybot.engine import TradingEngine
 from polybot.market import StreamingPolymarketMarketData
+from polybot.market_filters.crypto_updown import (
+    CryptoUpDownFilter,
+    CryptoUpDownFilterConfig,
+)
+from polybot.models import MarketSpec
 from polybot.reconcile import OrderReconciler
 from polybot.risk import RiskEngine
 from polybot.stores.base import StateStore
 from polybot.stores.memory import MemoryStore
 from polybot.stores.supabase_store import SupabaseStore
 from polybot.strategy import ValueStrategy
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -36,6 +46,29 @@ class Runtime:
     market_data: StreamingPolymarketMarketData
     forecast_provider: ForecastProvider
     reconciler: OrderReconciler | None = None
+    live_broker: PolymarketBroker | None = None
+    mode_aware: ModeAwareBroker | None = None
+
+    @property
+    def paper_broker(self) -> PaperBroker | None:
+        """The active simulator, wherever it lives, or ``None`` for live-only."""
+
+        if self.mode_aware is not None:
+            return (
+                self.mode_aware.paper
+                if isinstance(self.mode_aware.paper, PaperBroker)
+                else None
+            )
+        return self.broker if isinstance(self.broker, PaperBroker) else None
+
+    def replace_paper_broker(self, broker: PaperBroker) -> None:
+        """Install a freshly restored durable paper account without a restart."""
+
+        if self.mode_aware is not None:
+            self.mode_aware.replace_paper(broker)
+            return
+        self.broker = broker
+        self.engine.broker = broker
 
     async def close(self) -> None:
         close_provider = getattr(self.forecast_provider, "close", None)
@@ -59,6 +92,7 @@ def _store(settings: Settings) -> StateStore:
             settings.supabase_url,
             settings.supabase_service_role_key.get_secret_value(),
             account_id=settings.account_id,
+            timeout_seconds=settings.supabase_timeout_seconds,
         )
     if settings.mode in {TradingMode.CANARY, TradingMode.LIVE}:
         raise ValueError("canary/live requires durable Supabase idempotency and runtime controls")
@@ -143,6 +177,35 @@ def _evidence_collector(
     raise ValueError(f"unsupported evidence provider: {name}")
 
 
+def _market_filter(
+    settings: Settings,
+) -> Callable[[list[MarketSpec]], list[MarketSpec]] | None:
+    """Build the optional candidate-universe filter described by settings.
+
+    The filter runs after discovery and can only remove markets; the engine
+    keeps honouring held positions separately. Unsupported symbols are rejected
+    by ``Settings`` validation, so a misconfiguration fails at startup instead
+    of silently trading nothing.
+    """
+
+    if settings.market_filter != "crypto_updown":
+        return None
+    classifier = CryptoUpDownFilter(
+        CryptoUpDownFilterConfig(
+            allowed_assets=frozenset(settings.crypto_updown_asset_symbols)
+        )
+    )
+    LOGGER.info(
+        "crypto Up/Down market filter enabled for assets: %s",
+        ", ".join(settings.crypto_updown_asset_symbols),
+    )
+
+    def _apply(markets: list[MarketSpec]) -> list[MarketSpec]:
+        return [classified.market for classified in classifier.filter(markets)]
+
+    return _apply
+
+
 def build_runtime(
     settings: Settings | None = None,
     *,
@@ -159,17 +222,14 @@ def build_runtime(
     )
     market_data = StreamingPolymarketMarketData(max_cache_age_seconds=settings.max_book_age_seconds)
     reconciler: OrderReconciler | None = None
-    if broker_override is not None:
-        broker = broker_override
-    elif settings.mode is TradingMode.PAPER:
-        broker: Broker = PaperBroker(settings.bankroll_usd)
-    elif settings.mode is TradingMode.SHADOW:
-        broker = ShadowBroker(settings.bankroll_usd)
-    elif settings.component == "api":
-        broker = ControlPlaneBroker(settings.bankroll_usd)
-    else:
-        broker = PolymarketBroker(settings, store)
-        reconciler = OrderReconciler(
+    live_broker: PolymarketBroker | None = None
+    mode_aware: ModeAwareBroker | None = None
+
+    def build_live_broker() -> PolymarketBroker:
+        return PolymarketBroker(settings, store)
+
+    def build_reconciler() -> OrderReconciler:
+        return OrderReconciler(
             private_key=settings.polymarket_private_key.get_secret_value(),
             wallet=settings.polymarket_deposit_wallet,
             account_id=settings.account_id,
@@ -178,6 +238,42 @@ def build_runtime(
             market_data=market_data,
             baseline_utc=settings.reconcile_baseline_datetime,
         )
+
+    # A personal deployment that is allowed to touch real funds keeps every mode
+    # ready at once so the operator can switch between paper, shadow, canary and
+    # live from the dashboard without a redeploy. The mode dispatch itself lives
+    # in ModeAwareBroker; every real-money submission still requires a fresh arm
+    # that matches the currently effective mode.
+    hot_switchable = bool(
+        settings.personal_mode
+        and settings.personal_live_enabled
+        and settings.polymarket_private_key is not None
+        and settings.component != "api"
+    )
+    if broker_override is not None:
+        broker = broker_override
+    elif hot_switchable:
+        paper = PaperBroker(settings.bankroll_usd)
+        live_broker = build_live_broker()
+        mode_aware = ModeAwareBroker(
+            settings,
+            paper=paper,
+            shadow=ShadowBroker(settings.bankroll_usd),
+            live=live_broker,
+            live_factory=build_live_broker,
+        )
+        broker: Broker = mode_aware
+        reconciler = build_reconciler()
+    elif settings.mode is TradingMode.PAPER:
+        broker = PaperBroker(settings.bankroll_usd)
+    elif settings.mode is TradingMode.SHADOW:
+        broker = ShadowBroker(settings.bankroll_usd)
+    elif settings.component == "api":
+        broker = ControlPlaneBroker(settings.bankroll_usd)
+    else:
+        live_broker = build_live_broker()
+        broker = live_broker
+        reconciler = build_reconciler()
     engine = TradingEngine(
         settings=settings,
         market_data=market_data,
@@ -187,6 +283,10 @@ def build_runtime(
         risk=RiskEngine(settings),
         broker=broker,
         store=store,
+        quarantined_tokens=(
+            None if reconciler is None else lambda: reconciler.quarantined_token_ids
+        ),
+        market_filter=_market_filter(settings),
     )
     return Runtime(
         settings=settings,
@@ -196,4 +296,6 @@ def build_runtime(
         market_data=market_data,
         forecast_provider=provider,
         reconciler=reconciler,
+        live_broker=live_broker,
+        mode_aware=mode_aware,
     )

@@ -17,6 +17,7 @@ from polybot.models import (
     OrderBookSnapshot,
     OrderReconcileTarget,
     Outcome,
+    QuarantineRecord,
     RiskDecision,
     RuntimeControl,
     TradeIntent,
@@ -24,6 +25,7 @@ from polybot.models import (
     UserTradeUpdate,
     WorkerLease,
 )
+from polybot.performance import PerformanceSnapshot
 from polybot.stores.ledger import FillLedgerSnapshot
 
 
@@ -135,6 +137,42 @@ class StateStore(Protocol):
         usage: AIUsageRecord,
     ) -> None: ...
 
+    async def consume_ai_budget(
+        self,
+        account_id: str,
+        units: int = 1,
+    ) -> tuple[bool, int, int]:
+        """Atomically reserve ``units`` of the daily AI budget.
+
+        Returns ``(allowed, used, limit)``. Implementations must reserve before
+        the spend happens so an exhausted budget can never be exceeded.
+        """
+
+        ...
+
+    async def calibration_snapshot(self, account_id: str) -> PerformanceSnapshot:
+        """Resolved-forecast reliability data used by the AI calibrator."""
+
+        ...
+
+    async def prune_history(
+        self,
+        *,
+        ai_usage_days: int,
+        equity_days: int,
+        snapshot_days: int,
+        batch_limit: int = 20_000,
+    ) -> dict[str, int]:
+        """Delete history rows older than the given windows, in bounded batches.
+
+        Only the append-only history tables are eligible. Orders, fills,
+        forecasts, positions, and the reconciliation ledger are the audit trail
+        for real money and must never be removed here. Implementations return
+        the per-table deleted row counts.
+        """
+
+        ...
+
     async def list_ai_usage(
         self,
         account_id: str,
@@ -156,6 +194,14 @@ class StateStore(Protocol):
     async def durable_order_ids(
         self, candidate_order_ids: set[str], account_id: str
     ) -> set[str]: ...
+
+    async def durable_token_ids(self, account_id: str) -> set[str]: ...
+
+    async def record_quarantine(self, account_id: str, record: QuarantineRecord) -> None: ...
+
+    async def list_quarantine(
+        self, account_id: str, limit: int = 200
+    ) -> list[QuarantineRecord]: ...
 
     async def pending_trade_ids(self, account_id: str) -> set[str]: ...
 

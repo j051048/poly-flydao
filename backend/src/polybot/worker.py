@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import socket
@@ -8,35 +9,99 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any
+from decimal import Decimal
 from uuid import uuid4
 
+from polybot.ai.calibration import CalibrationConfig, Calibrator, refresh_calibrator
 from polybot.brokers.base import Broker
-from polybot.brokers.paper import PaperBroker
 from polybot.brokers.polymarket import PolymarketBroker
 from polybot.config import Settings, TradingMode, get_settings
 from polybot.engine import LiveSafetyLatchError
 from polybot.models import utc_now
+from polybot.monitor import monitor_readiness
 from polybot.notify import NotificationMessage, build_notifier
+from polybot.personal_cycle import (
+    _clear_personal_live_downgrade,
+    _load_personal_paper_broker,
+    _prepare_personal_live_cycle,
+    _save_personal_paper_broker,
+)
 from polybot.personal_execution import PersonalExecutionRepository
+from polybot.readiness import (
+    GATE_LEASE,
+    GATE_RECONCILIATION,
+    GATE_RUNTIME_CONTROL,
+    GATE_STORE,
+    READINESS,
+    ReadinessBlocker,
+)
+from polybot.retention import RetentionPolicy, prune_history
 from polybot.runtime import build_runtime
+from polybot.runtime_mode import resolve_effective_mode
 from polybot.security_logging import configure_secure_logging, safe_json
 from polybot.stores.base import StateStore
 from polybot.stores.supabase_store import PersonalExecutionScope, SupabaseStore
 
-_WORKER_READY = False
-PersonalCleanupClientFactory = Callable[[str, str | None], Any]
+# Stable, operator-facing explanations for every way reconciliation can fail.
+# The worker is fail-closed, so an unattributed failure is indistinguishable
+# from a crash; these codes are what makes the gate actionable in the dashboard.
+_RECONCILIATION_BLOCKERS: dict[str, tuple[str, str]] = {
+    "unmapped_account_trade": (
+        "账户里存在无法映射到机器人订单的成交，成本基础无法证明。",
+        "若该钱包曾用于手动交易：在 Polymarket 官网清仓后于「诊断」页重置对账基准；"
+        "或为该机器人单独使用一个专用钱包。",
+    ),
+    "fill_ledger_position_mismatch": (
+        "链上持仓与机器人成交台账不一致，无法计算可信的成本基础。",
+        "确认没有手动买入且未清仓的仓位；有则在官网清仓后重置对账基准。",
+    ),
+    "fill_ledger_incomplete": (
+        "成交台账不完整（存在无法解释的卖出或赎回）。",
+        "在当前钱包上不要混用手动与机器人交易；确认后重置对账基准。",
+    ),
+    "reconciliation_error": (
+        "对账过程本身失败（SDK、网络或凭证错误）。",
+        "检查 Zeabur 日志中的 polybot.reconcile 记录，并确认 Polymarket 凭证与网络可达。",
+    ),
+}
 
 
 def _set_worker_ready(value: bool) -> None:
-    global _WORKER_READY
-    _WORKER_READY = value
+    """Force the overall verdict.
+
+    Gates are the source of truth while the worker is running; this helper only
+    exists for the two fail-closed boundaries (startup and shutdown) where every
+    gate must be dropped regardless of what the loop last observed.
+    """
+
+    if not value:
+        READINESS.reset_gates()
+    else:
+        READINESS.set_ready(True)
 
 
 def is_worker_ready() -> bool:
     """Return process-local readiness without exposing account or credential state."""
 
-    return _WORKER_READY
+    return READINESS.ready
+
+
+def worker_readiness() -> dict[str, object]:
+    """Public readiness contract: gates plus operator-actionable blockers."""
+
+    return READINESS.snapshot()
+
+
+def _reconciliation_blocker(reason_code: str) -> ReadinessBlocker:
+    message, fix = _RECONCILIATION_BLOCKERS.get(
+        reason_code, _RECONCILIATION_BLOCKERS["reconciliation_error"]
+    )
+    return ReadinessBlocker(
+        code=f"reconciliation_{reason_code}",
+        gate=GATE_RECONCILIATION,
+        message=message,
+        fix=fix,
+    )
 
 
 @dataclass(frozen=True)
@@ -74,12 +139,9 @@ async def _handle_worker_health_request(
             status = "200 OK"
             body = b'{"ok":true,"role":"worker"}'
         elif len(parts) == 3 and parts[0] in {"GET", "HEAD"} and parts[1] == "/readyz":
-            if _WORKER_READY:
-                status = "200 OK"
-                body = b'{"ok":true,"role":"worker","ready":true}'
-            else:
-                status = "503 Service Unavailable"
-                body = b'{"ok":false,"role":"worker","ready":false}'
+            payload = READINESS.snapshot()
+            status = "200 OK" if payload["ready"] else "503 Service Unavailable"
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         if len(parts) == 3 and parts[0] == "HEAD":
             body = b""
     except (TimeoutError, ValueError):
@@ -398,277 +460,6 @@ async def _wait_for_next_cycle(
                 await task
 
 
-async def _prepare_personal_live_cycle(
-    *,
-    settings: Settings,
-    broker: PolymarketBroker,
-    repository: PersonalExecutionRepository,
-    owner_id: str,
-    fencing_token: int,
-    logger: logging.Logger,
-) -> bool:
-    """Refresh the short-lived personal authority without persisting secrets."""
-
-    environment = broker.client.environment
-    binding = await repository.bind_wallet(
-        owner_id=owner_id,
-        fencing_token=fencing_token,
-        signer_address=str(broker.client.signer),
-        deposit_wallet_address=str(broker.client.wallet),
-        chain_id=int(environment.chain_id),
-        collateral_token=str(environment.collateral_token),
-    )
-    if binding is None:
-        logger.warning("personal wallet binding lost its active worker lease; retrying")
-        return False
-    if binding.paused:
-        logger.info("personal live execution is paused")
-        return False
-
-    now = utc_now()
-    control = await repository.get_runtime_control()
-    if control.cancellation_pending:
-        logger.info("personal live execution is waiting for cancellation acknowledgement")
-        return False
-    # An expired stored arm must first be expired and cancellation-acknowledged
-    # by the runtime-control watcher. Calling the arm RPC in this state is a CAS
-    # no-op, so treat it as a normal retry instead of a permanent failure.
-    if control.armed and not control.is_live_armed:
-        logger.info("expired personal runtime arm is being safely rolled over")
-        return False
-    renew_before = now + timedelta(minutes=5)
-    needs_arm = (
-        not control.is_live_armed
-        or control.mode is not settings.mode
-        or control.armed_until is None
-        or control.armed_until <= renew_before
-    )
-    if needs_arm:
-        control = await repository.arm(
-            owner_id=owner_id,
-            fencing_token=fencing_token,
-            mode=settings.mode,
-            armed_until=now + timedelta(minutes=10),
-            expected_version=control.version,
-        )
-        if control is None:
-            logger.info("personal runtime arm raced a control or lease update; retrying")
-            return False
-
-    collateral, allowances_ready = await broker.ensure_trading_approvals()
-    ready_binding = await repository.record_wallet_readiness(
-        owner_id=owner_id,
-        fencing_token=fencing_token,
-        binding_version=binding.binding_version,
-        collateral_balance_pusd=collateral,
-        allowances_ready=allowances_ready,
-    )
-    if ready_binding is None:
-        logger.warning("personal wallet readiness lost its active fence; retrying")
-        return False
-    return bool(
-        not ready_binding.paused
-        and ready_binding.allowances_ready
-        and ready_binding.collateral_balance_pusd is not None
-        and ready_binding.collateral_balance_pusd > 0
-    )
-
-
-def _personal_cleanup_client(private_key: str, wallet: str | None) -> Any:
-    from polymarket import SecureClient
-
-    return SecureClient.create(private_key=private_key, wallet=wallet)
-
-
-async def _clear_personal_live_downgrade(
-    *,
-    settings: Settings,
-    store: StateStore,
-    owner_id: str,
-    fencing_token: int,
-    logger: logging.Logger,
-    client_factory: PersonalCleanupClientFactory = _personal_cleanup_client,
-) -> bool:
-    """Fail closed before a former live deployment may run paper/shadow cycles."""
-
-    if settings.mode not in {TradingMode.PAPER, TradingMode.SHADOW}:
-        return True
-    try:
-        control = await store.get_runtime_control(settings.account_id)
-        unresolved = await store.has_unresolved_live_orders(settings.account_id)
-        historical_live = bool(
-            control.mode in {TradingMode.CANARY, TradingMode.LIVE}
-            or control.armed
-            or control.accept_new_intents
-            or not control.kill_switch
-            or control.cancellation_pending
-            or unresolved
-        )
-        lease_valid = await store.validate_worker_lease(
-            settings.account_id,
-            owner_id,
-            fencing_token,
-        )
-        if not lease_valid:
-            logger.warning("personal downgrade cleanup is waiting for the active worker lease")
-            return False
-        if not historical_live:
-            if control.mode is settings.mode:
-                return True
-            aligned = await store.disarm_runtime_control(
-                settings.account_id,
-                settings.mode,
-            )
-            return bool(
-                aligned.mode is settings.mode
-                and not aligned.armed
-                and aligned.kill_switch
-                and await store.validate_worker_lease(
-                    settings.account_id,
-                    owner_id,
-                    fencing_token,
-                )
-            )
-
-        historical_mode = (
-            control.mode
-            if control.mode in {TradingMode.CANARY, TradingMode.LIVE}
-            else TradingMode.LIVE
-        )
-        if (
-            control.cancellation_pending
-            and not control.armed
-            and not control.accept_new_intents
-            and control.kill_switch
-            and control.mode is historical_mode
-        ):
-            disarmed = control
-        else:
-            disarmed = await store.disarm_runtime_control(
-                settings.account_id,
-                historical_mode,
-            )
-
-        key = settings.polymarket_private_key
-        if key is None:
-            logger.critical(
-                "POLYMARKET_PRIVATE_KEY is required to clear the former live wallet "
-                "before paper/shadow execution"
-            )
-            return False
-
-        client: Any | None = None
-        try:
-            client = await asyncio.to_thread(
-                client_factory,
-                key.get_secret_value(),
-                settings.polymarket_deposit_wallet,
-            )
-            await asyncio.to_thread(client.cancel_all)
-            open_orders: list[Any] = []
-            for delay in (0.0, 0.2, 0.5):
-                if delay:
-                    await asyncio.sleep(delay)
-                open_orders = await asyncio.to_thread(
-                    lambda: list(client.list_open_orders().iter_items())
-                )
-                if not open_orders:
-                    break
-            if open_orders:
-                logger.critical(
-                    "personal downgrade cleanup could not verify zero exchange open orders"
-                )
-                return False
-        finally:
-            if client is not None:
-                close = getattr(client, "close", None)
-                if callable(close):
-                    with suppress(Exception):
-                        await asyncio.to_thread(close)
-
-        if not await store.validate_worker_lease(
-            settings.account_id,
-            owner_id,
-            fencing_token,
-        ):
-            logger.critical("personal downgrade cleanup lost its worker lease")
-            return False
-        if await store.has_unresolved_live_orders(settings.account_id):
-            logger.critical(
-                "personal downgrade cleanup is blocked by a signed, submitting, "
-                "or unknown durable order"
-            )
-            return False
-        acknowledged = await store.acknowledge_runtime_cancellation(
-            settings.account_id,
-            disarmed.version,
-        )
-        if acknowledged is None:
-            logger.warning("personal downgrade cancellation acknowledgement raced; retrying")
-            return False
-        if not await store.validate_worker_lease(
-            settings.account_id,
-            owner_id,
-            fencing_token,
-        ):
-            logger.critical("personal downgrade cleanup lost its lease before mode alignment")
-            return False
-        aligned = await store.disarm_runtime_control(
-            settings.account_id,
-            settings.mode,
-        )
-        if not await store.validate_worker_lease(
-            settings.account_id,
-            owner_id,
-            fencing_token,
-        ):
-            logger.critical("personal downgrade cleanup lost its lease after mode alignment")
-            return False
-        return bool(
-            aligned.mode is settings.mode
-            and not aligned.armed
-            and not aligned.accept_new_intents
-            and aligned.kill_switch
-            and not aligned.cancellation_pending
-        )
-    except Exception:
-        logger.critical(
-            "personal downgrade cleanup failed; paper/shadow execution remains blocked",
-            exc_info=True,
-        )
-        return False
-
-
-async def _load_personal_paper_broker(
-    *,
-    settings: Settings,
-    repository: PersonalExecutionRepository,
-    owner_id: str,
-    fencing_token: int,
-) -> PaperBroker:
-    state = await repository.load_paper_state(
-        owner_id=owner_id,
-        fencing_token=fencing_token,
-    )
-    return PaperBroker.from_state(
-        settings.bankroll_usd,
-        state.state if state is not None else None,
-    )
-
-
-async def _save_personal_paper_broker(
-    *,
-    repository: PersonalExecutionRepository,
-    broker: PaperBroker,
-    owner_id: str,
-    fencing_token: int,
-) -> bool:
-    saved = await repository.save_paper_state(
-        owner_id=owner_id,
-        fencing_token=fencing_token,
-        state=broker.export_state(),
-    )
-    return saved is not None
 
 
 async def run_worker(
@@ -680,6 +471,11 @@ async def run_worker(
     install_signal_handlers: bool = True,
 ) -> None:
     settings = settings or get_settings()
+    READINESS.reset(
+        role="worker",
+        component=settings.component,
+        mode=settings.mode.value,
+    )
     _set_worker_ready(False)
     if settings.component == "api":
         raise RuntimeError("POLYBOT_COMPONENT=api cannot run the signer worker")
@@ -738,14 +534,15 @@ async def run_worker(
         await runtime.close()
         raise RuntimeError(
             "state store startup preflight failed; verify the Supabase Auth user, "
-            "account UUID, migrations through 0018, URL, and service-role key"
+            "account UUID, migrations through 0020, URL, and service-role key"
         )
-    if isinstance(runtime.broker, PolymarketBroker):
+    READINESS.set_gate(GATE_STORE, True)
+    if runtime.live_broker is not None:
         logger.info(
             "Polymarket signer ready: trading_wallet=%s signer=%s wallet_type=%s",
-            runtime.broker.client.wallet,
-            runtime.broker.client.signer,
-            runtime.broker.client.wallet_type,
+            runtime.live_broker.client.wallet,
+            runtime.live_broker.client.signer,
+            runtime.live_broker.client.wallet_type,
         )
     owner_id = f"{socket.gethostname()}-{os.getpid()}-{str(uuid4())[:8]}"
     personal_execution: PersonalExecutionRepository | None = None
@@ -764,6 +561,9 @@ async def run_worker(
             runtime.store.bind_personal_execution_scope(
                 PersonalExecutionScope(owner_id=owner_id, mode=settings.mode)
             )
+            bound_scope_mode: TradingMode | None = settings.mode
+        else:
+            bound_scope_mode = None
     stop = stop_event or asyncio.Event()
     lease_ok = asyncio.Event()
     runtime_control_ready = asyncio.Event()
@@ -806,7 +606,9 @@ async def run_worker(
         return await lease_guard() is not None
 
     runtime.engine.execution_guard = execution_guard
-    if isinstance(runtime.broker, PolymarketBroker):
+    if runtime.mode_aware is not None:
+        runtime.mode_aware.set_execution_guard(lease_guard)
+    elif isinstance(runtime.broker, PolymarketBroker):
         runtime.broker.set_execution_guard(lease_guard)
 
     async def cancel_all_or_alert(reason: str) -> bool:
@@ -851,8 +653,7 @@ async def run_worker(
             owner_id=owner_id,
             fencing_token=token,
         )
-        runtime.broker = paper_broker
-        runtime.engine.broker = paper_broker
+        runtime.replace_paper_broker(paper_broker)
         paper_state_fencing_token = token
         logger.info("personal paper account state restored under worker fence %s", token)
         return True
@@ -861,11 +662,12 @@ async def run_worker(
         nonlocal paper_state_fencing_token
         if personal_execution is None or settings.mode is not TradingMode.PAPER:
             return True
-        if not isinstance(runtime.broker, PaperBroker):
+        paper_broker = runtime.paper_broker
+        if paper_broker is None:
             raise RuntimeError("personal paper runtime has an incompatible broker")
         saved = await _save_personal_paper_broker(
             repository=personal_execution,
-            broker=runtime.broker,
+            broker=paper_broker,
             owner_id=owner_id,
             fencing_token=token,
         )
@@ -877,21 +679,278 @@ async def run_worker(
         logger.critical("personal paper state save lost its worker fence; cycle halted")
         return False
 
-    def refresh_worker_readiness() -> None:
-        reconciliation_ok = runtime.reconciler is None or runtime.reconciler.healthy.is_set()
-        _set_worker_ready(
-            not stop.is_set()
-            and lease_ok.is_set()
-            and runtime_control_ready.is_set()
-            and reconciliation_ok
+    async def align_effective_mode() -> None:
+        """Adopt the durable ``desired_mode`` at a cycle boundary.
+
+        The dashboard writes ``runtime_profiles.desired_mode``. A personal
+        deployment has to act on that without a redeploy, otherwise the mode
+        selector is a fake switch: the API reports success while nothing changes
+        until someone edits Zeabur. Only the capability layer (may this
+        deployment touch real funds at all) stays deployment-level, and any
+        downgrade is published as a readiness warning instead of being silent.
+        """
+
+        nonlocal paper_state_fencing_token
+        if personal_execution is None or not settings.personal_mode:
+            return
+        try:
+            desired = await personal_execution.get_desired_mode()
+        except Exception:
+            logger.warning("desired mode lookup failed; keeping the current mode")
+            return
+        if not isinstance(desired, TradingMode) or desired is settings.mode:
+            await bind_live_scope_if_needed()
+            return
+        decision = resolve_effective_mode(
+            desired,
+            live_enabled=settings.personal_live_enabled,
+            signer_configured=runtime.live_broker is not None,
         )
+        previous = settings.mode
+        if decision.effective is previous:
+            # The request was clamped (for example canary without a live
+            # deployment). Surface the reason once and keep running safely.
+            if decision.note:
+                READINESS.set_warning("mode_downgraded", decision.note)
+            await bind_live_scope_if_needed()
+            return
+        settings.mode = decision.effective
+        READINESS.set_mode(decision.effective.value)
+        # The simulator must be reloaded under the new mode before it trades.
+        paper_state_fencing_token = None
+        if decision.effective in {TradingMode.CANARY, TradingMode.LIVE}:
+            if runtime.live_broker is None:
+                settings.mode = previous
+                READINESS.set_mode(previous.value)
+                logger.critical("refusing a live mode switch without a live broker")
+                return
+        await bind_live_scope_if_needed()
+        if decision.note:
+            READINESS.set_warning("mode_downgraded", decision.note)
+        else:
+            READINESS.clear_warning("mode_downgraded")
+        logger.warning(
+            "effective trading mode changed %s -> %s (desired %s)",
+            previous.value,
+            decision.effective.value,
+            decision.desired.value,
+        )
+
+    async def bind_live_scope_if_needed() -> None:
+        """Bind (or re-bind) the durable live submission gate for the current mode.
+
+        The scope is live-only, and the lease may not be held yet on the first
+        loop iteration, so this retries until the gate matches the effective mode.
+        """
+
+        nonlocal bound_scope_mode
+        mode = settings.mode
+        if (
+            mode not in {TradingMode.CANARY, TradingMode.LIVE}
+            or bound_scope_mode is mode
+            or runtime.live_broker is None
+            or lease_token is None
+        ):
+            return
+        runtime.store.bind_personal_execution_scope(
+            PersonalExecutionScope(owner_id=owner_id, mode=mode)
+        )
+        bound_scope_mode = mode
+
+    calibrator = Calibrator(CalibrationConfig())
+    attach_calibrator = getattr(
+        getattr(runtime.engine, "forecaster", None), "set_calibrator", None
+    )
+    if callable(attach_calibrator):
+        attach_calibrator(calibrator)
+    calibration_refreshed_at: float | None = None
+
+    async def maybe_refresh_calibration() -> None:
+        """Keep the AI reliability curve in step with the account's own results.
+
+        The curve is rebuilt from resolved forecasts at most once per
+        ``POLYBOT_CALIBRATION_REFRESH_SECONDS`` so a long campaign slowly
+        corrects a systematically over-confident model instead of trusting it
+        forever.
+        """
+
+        nonlocal calibration_refreshed_at
+        now_monotonic = loop.time()
+        if (
+            calibration_refreshed_at is not None
+            and now_monotonic - calibration_refreshed_at < settings.calibration_refresh_seconds
+        ):
+            return
+        try:
+            active = await refresh_calibrator(
+                runtime.store,
+                account_id=settings.account_id,
+                calibrator=calibrator,
+            )
+        except Exception:
+            logger.warning(
+                "reliability calibration refresh failed; keeping the current curve",
+                exc_info=True,
+            )
+            calibration_refreshed_at = now_monotonic
+            return
+        calibration_refreshed_at = now_monotonic
+        if active:
+            logger.info("AI reliability calibration active: %s", calibrator.describe())
+        else:
+            logger.info("AI reliability calibration inactive (insufficient history)")
+
+    retention_policy = RetentionPolicy.from_settings(settings)
+    retention_pruned_at: float | None = None
+
+    async def maybe_prune_history() -> None:
+        """Keep the append-only history tables bounded without a manual job.
+
+        A long deployment writes AI usage, equity points, and snapshots on every
+        cycle and would otherwise grow forever. Pruning is bounded per call and
+        only ever touches those three tables, so running it on a daily timer is
+        safe while the worker keeps trading.
+        """
+
+        nonlocal retention_pruned_at
+        if not retention_policy.enabled:
+            return
+        now_monotonic = loop.time()
+        if (
+            retention_pruned_at is not None
+            and now_monotonic - retention_pruned_at < retention_policy.interval_seconds
+        ):
+            return
+        retention_pruned_at = now_monotonic
+        prune = getattr(runtime.store, "prune_history", None)
+        if not callable(prune):
+            logger.debug("state store has no retention support; skipping the prune pass")
+            return
+        try:
+            removed = await prune_history(runtime.store, retention_policy)
+        except Exception:
+            logger.warning("history pruning failed; retrying on the next interval", exc_info=True)
+            return
+        if any(removed.values()):
+            logger.info("pruned history rows: %s", safe_json(removed))
+
+    ai_budget_alerted = False
+    ai_spend_alerted_at: float | None = None
+
+    async def review_ai_spend(report: object) -> None:
+        """Surface AI budget exhaustion and unusually expensive cycles."""
+
+        nonlocal ai_budget_alerted, ai_spend_alerted_at
+        skipped = getattr(report, "skipped", {}) or {}
+        exhausted = "ai_budget_exhausted" in skipped
+        if exhausted and not ai_budget_alerted:
+            ai_budget_alerted = True
+            READINESS.set_warning(
+                "ai_budget_exhausted",
+                "当日 AI 预算已用尽：本轮不再产生新预测，已持仓仍会按风控退出；"
+                "UTC 零点后自动恢复，或在控制台提高预算上限。",
+            )
+            logger.warning("daily AI budget exhausted; new forecasts paused")
+            if notifier is not None:
+                await notifier.send(
+                    NotificationMessage(
+                        title="Polybot AI budget exhausted",
+                        message=(
+                            "The daily AI request budget is exhausted. New forecasts are "
+                            "paused until UTC midnight; risk exits still run."
+                        ),
+                        severity="warning",
+                    )
+                )
+        elif not exhausted and ai_budget_alerted:
+            ai_budget_alerted = False
+            READINESS.clear_warning("ai_budget_exhausted")
+
+        units = int(getattr(report, "ai_units_reserved", 0) or 0)
+        cost = getattr(report, "ai_cost_usd", None) or Decimal("0")
+        if units < settings.ai_cycle_units_alert and cost < settings.ai_cycle_cost_alert_usd:
+            return
+        now_monotonic = loop.time()
+        if ai_spend_alerted_at is not None and now_monotonic - ai_spend_alerted_at < 3600:
+            return
+        ai_spend_alerted_at = now_monotonic
+        logger.warning("cycle AI spend is high: units=%s cost_usd=%s", units, cost)
+        if notifier is not None:
+            await notifier.send(
+                NotificationMessage(
+                    title="Polybot AI spend alert",
+                    message=(
+                        f"One cycle reserved {units} AI requests and an estimated "
+                        f"{cost} USD. Check the AI usage page and the market universe."
+                    ),
+                    severity="warning",
+                )
+            )
+
+    def refresh_worker_readiness() -> None:
+        stopped = stop.is_set()
+        if runtime.reconciler is not None and runtime.reconciler.quarantine_count:
+            READINESS.set_warning(
+                "reconciliation_quarantine",
+                f"{runtime.reconciler.quarantine_count} 笔成交或持仓处于隔离区："
+                "它们不计入机器人权益，相关市场也不会被交易。",
+            )
+        else:
+            READINESS.clear_warning("reconciliation_quarantine")
+        READINESS.set_gate(
+            GATE_LEASE,
+            not stopped and lease_ok.is_set(),
+            (
+                ReadinessBlocker(
+                    code="lease_unavailable",
+                    gate=GATE_LEASE,
+                    message="Worker 租约未持有：另一个副本占用了该账户，或租约心跳失败。",
+                    fix="确认 Zeabur 个人服务只有一个副本（WEB_CONCURRENCY=1），"
+                    "且 Supabase 可达。",
+                ),
+            ),
+        )
+        READINESS.set_gate(
+            GATE_RUNTIME_CONTROL,
+            not stopped and runtime_control_ready.is_set(),
+            (
+                ReadinessBlocker(
+                    code="runtime_control_blocked",
+                    gate=GATE_RUNTIME_CONTROL,
+                    message="运行控制未就绪：暂停中、撤单进行中，或存在未确认的撤单。",
+                    fix="在控制台解除暂停，等撤单确认完成后自动恢复。",
+                ),
+            ),
+        )
+        reconciliation_ok = runtime.reconciler is None or runtime.reconciler.healthy.is_set()
+        failure = getattr(runtime.reconciler, "last_failure", None)
+        blocker = _reconciliation_blocker(getattr(failure, "code", "reconciliation_error"))
+        if reconciliation_ok:
+            READINESS.set_gate(GATE_RECONCILIATION, not stopped)
+            READINESS.clear_warning("reconciliation_pending")
+        elif settings.mode in {TradingMode.CANARY, TradingMode.LIVE}:
+            READINESS.set_gate(GATE_RECONCILIATION, False, (blocker,))
+            READINESS.clear_warning("reconciliation_pending")
+        else:
+            # Paper and shadow cannot touch funds, so leftover manual activity must
+            # not block a first successful run the way it did before. It blocks the
+            # switch into a real-money mode instead, and the reason is published so
+            # the dashboard can offer the one-click baseline reset.
+            READINESS.set_gate(GATE_RECONCILIATION, not stopped)
+            READINESS.set_warning(
+                "reconciliation_pending",
+                f"{blocker.message}{blocker.fix}（切换到 canary/live 前必须解决）",
+            )
 
     async def watch_runtime_control() -> None:
         state = RuntimeControlWatchState()
-        downgrade_mode = bool(
-            settings.personal_mode and settings.mode in {TradingMode.PAPER, TradingMode.SHADOW}
-        )
         while not stop.is_set():
+            # Recomputed every tick: a dashboard switch out of a live mode has to
+            # arm the downgrade cleanup (cancel + disarm) without a restart.
+            downgrade_mode = bool(
+                settings.personal_mode
+                and settings.mode in {TradingMode.PAPER, TradingMode.SHADOW}
+            )
             try:
                 token = lease_token
                 if downgrade_mode:
@@ -969,9 +1028,42 @@ async def run_worker(
     control_task = asyncio.create_task(
         watch_runtime_control(), name="polybot-runtime-control-watch"
     )
+    readiness_task = asyncio.create_task(
+        monitor_readiness(
+            stop=stop,
+            notifier=notifier,
+            threshold_seconds=settings.readiness_alert_seconds,
+            poll_seconds=max(15.0, min(60.0, settings.readiness_alert_seconds / 4)),
+        ),
+        name="polybot-readiness-monitor",
+    )
+
+    async def sync_reconcile_baseline() -> None:
+        """Adopt a durable baseline change without a redeploy.
+
+        An operator resets the baseline from the dashboard when a dedicated
+        wallet carries pre-existing manual activity. The worker has to pick
+        that up on its own: the whole point is to avoid a Zeabur redeploy.
+        """
+
+        if runtime.reconciler is None or personal_execution is None:
+            return
+        try:
+            stored = await personal_execution.get_reconcile_baseline()
+        except Exception:
+            logger.warning("reconcile baseline lookup failed; keeping the current value")
+            return
+        if stored is None or stored == runtime.reconciler.baseline_utc:
+            return
+        runtime.reconciler.set_baseline(stored)
+        logger.warning("adopted the durable reconcile baseline; replaying account history")
 
     try:
         while not stop.is_set():
+            await align_effective_mode()
+            await sync_reconcile_baseline()
+            await maybe_refresh_calibration()
+            await maybe_prune_history()
             refresh_worker_readiness()
             try:
                 if not lease_ok.is_set():
@@ -980,7 +1072,11 @@ async def run_worker(
                     logger.error(
                         "execution skipped until runtime control and cancellation state are healthy"
                     )
-                elif runtime.reconciler is not None and not runtime.reconciler.healthy.is_set():
+                elif (
+                    runtime.reconciler is not None
+                    and not runtime.reconciler.healthy.is_set()
+                    and settings.mode in {TradingMode.CANARY, TradingMode.LIVE}
+                ):
                     logger.error("execution skipped until account reconciliation is healthy")
                     if not await cancel_all_or_alert("account reconciliation unhealthy"):
                         await pause_personal_live("account reconciliation cancel-all failed")
@@ -991,11 +1087,24 @@ async def run_worker(
                     await cancel_all_or_alert("ambiguous durable order state")
                     await pause_personal_live("ambiguous durable order state")
                 elif not await runtime.store.health():
+                    READINESS.set_gate(
+                        GATE_STORE,
+                        False,
+                        (
+                            ReadinessBlocker(
+                                code="store_unhealthy",
+                                gate=GATE_STORE,
+                                message="状态存储不可用：无法读写数据库。",
+                                fix="检查 Supabase 项目状态、service-role key 与出网连接。",
+                            ),
+                        ),
+                    )
                     logger.error("state store unhealthy; execution skipped")
                     if settings.mode in {TradingMode.CANARY, TradingMode.LIVE}:
                         if not await cancel_all_or_alert("state store unhealthy"):
                             await pause_personal_live("state-store cancel-all failed")
                 else:
+                    READINESS.set_gate(GATE_STORE, True)
                     current_fence = lease_token
                     cycle_ready = current_fence is not None
                     if cycle_ready and settings.mode is TradingMode.PAPER:
@@ -1005,14 +1114,14 @@ async def run_worker(
                         and personal_execution is not None
                         and settings.mode in {TradingMode.CANARY, TradingMode.LIVE}
                     ):
-                        if not isinstance(runtime.broker, PolymarketBroker):
+                        if runtime.live_broker is None:
                             raise RuntimeError(
                                 "personal real-money runtime requires PolymarketBroker"
                             )
                         try:
                             cycle_ready = await _prepare_personal_live_cycle(
                                 settings=settings,
-                                broker=runtime.broker,
+                                broker=runtime.live_broker,
                                 repository=personal_execution,
                                 owner_id=owner_id,
                                 fencing_token=current_fence,
@@ -1089,6 +1198,7 @@ async def run_worker(
                             }
                         )
                         logger.info(safe_json(report.model_dump(mode="json")))
+                        await review_ai_spend(report)
                         safety_latched = any(
                             reason.startswith("live_stop_latched:") for reason in report.skipped
                         )
@@ -1164,6 +1274,9 @@ async def run_worker(
         control_task.cancel()
         with suppress(asyncio.CancelledError):
             await control_task
+        readiness_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await readiness_task
 
         try:
             if reconcile_task is not None:

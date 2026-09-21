@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from datetime import timedelta
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from polybot.models import MarketSpec, Outcome
 
@@ -13,6 +13,9 @@ _ASSET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("SOL", re.compile(r"\b(?:sol|solana)\b", re.IGNORECASE)),
     ("XRP", re.compile(r"\b(?:xrp|ripple)\b", re.IGNORECASE)),
 )
+# The only symbols with a real classifier. Configuring anything else would
+# silently match nothing, so the filter refuses to be built with it.
+SUPPORTED_ASSETS: frozenset[str] = frozenset(symbol for symbol, _ in _ASSET_PATTERNS)
 _UP_LABELS = frozenset({"up", "higher", "increase", "above"})
 _DOWN_LABELS = frozenset({"down", "lower", "decrease", "below"})
 _UP_DOWN_CONTEXT = re.compile(
@@ -29,6 +32,21 @@ class CryptoUpDownFilterConfig(BaseModel):
     maximum_duration: timedelta = timedelta(days=1)
     require_resolution_source: bool = True
     allow_neg_risk: bool = False
+
+    @field_validator("allowed_assets")
+    @classmethod
+    def _validate_allowed_assets(cls, value: frozenset[str]) -> frozenset[str]:
+        if not value:
+            raise ValueError("allowed_assets must contain at least one symbol")
+        unsupported = sorted(value - SUPPORTED_ASSETS)
+        if unsupported:
+            supported = ", ".join(sorted(SUPPORTED_ASSETS))
+            raise ValueError(
+                "unsupported crypto Up/Down symbols: "
+                + ", ".join(unsupported)
+                + f" (supported: {supported})"
+            )
+        return value
 
 
 class CryptoUpDownMarket(BaseModel):

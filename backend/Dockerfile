@@ -50,6 +50,12 @@ COPY --from=builder --chown=polybot:polybot /app /app
 USER 10001:10001
 EXPOSE 8080
 
+# Liveness only. Readiness (``/readyz``) is intentionally *not* the container
+# health check: a safe but not-yet-ready deployment must stay up and keep
+# publishing its blocker list instead of being restarted by the platform.
+HEALTHCHECK --interval=30s --timeout=8s --start-period=45s --retries=3 \
+    CMD ["python", "-m", "polybot.healthcheck"]
+
 ENTRYPOINT ["/usr/bin/tini", "--"]
 
 # The safe default remains the signer-free multi-tenant API. `personal` runs one

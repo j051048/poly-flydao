@@ -3,9 +3,9 @@ from __future__ import annotations
 from datetime import timedelta
 from decimal import Decimal
 
+from polybot.experimental.pair_accumulator import PairAccumulatorConfig, PairPricer
 from polybot.market_filters.crypto_updown import CryptoUpDownFilter
 from polybot.models import BookLevel, MarketSpec, OrderBookSnapshot, Outcome, utc_now
-from polybot.strategies.pair_accumulator import PairAccumulatorConfig, PairPricer
 
 
 def _updown_market(**updates) -> MarketSpec:

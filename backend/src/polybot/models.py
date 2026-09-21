@@ -579,6 +579,8 @@ class EngineCycleResult(BaseModel):
     forecasts_created: int = 0
     candidates_created: int = 0
     intents_approved: int = 0
+    ai_units_reserved: int = 0
+    ai_cost_usd: Decimal | None = None
     executions: list[ExecutionResult] = Field(default_factory=list)
     skipped: dict[str, int] = Field(default_factory=dict)
     started_at: datetime = Field(default_factory=utc_now)
@@ -686,3 +688,32 @@ class AccountPositionUpdate(BaseModel):
     mark_price: Decimal | None = None
     unrealized_pnl_usd: Decimal = Decimal("0")
     as_of: datetime = Field(default_factory=utc_now)
+
+
+class QuarantineKind(StrEnum):
+    TRADE = "trade"
+    POSITION = "position"
+
+
+class QuarantineRecord(BaseModel):
+    """Activity the bot cannot attribute to its own durable order ledger.
+
+    Quarantined quantity is never treated as bot inventory: it is excluded from
+    equity, from risk sizing, and from the tokens the engine is allowed to
+    trade. Recording it (instead of failing closed forever) is what lets a
+    dedicated wallet with pre-existing manual activity become usable.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    kind: QuarantineKind
+    external_key: str = Field(min_length=1, max_length=256)
+    reason: str = Field(min_length=1, max_length=64)
+    condition_id: str | None = Field(default=None, max_length=128)
+    token_id: str | None = Field(default=None, max_length=128)
+    side: str | None = Field(default=None, max_length=16)
+    size: Decimal | None = Field(default=None, ge=0)
+    price: Decimal | None = Field(default=None, ge=0, le=1)
+    notional_usd: Decimal | None = Field(default=None, ge=0)
+    occurred_at: datetime | None = None
+    detail: dict[str, Any] = Field(default_factory=dict)

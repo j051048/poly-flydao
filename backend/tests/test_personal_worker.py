@@ -468,6 +468,16 @@ async def test_failed_personal_paper_cycle_reloads_last_committed_state(
             self.broker = PaperBroker(settings.bankroll_usd)
             self.engine = Engine(self.broker)
             self.reconciler = None
+            self.live_broker = None
+            self.mode_aware = None
+
+        @property
+        def paper_broker(self) -> PaperBroker:
+            return self.broker
+
+        def replace_paper_broker(self, broker: PaperBroker) -> None:
+            self.broker = broker
+            self.engine.broker = broker
 
         async def close(self) -> None:
             return None
@@ -602,6 +612,8 @@ async def test_successful_personal_live_cycle_keeps_limit_orders_until_shutdown(
             self.broker = broker
             self.engine = Engine()
             self.reconciler = None
+            self.live_broker = broker
+            self.mode_aware = None
 
         async def close(self) -> None:
             return None
@@ -634,3 +646,268 @@ async def test_successful_personal_live_cycle_keeps_limit_orders_until_shutdown(
     )
 
     assert broker.cancel_reasons == ["worker shutdown"]
+
+
+async def test_desired_mode_is_clamped_and_reported_without_live_capability(
+    monkeypatch,
+) -> None:
+    stop = asyncio.Event()
+    trigger = asyncio.Event()
+    trigger.set()
+    settings = _personal_paper_settings()
+    assert settings.personal_live_enabled is False
+    store = SupabaseStore(
+        settings.supabase_url,
+        settings.supabase_service_role_key.get_secret_value(),
+        account_id=ACCOUNT,
+        client=SimpleNamespace(),  # type: ignore[arg-type]
+    )
+    store.health = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    store.claim_worker_lease = AsyncMock(  # type: ignore[method-assign]
+        return_value=WorkerLease(
+            account_id=ACCOUNT,
+            owner_id="placeholder",
+            fencing_token=5,
+            expires_at=utc_now() + timedelta(minutes=2),
+        )
+    )
+    store.validate_worker_lease = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    store.get_runtime_control = AsyncMock(  # type: ignore[method-assign]
+        return_value=RuntimeControl(account_id=ACCOUNT, mode=TradingMode.PAPER, version=2)
+    )
+    store.has_unresolved_live_orders = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    store.release_worker_lease = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+    class Repository:
+        async def schema_ready(self) -> bool:
+            return True
+
+        async def get_desired_mode(self) -> TradingMode:
+            return TradingMode.CANARY
+
+        async def load_paper_state(self, **kwargs: object) -> None:
+            del kwargs
+            return None
+
+        async def save_paper_state(self, **kwargs: object) -> PersonalPaperAccountState:
+            return PersonalPaperAccountState(
+                state=kwargs["state"],  # type: ignore[arg-type]
+                version=1,
+                updated_at=utc_now(),
+            )
+
+    class Engine:
+        execution_guard = None
+
+        async def run_cycle(self) -> EngineCycleResult:
+            stop.set()
+            return EngineCycleResult(
+                run_id="clamped-mode",
+                mode=TradingMode.PAPER,
+                completed_at=utc_now(),
+            )
+
+    class Runtime:
+        def __init__(self) -> None:
+            self.store = store
+            self.broker = PaperBroker(settings.bankroll_usd)
+            self.engine = Engine()
+            self.reconciler = None
+            self.live_broker = None
+            self.mode_aware = None
+
+        @property
+        def paper_broker(self) -> PaperBroker:
+            return self.broker
+
+        def replace_paper_broker(self, broker: PaperBroker) -> None:
+            self.broker = broker
+
+        async def close(self) -> None:
+            return None
+
+    class RepositoryFactory:
+        def __new__(cls, client, account_id):
+            del client, account_id
+            return Repository()
+
+    monkeypatch.setattr(worker_module, "build_runtime", lambda selected: Runtime())
+    monkeypatch.setattr(
+        worker_module,
+        "PersonalExecutionRepository",
+        RepositoryFactory,
+    )
+
+    await worker_module.run_worker(
+        settings=settings,
+        stop_event=stop,
+        cycle_trigger=trigger,
+        install_signal_handlers=False,
+    )
+
+    # The request is honoured as far as the deployment allows: still paper, but
+    # the clamp is published instead of being silently swallowed.
+    assert settings.mode is TradingMode.PAPER
+    codes = {warning["code"] for warning in worker_module.worker_readiness()["warnings"]}
+    assert "mode_downgraded" in codes
+
+
+async def test_desired_mode_starts_a_live_cycle_without_a_restart(monkeypatch) -> None:
+    """A dashboard switch to canary has to take effect in the running process."""
+
+    stop = asyncio.Event()
+    trigger = asyncio.Event()
+    trigger.set()
+    settings = Settings(
+        _env_file=None,
+        personal_mode=True,
+        personal_live_enabled=True,
+        mode="paper",
+        component="all",
+        account_id=ACCOUNT,
+        supabase_url="https://example.supabase.co",
+        supabase_service_role_key="service-role-test",
+        ai_api_key="personal-ai-key",
+        polymarket_private_key="12" * 32,
+    )
+    store = SupabaseStore(
+        settings.supabase_url,
+        settings.supabase_service_role_key.get_secret_value(),
+        account_id=ACCOUNT,
+        client=SimpleNamespace(),  # type: ignore[arg-type]
+    )
+    paper_control = RuntimeControl(
+        account_id=ACCOUNT,
+        mode=TradingMode.PAPER,
+        armed=False,
+        kill_switch=True,
+        version=2,
+    )
+    disarmed = RuntimeControl(
+        account_id=ACCOUNT,
+        mode=TradingMode.CANARY,
+        kill_switch=True,
+        cancellation_pending=True,
+        version=4,
+    )
+    lease = WorkerLease(
+        account_id=ACCOUNT,
+        owner_id="placeholder",
+        fencing_token=7,
+        expires_at=utc_now() + timedelta(minutes=2),
+    )
+    store.health = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    store.claim_worker_lease = AsyncMock(return_value=lease)  # type: ignore[method-assign]
+    store.validate_worker_lease = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    store.get_runtime_control = AsyncMock(return_value=paper_control)  # type: ignore[method-assign]
+    store.expire_runtime_control = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    store.has_unresolved_live_orders = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    store.disarm_runtime_control = AsyncMock(return_value=disarmed)  # type: ignore[method-assign]
+    store.acknowledge_runtime_cancellation = AsyncMock(  # type: ignore[method-assign]
+        return_value=disarmed.model_copy(update={"cancellation_pending": False, "version": 5})
+    )
+    store.release_worker_lease = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+    class Broker(PolymarketBroker):
+        def __init__(self) -> None:
+            self.client = SimpleNamespace(
+                signer=SIGNER,
+                wallet=DEPOSIT,
+                wallet_type=3,
+                environment=SimpleNamespace(
+                    chain_id=137,
+                    collateral_token=COLLATERAL,
+                ),
+            )
+            self.cancel_reasons: list[str] = []
+            self.guard = None
+
+        def set_execution_guard(self, guard):
+            self.guard = guard
+
+        async def ensure_trading_approvals(self) -> tuple[Decimal, bool]:
+            return Decimal("25"), True
+
+        async def cancel_all(self, reason: str) -> bool:
+            self.cancel_reasons.append(reason)
+            return True
+
+        async def redeem_resolved(self) -> int:
+            return 0
+
+    broker = Broker()
+    cycles: list[TradingMode] = []
+
+    class Engine:
+        execution_guard = None
+
+        async def run_cycle(self) -> EngineCycleResult:
+            cycles.append(settings.mode)
+            stop.set()
+            return EngineCycleResult(
+                run_id="hot-switch",
+                mode=settings.mode,
+                completed_at=utc_now(),
+            )
+
+    class Runtime:
+        def __init__(self) -> None:
+            self.store = store
+            self.broker = broker
+            self.engine = Engine()
+            self.reconciler = None
+            self.live_broker = broker
+            self.mode_aware = None
+
+        async def close(self) -> None:
+            return None
+
+    repository = _LiveRepository()
+
+    async def get_desired_mode() -> TradingMode:
+        return TradingMode.CANARY
+
+    async def schema_ready() -> bool:
+        return True
+
+    # The worker generates its own owner id, so the fixture's strict ``arm``
+    # assertion is replaced by one that records the call instead.
+    repository.arm = AsyncMock(  # type: ignore[method-assign]
+        return_value=RuntimeControl(
+            account_id=ACCOUNT,
+            mode=TradingMode.CANARY,
+            armed=True,
+            accept_new_intents=True,
+            armed_until=utc_now() + timedelta(minutes=10),
+            kill_switch=False,
+            version=3,
+        )
+    )
+    repository.get_desired_mode = get_desired_mode  # type: ignore[attr-defined]
+    repository.schema_ready = schema_ready  # type: ignore[attr-defined]
+
+    class RepositoryFactory:
+        def __new__(cls, client, account_id):
+            del client, account_id
+            return repository
+
+    monkeypatch.setattr(worker_module, "build_runtime", lambda selected: Runtime())
+    monkeypatch.setattr(
+        worker_module,
+        "PersonalExecutionRepository",
+        RepositoryFactory,
+    )
+
+    await worker_module.run_worker(
+        settings=settings,
+        stop_event=stop,
+        cycle_trigger=trigger,
+        install_signal_handlers=False,
+    )
+
+    assert cycles == [TradingMode.CANARY]
+    assert repository.arm.await_count == 1
+    assert repository.events == ["bind", "control", "readiness"]
+    assert settings.mode is TradingMode.CANARY
+    # Shutdown still goes through the real-money safety sequence.
+    assert "worker shutdown" in broker.cancel_reasons

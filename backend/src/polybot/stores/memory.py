@@ -19,6 +19,8 @@ from polybot.models import (
     OrderBookSnapshot,
     OrderReconcileTarget,
     Outcome,
+    QuarantineKind,
+    QuarantineRecord,
     RiskDecision,
     RuntimeControl,
     TradeIntent,
@@ -26,6 +28,11 @@ from polybot.models import (
     UserTradeUpdate,
     WorkerLease,
     utc_now,
+)
+from polybot.performance import (
+    DEFAULT_AI_BUDGET_LIMIT,
+    PerformanceSnapshot,
+    performance_snapshot_from_rows,
 )
 from polybot.stores.ledger import FillLedgerSnapshot, replay_fill_ledger
 
@@ -48,10 +55,16 @@ class MemoryStore:
         self.signed_orders: dict[str, tuple[str, bytes, int, str, int]] = {}
         self.unresolved_live_orders: set[str] = set()
         self.durable_orders: dict[str, str] = {}
+        self.quarantine: dict[tuple[QuarantineKind, str], QuarantineRecord] = {}
         self.order_missing_confirmations: dict[str, int] = {}
         self.equity_states: dict[str, EquityRiskState] = {}
         self.equity_history: dict[str, list[EquityHistoryPoint]] = {}
         self.ai_usage: dict[str, list[AIUsageRecord]] = {}
+        self.ai_budget_used: dict[str, int] = {}
+        self.ai_budget_limits: dict[str, int] = {}
+        # Raw ``forecast_outcomes`` rows, keyed by account. Tests and local runs
+        # seed this directly; SupabaseStore reads the same shape from the table.
+        self.forecast_outcomes: dict[str, list[dict[str, object]]] = {}
         self._lock = asyncio.Lock()
 
     async def health(self) -> bool:
@@ -422,12 +435,131 @@ class MemoryStore:
             raise ValueError("AI usage tokens must be non-negative")
         self.ai_usage.setdefault(account_id, []).append(usage)
 
+    async def record_forecast_outcome(
+        self, account_id: str, row: dict[str, object]
+    ) -> None:
+        """Seed the reliability ledger from local runs and tests."""
+
+        self.forecast_outcomes.setdefault(account_id, []).append(dict(row))
+
+    def set_ai_budget_limit(self, account_id: str, limit: int) -> None:
+        if not 1 <= limit <= 10000:
+            raise ValueError("AI budget limit out of range")
+        self.ai_budget_limits[account_id] = limit
+
     async def list_ai_usage(
         self, account_id: str, limit: int
     ) -> list[AIUsageRecord]:
         if limit < 1:
             raise ValueError("AI usage limit must be positive")
         return self.ai_usage.get(account_id, [])[-limit:]
+
+    async def consume_ai_budget(
+        self, account_id: str, units: int = 1
+    ) -> tuple[bool, int, int]:
+        if not 1 <= units <= 10:
+            raise ValueError("AI budget units out of range")
+        async with self._lock:
+            used = self.ai_budget_used.get(account_id, 0)
+            limit = self.ai_budget_limits.get(account_id, DEFAULT_AI_BUDGET_LIMIT)
+            if used + units > limit:
+                return False, used, limit
+            used += units
+            self.ai_budget_used[account_id] = used
+            return True, used, limit
+
+    async def calibration_snapshot(self, account_id: str) -> PerformanceSnapshot:
+        rows = [dict(row) for row in self.forecast_outcomes.get(account_id, [])]
+        used = self.ai_budget_used.get(account_id, 0)
+        limit = self.ai_budget_limits.get(account_id, DEFAULT_AI_BUDGET_LIMIT)
+        return performance_snapshot_from_rows(
+            rows,
+            ai_usage_used=used,
+            ai_usage_limit=limit,
+        )
+
+    async def prune_history(
+        self,
+        *,
+        ai_usage_days: int,
+        equity_days: int,
+        snapshot_days: int,
+        batch_limit: int = 20_000,
+    ) -> dict[str, int]:
+        """Drop in-memory history older than the windows.
+
+        The local store has no transaction to protect, but it mirrors the
+        production contract exactly: only AI usage, equity history, and
+        snapshots are touched, and the batch limit still applies.
+        """
+
+        if ai_usage_days < 7 or equity_days < 30 or snapshot_days < 1:
+            raise ValueError("retention window below the supported minimum")
+        if batch_limit < 100:
+            raise ValueError("retention batch limit out of range")
+        now = utc_now()
+        ai_cutoff = now - timedelta(days=ai_usage_days)
+        equity_cutoff = now - timedelta(days=equity_days)
+        snapshot_cutoff = now - timedelta(days=snapshot_days)
+
+        async with self._lock:
+            removed_ai = 0
+            budget_ai = batch_limit
+            for account_id, records in list(self.ai_usage.items()):
+                doomed = [
+                    index
+                    for index, record in enumerate(records)
+                    if record.created_at < ai_cutoff
+                ][:budget_ai]
+                if not doomed:
+                    continue
+                dropped = set(doomed)
+                self.ai_usage[account_id] = [
+                    record for index, record in enumerate(records) if index not in dropped
+                ]
+                removed_ai += len(doomed)
+                budget_ai -= len(doomed)
+                if budget_ai <= 0:
+                    break
+
+            removed_equity = 0
+            budget_equity = batch_limit
+            for account_id, points in list(self.equity_history.items()):
+                doomed_points = [
+                    index
+                    for index, point in enumerate(points)
+                    if point.recorded_at < equity_cutoff
+                ][:budget_equity]
+                if not doomed_points:
+                    continue
+                dropped_points = set(doomed_points)
+                self.equity_history[account_id] = [
+                    point for index, point in enumerate(points) if index not in dropped_points
+                ]
+                removed_equity += len(doomed_points)
+                budget_equity -= len(doomed_points)
+                if budget_equity <= 0:
+                    break
+
+            doomed_snapshots = [
+                index
+                for index, snapshot in enumerate(self.snapshots)
+                if snapshot.captured_at < snapshot_cutoff
+            ][:batch_limit]
+            removed_snapshots = len(doomed_snapshots)
+            if doomed_snapshots:
+                dropped_snapshots = set(doomed_snapshots)
+                self.snapshots = [
+                    snapshot
+                    for index, snapshot in enumerate(self.snapshots)
+                    if index not in dropped_snapshots
+                ]
+
+        return {
+            "ai_usage_ledger": removed_ai,
+            "equity_history": removed_equity,
+            "snapshots": removed_snapshots,
+        }
 
     async def realized_pnl_since(self, account_id: str, since: datetime) -> Decimal:
         return (await self.fill_ledger_snapshot(account_id, since)).realized_pnl_usd
@@ -492,6 +624,22 @@ class MemoryStore:
 
     async def durable_order_ids(self, candidate_order_ids: set[str], account_id: str) -> set[str]:
         return set(candidate_order_ids).intersection(self.durable_orders)
+
+    async def durable_token_ids(self, account_id: str) -> set[str]:
+        tokens = {intent.token_id for intent in self.intents.values() if intent.token_id}
+        tokens.update(update.token_id for update in self.trade_updates if update.token_id)
+        return tokens
+
+    async def record_quarantine(self, account_id: str, record: QuarantineRecord) -> None:
+        self.quarantine[(record.kind, record.external_key)] = record
+
+    async def list_quarantine(
+        self, account_id: str, limit: int = 200
+    ) -> list[QuarantineRecord]:
+        records = [
+            record for (kind, _), record in self.quarantine.items() if kind is QuarantineKind.TRADE
+        ]
+        return records[: max(0, limit)]
 
     async def pending_trade_ids(self, account_id: str) -> set[str]:
         response_ids = {

@@ -4,6 +4,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
+from decimal import Decimal
 from uuid import uuid4
 
 from polybot.ai.base import EvidenceCollector
@@ -29,6 +30,9 @@ from polybot.strategy import ValueStrategy
 
 LOGGER = logging.getLogger(__name__)
 METRICS = Metrics()
+
+#: Provider requests spent per forecast: one primary pass and one critic pass.
+AI_UNITS_PER_FORECAST = 2
 
 
 class LiveSafetyLatchError(RuntimeError):
@@ -63,6 +67,8 @@ class TradingEngine:
         broker: Broker,
         store: StateStore,
         execution_guard: Callable[[], Awaitable[bool]] | None = None,
+        quarantined_tokens: Callable[[], frozenset[str]] | None = None,
+        market_filter: Callable[[list[MarketSpec]], list[MarketSpec]] | None = None,
     ):
         self.settings = settings
         self.market_data = market_data
@@ -73,6 +79,18 @@ class TradingEngine:
         self.broker = broker
         self.store = store
         self.execution_guard = execution_guard
+        # Tokens holding inventory the bot did not create. Trading them could
+        # net against unowned shares, so the engine never touches them.
+        self.quarantined_tokens = quarantined_tokens
+        # Optional universe narrowing (e.g. short-horizon crypto Up/Down only).
+        # It is a pure candidate filter: it can only remove markets from the
+        # discovery set. A market that still holds inventory is never dropped,
+        # but when the filter excluded it the engine may only reduce that
+        # position and will not open a new one.
+        self.market_filter = market_filter
+        # Per-cycle latch: once the daily AI budget refuses a reservation we stop
+        # asking, so an exhausted budget costs one database call per cycle.
+        self._ai_budget_blocked = False
 
     @property
     def _is_real_money(self) -> bool:
@@ -185,6 +203,7 @@ class TradingEngine:
     async def run_cycle(self) -> EngineCycleResult:
         run_id = str(uuid4())
         report = EngineCycleResult(run_id=run_id, mode=self.settings.mode)
+        self._ai_budget_blocked = False
         METRICS.increment("polybot_cycles_total", {"mode": self.settings.mode.value})
         if not await self.store.health():
             report.skip("state_store_unhealthy")
@@ -260,6 +279,22 @@ class TradingEngine:
         markets, held_market_ids = await self._include_held_markets(
             markets, report, cycle_portfolio
         )
+        # Narrow the candidate universe before any budget is spent. Held
+        # positions survive the filter so they can still be exited, but they
+        # are marked reduce-only to keep the filter from being bypassed.
+        reduce_only_market_ids: set[str] = set()
+        if self.market_filter is not None:
+            allowed_market_ids = {market.id for market in self.market_filter(markets)}
+            narrowed: list[MarketSpec] = []
+            for market in markets:
+                if market.id in allowed_market_ids:
+                    narrowed.append(market)
+                elif market.id in held_market_ids:
+                    narrowed.append(market)
+                    reduce_only_market_ids.add(market.id)
+                else:
+                    report.skip("market_filter_excluded")
+            markets = narrowed
         if hard_risk_breach:
             # Once the portfolio is in a hard-stop state, do not spend AI budget or
             # evaluate entries. Only markets containing held shares are actionable.
@@ -281,8 +316,11 @@ class TradingEngine:
                 used_ai = await self._process_market(
                     market,
                     report,
+                    reduce_only=market.id in reduce_only_market_ids,
                     allow_ai=(
-                        not hard_risk_breach and ai_markets < self.settings.max_ai_markets_per_cycle
+                        not hard_risk_breach
+                        and market.id not in reduce_only_market_ids
+                        and ai_markets < self.settings.max_ai_markets_per_cycle
                     ),
                 )
                 ai_markets += int(used_ai)
@@ -381,8 +419,50 @@ class TradingEngine:
 
         return result, held_market_ids
 
+    async def _reserve_ai_budget(self, report: EngineCycleResult) -> bool:
+        """Reserve the provider requests one forecast will spend.
+
+        This is the hard stop behind P2-3: the reservation happens before the
+        evidence/forecast calls, so an exhausted daily budget cannot be
+        exceeded. A store that cannot answer fails closed for the cycle instead
+        of spending without a budget check.
+        """
+
+        if self._ai_budget_blocked:
+            report.skip("ai_budget_exhausted")
+            return False
+        try:
+            allowed, used, limit = await self.store.consume_ai_budget(
+                self.settings.account_id, units=AI_UNITS_PER_FORECAST
+            )
+        except Exception as exc:
+            self._ai_budget_blocked = True
+            report.skip(f"ai_budget_unavailable:{type(exc).__name__}")
+            LOGGER.warning(
+                "AI budget reservation failed; skipping AI for this cycle",
+                exc_info=True,
+            )
+            return False
+        if not allowed:
+            self._ai_budget_blocked = True
+            report.skip("ai_budget_exhausted")
+            LOGGER.warning(
+                "daily AI budget exhausted (%s/%s); no new forecasts this cycle",
+                used,
+                limit,
+            )
+            METRICS.increment("polybot_ai_budget_exhausted_total")
+            return False
+        report.ai_units_reserved += AI_UNITS_PER_FORECAST
+        return True
+
     async def _process_market(
-        self, market, report: EngineCycleResult, *, allow_ai: bool = True
+        self,
+        market,
+        report: EngineCycleResult,
+        *,
+        allow_ai: bool = True,
+        reduce_only: bool = False,
     ) -> bool:
         if not market.active or market.closed or not market.accepting_orders:
             report.skip("market_not_tradeable")
@@ -390,6 +470,11 @@ class TradingEngine:
         if not market.yes_token_id or not market.no_token_id:
             report.skip("missing_outcome_tokens")
             return False
+        if self.quarantined_tokens is not None:
+            blocked = self.quarantined_tokens()
+            if blocked and {market.yes_token_id, market.no_token_id} & blocked:
+                report.skip("quarantined_token")
+                return False
 
         await self.store.save_market(market)
         yes_book, no_book = await asyncio.gather(
@@ -408,7 +493,9 @@ class TradingEngine:
             return False
 
         if not allow_ai:
-            report.skip("ai_cycle_budget")
+            # A market the candidate filter excluded but that still holds
+            # inventory may only be reduced, never extended.
+            report.skip("market_filter_reduce_only" if reduce_only else "ai_cycle_budget")
             return False
         if market.liquidity_usd < self.settings.min_liquidity_usd:
             report.skip("market_liquidity_screen")
@@ -423,6 +510,9 @@ class TradingEngine:
             return False
         if yes_book.best_ask is None or no_book.best_ask is None:
             report.skip("empty_order_book")
+            return False
+
+        if not await self._reserve_ai_budget(report):
             return False
 
         try:
@@ -454,6 +544,8 @@ class TradingEngine:
             return True
         usage_records = self.forecaster.drain_usage()
         for usage in usage_records:
+            if usage.cost_usd is not None:
+                report.ai_cost_usd = (report.ai_cost_usd or Decimal("0")) + usage.cost_usd
             try:
                 await self.store.record_ai_usage(self.settings.account_id, usage)
                 METRICS.increment(

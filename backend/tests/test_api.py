@@ -25,6 +25,10 @@ class _UnboundPersonalRepository:
     async def get_binding(self) -> None:
         return None
 
+    async def list_quarantine(self, limit: int = 200) -> list:
+        del limit
+        return []
+
 
 def test_control_api_safe_defaults_and_auth_gate() -> None:
     app = create_app(
@@ -121,6 +125,9 @@ def test_personal_status_is_owner_scoped_and_never_returns_secrets() -> None:
         _env_file=None,
         personal_mode=True,
         personal_auto_run=False,
+        # The archive worker performs real Supabase/market I/O. A unit test must
+        # never depend on the network, so it stays disabled here.
+        archive_enabled=False,
         component="all",
         account_id=owner,
         supabase_url="https://example.supabase.co",
@@ -171,6 +178,8 @@ def test_personal_status_is_owner_scoped_and_never_returns_secrets() -> None:
         "enabled": True,
         "live_supported": False,
         "mode": "paper",
+        "desired_mode": "paper",
+        "mode_note": None,
         "auto_run_enabled": False,
         "worker_execution_model": "single_account",
         "worker_ready": False,
@@ -196,6 +205,12 @@ def test_personal_status_is_owner_scoped_and_never_returns_secrets() -> None:
             "collateral_balance_pusd": None,
             "allowances_ready": False,
             "readiness_checked_at": None,
+        },
+        "reconciliation": {
+            "baseline_at": None,
+            "quarantined_count": 0,
+            "quarantined_items": [],
+            "reason": None,
         },
     }
     serialized = response.text
@@ -354,6 +369,8 @@ def test_personal_lifespan_runs_one_worker_and_manual_trigger(
         settings=Settings(
             _env_file=None,
             personal_mode=True,
+            # No network in tests: the archive worker talks to Supabase directly.
+            archive_enabled=False,
             component="all",
             account_id=owner,
             supabase_url="https://example.supabase.co",
@@ -491,6 +508,7 @@ def test_personal_live_resume_and_pause_accept_owner_aal1() -> None:
         personal_auto_run=False,
         personal_live_enabled=True,
         mode="canary",
+        archive_enabled=False,
         component="all",
         account_id=owner,
         supabase_url="https://example.supabase.co",

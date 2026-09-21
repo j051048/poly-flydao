@@ -13,12 +13,6 @@ import {
 
 import { apiRequest, readableApiError } from "../lib/api";
 
-interface EquityPoint {
-  recordedAt: string;
-  equityUsd: number;
-  source: string;
-}
-
 interface ChartPoint {
   label: string;
   equityUsd: number;

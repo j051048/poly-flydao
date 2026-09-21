@@ -343,3 +343,60 @@ def test_product_operations_migration_closes_readiness_and_calibration_loops() -
     assert "wallet.chain_id is not null" in enqueue_gate
     assert "wallet.collateral_balance_pusd > 0" not in enqueue_gate
     assert "wallet.allowances_ready" not in enqueue_gate
+
+def test_reconciliation_quarantine_migration_is_owner_readable_and_service_role_only() -> None:
+    sql = (
+        Path("supabase/migrations/0019_reconciliation_quarantine.sql")
+        .read_text(encoding="utf-8")
+        .lower()
+    )
+    assert "create table if not exists public.reconciliation_quarantine" in sql
+    assert "reconciliation_quarantine_kind_allowed" in sql
+    assert "reconciliation_quarantine_owner_select" in sql
+    assert "alter table public.reconciliation_quarantine force row level security" in sql
+    assert "add column if not exists reconcile_baseline_at timestamptz" in sql
+    assert "create or replace function public.set_personal_reconcile_baseline" in sql
+    assert "security definer" in sql
+    assert "set search_path = ''" in sql
+    assert "select 19;" in sql
+    assert "revoke all on function public.set_personal_reconcile_baseline(uuid, timestamptz)" in sql
+    assert "to service_role;" in sql
+    # The baseline may only move while no real-money exposure can exist.
+    assert "refusing to move the reconcile baseline while the runtime is armed" in sql
+    assert "refusing to move the reconcile baseline with non-terminal orders" in sql
+
+
+def test_retention_migration_is_bounded_and_restores_the_ai_usage_write_path() -> None:
+    sql = (
+        Path("supabase/migrations/0020_data_retention.sql")
+        .read_text(encoding="utf-8")
+        .lower()
+    )
+    assert "create or replace function public.prune_polybot_history(" in sql
+    assert "security definer" in sql
+    assert "set search_path = ''" in sql
+    assert "select 20;" in sql
+    assert "grant execute on function public.prune_polybot_history" in sql
+    assert "from public, anon, authenticated;" in sql
+    assert "to service_role;" in sql
+    # A mistyped window must never be able to wipe recent history.
+    assert "retention window below the supported minimum" in sql
+    assert "p_ai_usage_days < 7" in sql
+    assert "p_equity_days < 30" in sql
+    assert "p_snapshot_days < 1" in sql
+    # Bounded per call so a large backlog cannot hold the transaction open.
+    assert "limit p_batch_limit" in sql
+    assert "get diagnostics v_ai_usage = row_count" in sql
+    # Only the three append-only history tables are eligible.
+    assert "delete from public.ai_usage_ledger" in sql
+    assert "delete from public.equity_history" in sql
+    assert "delete from public.snapshots" in sql
+    for protected in (
+        "delete from public.orders",
+        "delete from public.fills",
+        "delete from public.forecasts",
+        "delete from public.positions",
+    ):
+        assert protected not in sql
+    # 0018 revoked the worker's ability to write the AI usage trail.
+    assert "grant insert, select on table public.ai_usage_ledger to service_role;" in sql

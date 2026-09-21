@@ -123,7 +123,20 @@ class Settings(BaseSettings):
     scan_interval_seconds: int = Field(default=60, ge=10)
     reconcile_interval_seconds: int = Field(default=30, ge=10, le=300)
     reconcile_baseline_utc: str | None = None
+    # How often the worker reloads the AI reliability curve from resolved
+    # forecasts. Generating the curve is one bounded read; caching it avoids a
+    # ledger query on every cycle.
+    calibration_refresh_seconds: int = Field(default=900, ge=60, le=86400)
+    # Per-cycle AI spend alerts: a single cycle that reserves more requests or
+    # more estimated cost than these thresholds notifies the operator once.
+    ai_cycle_units_alert: int = Field(default=10, ge=1, le=1000)
+    ai_cycle_cost_alert_usd: Decimal = Field(default=Decimal("0.50"), ge=0)
     market_limit: int = Field(default=20, ge=1, le=200)
+    # ``none`` keeps the liquidity-ranked top-N universe. ``crypto_updown``
+    # narrows every cycle to short-horizon crypto Up/Down windows (BTC/ETH 5m
+    # markets by default) before forecasting; it can only remove markets.
+    market_filter: Literal["none", "crypto_updown"] = "none"
+    crypto_updown_assets: str = "BTC,ETH"
     max_ai_markets_per_cycle: int = Field(default=3, ge=1, le=20)
     ai_timeout_seconds: int = Field(default=45, ge=10, le=180)
     forecast_cooldown_seconds: int = Field(default=900, ge=60, le=86400)
@@ -131,6 +144,19 @@ class Settings(BaseSettings):
     archive_enabled: bool = True
     archive_market_limit: int = Field(default=20, ge=1, le=100)
     archive_interval_seconds: int = Field(default=300, ge=60, le=86400)
+    # Bounded-growth retention for the append-only history tables. Windows have
+    # hard minimums (see ``polybot.retention``) so a mistyped value cannot wipe
+    # recent data; the pruning itself runs in one bounded, service-role-only
+    # database call.
+    retention_enabled: bool = True
+    retention_ai_usage_days: int = Field(default=90, ge=7, le=3650)
+    retention_equity_history_days: int = Field(default=365, ge=30, le=3650)
+    retention_snapshot_days: int = Field(default=30, ge=1, le=365)
+    retention_interval_seconds: int = Field(default=86_400, ge=3600, le=604_800)
+    # How long the worker may stay not-ready before the external monitor raises
+    # exactly one alert. Without this a green-looking deployment can sit blocked
+    # forever and nobody is told.
+    readiness_alert_seconds: int = Field(default=900, ge=60, le=86_400)
 
     bankroll_usd: Decimal = Field(default=Decimal("1000"), gt=0)
     min_liquidity_usd: Decimal = Field(default=Decimal("10000"), ge=0)
@@ -177,6 +203,10 @@ class Settings(BaseSettings):
             "SUPABASE_SERVICE_ROLE_KEY", "POLYBOT_SUPABASE_SERVICE_ROLE_KEY"
         ),
     )
+    # Hard ceiling for every Supabase HTTP request. The SDK default of 120s can
+    # freeze a worker thread (and process shutdown) long past the trading loop's
+    # own interval, so the durable store must fail fast and retry instead.
+    supabase_timeout_seconds: float = Field(default=15.0, gt=0, le=300)
 
     polymarket_private_key: SecretStr | None = Field(
         default=None,
@@ -200,7 +230,12 @@ class Settings(BaseSettings):
     credential_private_keys_json: SecretStr | None = None
     credential_fingerprint_key: SecretStr | None = None
     geoblock_url: str = OFFICIAL_GEOBLOCK_URL
-    auto_redeem_resolved: bool = False
+    # Winning positions must be redeemed for capital to flow back into the
+    # wallet. Leaving this off silently strands every resolution, which is
+    # impossible to discover from the dashboard, so full automation is the
+    # default. Redemption still requires an armed runtime, a healthy lease and
+    # a passing geoblock check on every attempt.
+    auto_redeem_resolved: bool = True
     notify_webhook_url: str | None = None
     live_ack: str = ""
     beta_sdk_ack: str = ""
@@ -402,6 +437,30 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "POLYBOT_RECONCILE_BASELINE_UTC must include a timezone (use Z or +00:00)"
                 )
+        if self.market_filter == "crypto_updown":
+            symbols = self.crypto_updown_asset_symbols
+            if not symbols:
+                raise ValueError(
+                    "POLYBOT_CRYPTO_UPDOWN_ASSETS must list at least one symbol "
+                    "when POLYBOT_MARKET_FILTER=crypto_updown"
+                )
+            for symbol in symbols:
+                if not re.fullmatch(r"[A-Z0-9]{2,10}", symbol):
+                    raise ValueError(
+                        "POLYBOT_CRYPTO_UPDOWN_ASSETS entries must be 2-10 "
+                        "alphanumeric characters"
+                    )
+            from polybot.market_filters.crypto_updown import SUPPORTED_ASSETS
+
+            unsupported = sorted(set(symbols) - SUPPORTED_ASSETS)
+            if unsupported:
+                raise ValueError(
+                    "POLYBOT_CRYPTO_UPDOWN_ASSETS has no classifier for: "
+                    + ", ".join(unsupported)
+                    + " (supported: "
+                    + ", ".join(sorted(SUPPORTED_ASSETS))
+                    + ")"
+                )
         return self
 
     @property
@@ -412,6 +471,17 @@ class Settings(BaseSettings):
             return None
         parsed = datetime.fromisoformat(self.reconcile_baseline_utc.replace("Z", "+00:00"))
         return parsed if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+    @property
+    def crypto_updown_asset_symbols(self) -> tuple[str, ...]:
+        """Normalised upper-case symbols for the crypto Up/Down market filter."""
+
+        symbols: list[str] = []
+        for item in self.crypto_updown_assets.split(","):
+            symbol = item.strip().upper()
+            if symbol and symbol not in symbols:
+                symbols.append(symbol)
+        return tuple(symbols)
 
     def validated_copy(self, **updates: object) -> Settings:
         """Rebuild settings through validation instead of Pydantic's unchecked model_copy."""

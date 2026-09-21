@@ -12,14 +12,22 @@ from polybot.stores.ledger import IncompleteFillLedgerError
 
 
 class TraceStore:
-    def __init__(self) -> None:
+    def __init__(self, *, bot_tokens: set[str] | None = None) -> None:
         self.trades: list[str] = []
+        self.quarantined: list[object] = []
+        self.bot_tokens = bot_tokens or set()
 
     async def reconcile_trade(self, update: UserTradeUpdate, account_id: str) -> None:
         self.trades.append(update.clob_trade_id)
 
     async def durable_order_ids(self, candidates: set[str], account_id: str) -> set[str]:
         return set()
+
+    async def durable_token_ids(self, account_id: str) -> set[str]:
+        return set(self.bot_tokens)
+
+    async def record_quarantine(self, account_id: str, record: object) -> None:
+        self.quarantined.append(record)
 
     async def pending_trade_ids(self, account_id: str) -> set[str]:
         return set()
@@ -30,14 +38,20 @@ class CloseOnlyClient:
         return None
 
 
-def _reconciler(baseline: datetime | None) -> OrderReconciler:
+def _reconciler(
+    baseline: datetime | None,
+    *,
+    store: TraceStore | None = None,
+    quarantine_enabled: bool = True,
+) -> OrderReconciler:
     return OrderReconciler(
         private_key="unused",
         wallet=None,
         account_id="acct",
-        store=TraceStore(),  # type: ignore[arg-type]
+        store=store or TraceStore(),  # type: ignore[arg-type]
         client=CloseOnlyClient(),
         baseline_utc=baseline,
+        quarantine_enabled=quarantine_enabled,
     )
 
 
@@ -51,9 +65,38 @@ async def test_baseline_ignores_old_trade_in_account_updates() -> None:
 
 async def test_recent_trade_still_requires_durable_mapping() -> None:
     baseline = datetime.now(UTC) - timedelta(minutes=5)
-    reconciler = _reconciler(baseline)
+    store = TraceStore()
+    reconciler = _reconciler(baseline, store=store)
+
+    assert await reconciler._account_trade_updates(_recent_trade()) == []
+    assert len(store.quarantined) == 1
+    assert reconciler.quarantined_token_ids == frozenset({"token"})
+    assert store.trades == []
+
+
+async def test_quarantine_is_disabled_for_strict_deployments() -> None:
+    baseline = datetime.now(UTC) - timedelta(minutes=5)
+    reconciler = _reconciler(baseline, quarantine_enabled=False)
+
+    with pytest.raises(IncompleteFillLedgerError):
+        await reconciler._account_trade_updates(_recent_trade())
+
+
+async def test_trade_touching_bot_inventory_still_fails_closed() -> None:
+    """Quarantine must never mask divergence inside the bot's own footprint."""
+
+    baseline = datetime.now(UTC) - timedelta(minutes=5)
+    store = TraceStore(bot_tokens={"token"})
+    reconciler = _reconciler(baseline, store=store)
+
+    with pytest.raises(IncompleteFillLedgerError):
+        await reconciler._account_trade_updates(_recent_trade())
+    assert store.quarantined == []
+
+
+def _recent_trade() -> SimpleNamespace:
     now = datetime.now(UTC)
-    trade = SimpleNamespace(
+    return SimpleNamespace(
         id="trade-new",
         matched_at=now,
         status="MATCHED",
@@ -70,9 +113,6 @@ async def test_recent_trade_still_requires_durable_mapping() -> None:
         updated_at=now,
         trader_side="TAKER",
     )
-
-    with pytest.raises(IncompleteFillLedgerError):
-        await reconciler._account_trade_updates(trade)
 
 
 async def test_reconcile_trade_and_notify_skips_old_update() -> None:

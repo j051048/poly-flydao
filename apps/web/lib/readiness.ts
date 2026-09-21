@@ -1,4 +1,8 @@
-import { parsePersonalRuntimeStatus } from "./personal-runtime";
+import {
+  parsePersonalRuntimeStatus,
+  personalModeLabel,
+  type PersonalTradingMode,
+} from "./personal-runtime";
 
 export type SetupStepState = "done" | "todo" | "working" | "blocked";
 
@@ -29,19 +33,60 @@ function text(...values: unknown[]): string | undefined {
   );
 }
 
+const VALIDATION_COPY: Record<
+  PersonalTradingMode,
+  { title: string; description: string; action: string }
+> = {
+  paper: {
+    title: "完成一次 Paper 模拟",
+    description:
+      "不会发送真实订单，用它确认 AI、市场数据和常驻 Worker 可以协同工作。",
+    action: "运行安全模拟",
+  },
+  shadow: {
+    title: "完成一次 Shadow 观察",
+    description:
+      "跟随真实行情但不提交订单，用来核对信号与风控是否按预期工作。",
+    action: "运行观察周期",
+  },
+  canary: {
+    title: "完成一次 Canary 小额实盘验证",
+    description:
+      "以最小仓位走通钱包绑定、授权、下单与撤单链路；这是实盘运行前的最后一步。",
+    action: "运行验证周期",
+  },
+  live: {
+    title: "确认一笔实盘成交与对账",
+    description: "已进入实盘模式，先确认小额成交、持仓与对账结果符合预期。",
+    action: "查看运行状态",
+  },
+};
+
 export function buildSetupSteps(input: ReadinessInput): SetupStep[] {
   const health = record(input.health);
   const status = record(input.status);
   const personal = parsePersonalRuntimeStatus(input.personal ?? status);
   const latestJob = record(status.latest_job);
   const jobState = text(personal.lastCycle?.state, latestJob.status);
-  const jobMode = personal.lastCycle ? personal.mode : text(latestJob.mode);
+  const jobMode = text(latestJob.mode);
   const realMoneyMode = ["canary", "live"].includes(personal.mode);
   const environmentReady =
     personal.enabled &&
     personal.ai.configured &&
     (!realMoneyMode || personal.wallet.configured);
-  const paperMode = personal.mode === "paper";
+  const mode = personal.mode;
+  const validation = VALIDATION_COPY[mode];
+  // A cycle only validates the mode it actually ran in; a stale paper cycle
+  // must not mark a canary deployment as verified.
+  const validated =
+    jobState === "succeeded" && (jobMode === undefined || jobMode === mode);
+  const validating =
+    ["queued", "claimed", "running"].includes(jobState ?? "") &&
+    (jobMode === undefined || jobMode === mode);
+  const modeNote =
+    personal.desiredMode !== mode && personal.modeNote
+      ? `${personal.modeNote}（当前实际运行：${personalModeLabel(mode)}）`
+      : undefined;
 
   return [
     {
@@ -64,26 +109,21 @@ export function buildSetupSteps(input: ReadinessInput): SetupStep[] {
     },
     {
       key: "paper",
-      title: "完成一次 Paper 模拟",
-      description: paperMode
-        ? "不会发送真实订单，用它确认 AI、市场数据和常驻 Worker 可以协同工作。"
-        : "当前后端不是 Paper。请先在 Zeabur 设置 POLYBOT_MODE=paper 并重新部署，向导绝不会把实盘伪装成模拟。",
-      state:
-        !paperMode
-          ? "blocked"
-          : jobMode === "paper" && jobState === "succeeded"
-          ? "done"
-          : jobMode === "paper" &&
-              ["queued", "claimed", "running"].includes(jobState ?? "")
-            ? "working"
-            : "todo",
-      actionLabel: paperMode ? "运行安全模拟" : "查看模式变量",
-      href: paperMode ? "/" : "/settings#runtime",
+      title: validation.title,
+      description: modeNote ?? validation.description,
+      // Every mode gets a non-blocking step: the deployment either validates
+      // itself in the mode the operator chose, or it is honestly clamped and
+      // says so. The old flow forced canary users to stay blocked at 75%.
+      state: validated ? "done" : validating ? "working" : "todo",
+      actionLabel: validation.action,
+      href: "/",
     },
     {
       key: "automation",
       title: "开启个人自动运行",
-      description: "由 Zeabur 常驻 Worker 定时运行；先保持 Paper 或 Shadow 观察。",
+      description: realMoneyMode
+        ? "由常驻 Worker 按周期自动运行实盘；随时可在控制台暂停并撤单。"
+        : "由 Zeabur 常驻 Worker 定时运行；先保持 Paper 或 Shadow 观察。",
       state:
         personal.autoRunEnabled && personal.workerReady
           ? "done"

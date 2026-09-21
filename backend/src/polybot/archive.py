@@ -32,6 +32,7 @@ def build_archive_worker(settings: Settings) -> MarketArchiveWorker:
         settings.supabase_url,
         settings.supabase_service_role_key.get_secret_value(),
         account_id=settings.account_id,
+        timeout_seconds=settings.supabase_timeout_seconds,
     )
     return MarketArchiveWorker(
         settings=settings,

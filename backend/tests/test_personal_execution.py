@@ -8,6 +8,7 @@ import pytest
 
 from polybot.config import TradingMode
 from polybot.personal_execution import PersonalExecutionRepository
+from polybot.schema import EXPECTED_SCHEMA_VERSION
 
 ACCOUNT = "11111111-1111-4111-8111-111111111111"
 SIGNER = "0x" + ("11" * 20)
@@ -53,7 +54,7 @@ class Query:
     def execute(self):
         self.client.executions.append(self.source)
         if self.source == "rpc:polybot_schema_version":
-            return SimpleNamespace(data=18)
+            return SimpleNamespace(data=EXPECTED_SCHEMA_VERSION)
         if self.source == "rpc:bind_personal_runtime_wallet":
             return SimpleNamespace(data=[_binding_row()])
         if self.source == "rpc:record_personal_wallet_readiness":

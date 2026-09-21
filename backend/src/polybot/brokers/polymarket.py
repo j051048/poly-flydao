@@ -36,7 +36,9 @@ class PolymarketBroker:
         client: Any | None = None,
         geoblock: GeoblockChecker | None = None,
     ):
-        if settings.mode not in {TradingMode.CANARY, TradingMode.LIVE}:
+        if settings.mode not in {TradingMode.CANARY, TradingMode.LIVE} and not (
+            settings.personal_mode and settings.personal_live_enabled
+        ):
             raise ValueError("PolymarketBroker is only valid for canary/live modes")
         self.settings = settings
         self.store = store

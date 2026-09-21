@@ -1,257 +1,39 @@
 "use client";
 
-import Link from "next/link";
 import dynamic from "next/dynamic";
+import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { API_BASE_URL, apiRequest, readableApiError } from "../lib/api";
+import ControlDetailsPanel from "../components/ControlDetailsPanel";
+import LatestJobPanel from "../components/LatestJobPanel";
+import NotificationsPanel from "../components/NotificationsPanel";
+import RiskLimitsPanel from "../components/RiskLimitsPanel";
+import ToastViewport, { useToasts } from "../components/Toast";
 import {
-  API_BASE_URL,
-  apiRequest,
-  readableApiError,
-} from "../lib/api";
+  type BusyAction,
+  type HealthView,
+  type JobView,
+  type LiveMode,
+  type Notice,
+  type NotificationView,
+  type RiskLimitView,
+  type StatusView,
+  RISK_LIMITS,
+  asRecord,
+  asString,
+  countdownLabel,
+  formatDate,
+  jobCompletionText,
+  modeLabel,
+  parseJob,
+  parseNotifications,
+  parseStatus,
+} from "../lib/dashboard";
 
 const EquityChart = dynamic(() => import("../components/EquityChart"), {
   ssr: false,
 });
-
-type JsonRecord = Record<string, unknown>;
-type BusyAction = "cycle" | "arm" | "disarm" | null;
-type HealthPhase = "loading" | "online" | "degraded" | "offline";
-type Notice = { tone: "success" | "error" | "info"; text: string };
-type LiveMode = "canary" | "live";
-
-interface HealthView {
-  phase: HealthPhase;
-  store?: string;
-  mode?: string;
-  checkedAt?: number;
-}
-
-interface ControlView {
-  accountId?: string;
-  mode?: string;
-  armed?: boolean;
-  armedUntil?: string;
-  killSwitch?: boolean;
-  acceptNewIntents?: boolean;
-  version?: number;
-  updatedAt?: string;
-}
-
-interface StatusView {
-  configuredMode?: string;
-  aiProvider?: string;
-  forecastModel?: string;
-  personalEnabled?: boolean;
-  liveSupported?: boolean;
-  personalPaused?: boolean;
-  autoRunEnabled?: boolean;
-  personalCycleCount?: number;
-  control: ControlView;
-  riskLimits: Array<{ key: string; label: string; value: string }>;
-  latestJob?: JobView;
-  fetchedAt: number;
-}
-
-interface JobView {
-  id?: string;
-  status?: string;
-  mode?: string;
-  marketsScanned?: number;
-  forecastsCreated?: number;
-  candidatesCreated?: number;
-  executions?: number;
-  skipped?: Array<{ code: string; count: number }>;
-  message?: string;
-}
-
-interface NotificationView {
-  id: number;
-  severity: string;
-  title: string;
-  message: string;
-  createdAt?: string;
-  read: boolean;
-}
-
-const RISK_LIMITS = [
-  { key: "min_edge", label: "最小净优势", format: "percent" },
-  { key: "max_order_usd", label: "单笔订单上限", format: "usd" },
-  { key: "max_trade_risk_pct", label: "单次交易风险", format: "percent" },
-  { key: "max_event_exposure_pct", label: "单事件敞口", format: "percent" },
-  { key: "max_gross_exposure_pct", label: "总敞口", format: "percent" },
-  { key: "daily_loss_limit_pct", label: "单日亏损熔断", format: "percent" },
-  { key: "max_drawdown_pct", label: "最大回撤熔断", format: "percent" },
-] as const;
-
-function asRecord(value: unknown): JsonRecord {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? (value as JsonRecord)
-    : {};
-}
-
-function asString(value: unknown): string | undefined {
-  return typeof value === "string" && value.length > 0 ? value : undefined;
-}
-
-function asNumber(value: unknown): number | undefined {
-  const parsed = typeof value === "number" ? value : Number(value);
-  return Number.isFinite(parsed) ? parsed : undefined;
-}
-
-function asBoolean(value: unknown): boolean | undefined {
-  return typeof value === "boolean" ? value : undefined;
-}
-
-function formatRisk(value: unknown, format: "percent" | "usd"): string {
-  const numeric = asNumber(value);
-  if (numeric === undefined) return "未返回";
-  return new Intl.NumberFormat(format === "usd" ? "en-US" : "zh-CN", {
-    style: format === "usd" ? "currency" : "percent",
-    ...(format === "usd" ? { currency: "USD" } : {}),
-    maximumFractionDigits: 2,
-  }).format(numeric);
-}
-
-function parseJob(payload: unknown): JobView {
-  const root = asRecord(payload);
-  const job = asRecord(root.job);
-  const source = Object.keys(job).length ? job : root;
-  const summary = asRecord(source.result_summary);
-  const skipped = asRecord(summary.skipped);
-  const executions = Array.isArray(source.executions)
-    ? source.executions.length
-    : asNumber(
-        summary.executions ?? source.executions ?? source.execution_count,
-      );
-  return {
-    id: asString(
-      source.job_id ?? source.request_id ?? source.id ?? source.run_id,
-    ),
-    status:
-      asString(source.status ?? source.state) ??
-      (source.completed_at ? "completed" : undefined),
-    mode: asString(source.mode),
-    marketsScanned: asNumber(summary.markets_scanned ?? source.markets_scanned),
-    forecastsCreated: asNumber(
-      summary.forecasts_created ?? source.forecasts_created,
-    ),
-    candidatesCreated: asNumber(
-      summary.candidates_created ?? source.candidates_created,
-    ),
-    executions,
-    skipped: Object.entries(skipped)
-      .map(([code, count]) => ({ code, count: asNumber(count) ?? 0 }))
-      .filter((item) => item.count > 0)
-      .sort((left, right) => right.count - left.count),
-    message: asString(source.message ?? source.error_code),
-  };
-}
-
-function jobCompletionText(job: JobView): string {
-  if (
-    job.marketsScanned === undefined &&
-    job.forecastsCreated === undefined &&
-    job.executions === undefined
-  ) {
-    return "任务已完成；旧任务没有可展示的运行摘要。";
-  }
-  return `任务已完成：扫描 ${job.marketsScanned ?? 0} 个市场，生成 ${job.forecastsCreated ?? 0} 个预测，执行 ${job.executions ?? 0} 笔。`;
-}
-
-function skipReasonLabel(code: string): string {
-  const exact: Record<string, string> = {
-    market_liquidity_screen: "市场流动性不足",
-    forecast_cooldown: "预测仍在冷却期",
-    insufficient_distinct_evidence: "独立证据不足",
-    forecast_insufficient_citations: "AI 引用来源不足",
-    no_positive_value_candidate: "费用后没有正优势",
-    market_resolution_too_close: "距离结算太近",
-    stale_order_book: "盘口数据过期",
-  };
-  if (exact[code]) return exact[code];
-  if (code.startsWith("forecast_generation_error")) return "AI 预测调用失败";
-  if (code.startsWith("evidence_pipeline_error")) return "外部证据检索失败";
-  if (code.startsWith("risk_")) return "被风险规则拒绝";
-  return code.replaceAll("_", " ");
-}
-
-function parseStatus(payload: unknown): StatusView {
-  const root = asRecord(payload);
-  const personal = asRecord(root.personal);
-  const personalAi = asRecord(personal.ai);
-  const personalWallet = asRecord(personal.wallet);
-  const control = asRecord(root.control);
-  const risk = asRecord(root.risk_limits ?? root.risk_policy);
-  return {
-    configuredMode: asString(personal.mode ?? root.mode),
-    aiProvider: asString(personalAi.provider ?? root.ai_provider),
-    forecastModel: asString(
-      personalAi.forecast_model ?? root.forecast_model,
-    ),
-    personalEnabled: asBoolean(personal.enabled ?? root.personal_mode),
-    liveSupported: asBoolean(personal.live_supported),
-    personalPaused: asBoolean(personalWallet.paused),
-    autoRunEnabled: asBoolean(personal.auto_run_enabled),
-    personalCycleCount: asNumber(personal.cycle_count),
-    control: {
-      accountId: asString(control.account_id),
-      mode: asString(control.mode),
-      armed: asBoolean(control.armed),
-      armedUntil: asString(control.armed_until),
-      killSwitch: asBoolean(control.kill_switch),
-      acceptNewIntents: asBoolean(control.accept_new_intents),
-      version: asNumber(control.version),
-      updatedAt: asString(control.updated_at),
-    },
-    riskLimits: RISK_LIMITS.map((definition) => ({
-      key: definition.key,
-      label: definition.label,
-      value: formatRisk(risk[definition.key], definition.format),
-    })),
-    latestJob: root.latest_job
-      ? parseJob(root.latest_job)
-      : personal.last_cycle
-        ? parseJob(personal.last_cycle)
-        : undefined,
-    fetchedAt: Date.now(),
-  };
-}
-
-function modeLabel(mode?: string): string {
-  return (
-    {
-      paper: "模拟盘",
-      shadow: "影子模式",
-      canary: "金丝雀实盘",
-      live: "受控实盘",
-    }[mode ?? ""] ??
-    mode ??
-    "未知"
-  );
-}
-
-function formatDate(value?: string | number): string {
-  if (value === undefined) return "—";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "—";
-  return new Intl.DateTimeFormat("zh-CN", {
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  }).format(date);
-}
-
-function countdownLabel(armedUntil: string | undefined, now: number): string {
-  if (!armedUntil || !now) return "无有效窗口";
-  const remaining = new Date(armedUntil).getTime() - now;
-  if (!Number.isFinite(remaining) || remaining <= 0) return "窗口已过期";
-  const seconds = Math.ceil(remaining / 1000);
-  return `${Math.floor(seconds / 60)} 分 ${String(seconds % 60).padStart(2, "0")} 秒`;
-}
 
 export default function HomePage() {
   const [health, setHealth] = useState<HealthView>({ phase: "loading" });
@@ -264,6 +46,7 @@ export default function HomePage() {
   const [refreshing, setRefreshing] = useState(false);
   const [now, setNow] = useState(0);
   const [notifications, setNotifications] = useState<NotificationView[]>([]);
+  const { toasts, push: pushToast, dismiss: dismissToast } = useToasts();
   const cycleIdempotencyKey = useRef<string | null>(null);
   const personalCycleBaseline = useRef<number | null>(null);
 
@@ -298,22 +81,7 @@ export default function HomePage() {
       .catch((error) => setStatusError(readableApiError(error)));
 
     const notificationsPromise = apiRequest<unknown>("/v1/me/notifications?limit=8")
-      .then(({ data }) => {
-        const rows = asRecord(data).items;
-        setNotifications(
-          (Array.isArray(rows) ? rows : []).map((value) => {
-            const row = asRecord(value);
-            return {
-              id: Number(row.id),
-              severity: asString(row.severity) ?? "info",
-              title: asString(row.title) ?? "系统通知",
-              message: asString(row.message) ?? "",
-              createdAt: asString(row.created_at),
-              read: Boolean(row.read_at),
-            };
-          }),
-        );
-      })
+      .then(({ data }) => setNotifications(parseNotifications(data)))
       .catch(() => undefined);
 
     await Promise.allSettled([healthPromise, statusPromise, notificationsPromise]);
@@ -343,6 +111,10 @@ export default function HomePage() {
     }
 
     let cancelled = false;
+    const announce = (next: Notice) => {
+      setNotice(next);
+      pushToast(next.text, next.tone);
+    };
     const poll = async () => {
       try {
         if (status?.personalEnabled) {
@@ -367,7 +139,7 @@ export default function HomePage() {
               ["completed", "succeeded"].includes(updatedState)
             ) {
               personalCycleBaseline.current = null;
-              setNotice({
+              announce({
                 tone: "success",
                 text: jobCompletionText(updatedStatus.latestJob),
               });
@@ -377,7 +149,7 @@ export default function HomePage() {
               ["failed", "cancelled", "dead"].includes(updatedState)
             ) {
               personalCycleBaseline.current = null;
-              setNotice({
+              announce({
                 tone: "error",
                 text:
                   updatedStatus.latestJob.message ??
@@ -397,15 +169,12 @@ export default function HomePage() {
           updated.status &&
           ["completed", "succeeded"].includes(updated.status)
         ) {
-          setNotice({
-            tone: "success",
-            text: jobCompletionText(updated),
-          });
+          announce({ tone: "success", text: jobCompletionText(updated) });
         } else if (
           updated.status &&
           ["failed", "cancelled", "dead"].includes(updated.status)
         ) {
-          setNotice({
+          announce({
             tone: "error",
             text: updated.message ?? `任务以 ${updated.status} 状态结束。`,
           });
@@ -422,7 +191,7 @@ export default function HomePage() {
       cancelled = true;
       globalThis.clearInterval(timer);
     };
-  }, [lastJob?.id, lastJob?.status, status?.personalEnabled]);
+  }, [lastJob?.id, lastJob?.status, status?.personalEnabled, pushToast]);
 
   async function markNotificationRead(notificationId: number) {
     try {
@@ -435,7 +204,9 @@ export default function HomePage() {
         ),
       );
     } catch (error) {
-      setNotice({ tone: "error", text: readableApiError(error) });
+      const failure: Notice = { tone: "error", text: readableApiError(error) };
+      setNotice(failure);
+      pushToast(failure.text, failure.tone);
     }
   }
 
@@ -463,6 +234,16 @@ export default function HomePage() {
       API_BASE_URL.startsWith("http://127.0.0.1"),
     [],
   );
+  const riskLimits: RiskLimitView[] = useMemo(
+    () =>
+      status?.riskLimits ??
+      RISK_LIMITS.map((item) => ({
+        key: item.key,
+        label: item.label,
+        value: "等待 API",
+      })),
+    [status?.riskLimits],
+  );
 
   async function runCycle() {
     if (
@@ -472,7 +253,9 @@ export default function HomePage() {
       return;
     }
     setBusy("cycle");
-    setNotice({ tone: "info", text: "正在启动个人运行周期…" });
+    const startingNotice: Notice = { tone: "info", text: "正在启动个人运行周期…" };
+    setNotice(startingNotice);
+    pushToast(startingNotice.text, startingNotice.tone);
     try {
       cycleIdempotencyKey.current ??= crypto.randomUUID();
       if (status?.personalEnabled) {
@@ -492,16 +275,20 @@ export default function HomePage() {
         mode: asString(parsedResponse.mode) ?? configuredMode,
       };
       setLastJob(job);
-      setNotice({
+      const settledNotice: Notice = {
         tone: "success",
-          text:
-            result.status === 202
-              ? `周期已交给个人 Worker${job.id ? `（${job.id}）` : ""}，可以继续使用控制台。`
-              : jobCompletionText(job),
-      });
+        text:
+          result.status === 202
+            ? `周期已交给个人 Worker${job.id ? `（${job.id}）` : ""}，可以继续使用控制台。`
+            : jobCompletionText(job),
+      };
+      setNotice(settledNotice);
+      pushToast(settledNotice.text, settledNotice.tone);
       await refresh();
     } catch (error) {
-      setNotice({ tone: "error", text: readableApiError(error) });
+      const failure: Notice = { tone: "error", text: readableApiError(error) };
+      setNotice(failure);
+      pushToast(failure.text, failure.tone);
     } finally {
       setBusy(null);
     }
@@ -528,13 +315,17 @@ export default function HomePage() {
         idempotencyKey: crypto.randomUUID(),
       });
       setRiskConfirmed(false);
-      setNotice({
+      const armed: Notice = {
         tone: "success",
         text: `${modeLabel(armableMode)}恢复请求已交给个人 Worker；内部短期授权会由它自动续期。`,
-      });
+      };
+      setNotice(armed);
+      pushToast(armed.text, armed.tone);
       await refresh();
     } catch (error) {
-      setNotice({ tone: "error", text: readableApiError(error) });
+      const failure: Notice = { tone: "error", text: readableApiError(error) };
+      setNotice(failure);
+      pushToast(failure.text, failure.tone);
     } finally {
       setBusy(null);
     }
@@ -542,7 +333,12 @@ export default function HomePage() {
 
   async function disarmTrading() {
     setBusy("disarm");
-    setNotice({ tone: "info", text: "正在打开 kill switch 并请求撤销挂单…" });
+    const startingNotice: Notice = {
+      tone: "info",
+      text: "正在打开 kill switch 并请求撤销挂单…",
+    };
+    setNotice(startingNotice);
+    pushToast(startingNotice.text, startingNotice.tone);
     try {
       const result = await apiRequest<unknown>("/v1/control/disarm", {
         method: "POST",
@@ -553,15 +349,19 @@ export default function HomePage() {
       const response = asRecord(result.data);
       const pending =
         result.status === 202 || response.cancellation_pending === true;
-      setNotice({
+      const stopped: Notice = {
         tone: pending ? "info" : "success",
         text: pending
           ? "交易已停用，撤单任务正在 worker 中处理。请等待开放订单归零。"
           : "交易已停用，kill switch 已打开且挂单已撤销。",
-      });
+      };
+      setNotice(stopped);
+      pushToast(stopped.text, stopped.tone);
       await refresh();
     } catch (error) {
-      setNotice({ tone: "error", text: readableApiError(error) });
+      const failure: Notice = { tone: "error", text: readableApiError(error) };
+      setNotice(failure);
+      pushToast(failure.text, failure.tone);
     } finally {
       setBusy(null);
     }
@@ -680,37 +480,10 @@ export default function HomePage() {
 
       <EquityChart />
 
-      {notifications.some((item) => !item.read) && (
-        <section className="panel notification-panel" aria-label="系统提醒">
-          <div className="section-heading">
-            <div>
-              <p className="eyebrow">ATTENTION</p>
-              <h2>需要关注</h2>
-            </div>
-            <span className="pill degraded">
-              {notifications.filter((item) => !item.read).length} 条未读
-            </span>
-          </div>
-          <div className="notification-list">
-            {notifications.filter((item) => !item.read).map((item) => (
-              <article className={`notification-item ${item.severity}`} key={item.id}>
-                <div>
-                  <strong>{item.title}</strong>
-                  <p>{item.message}</p>
-                  <small>{formatDate(item.createdAt)}</small>
-                </div>
-                <button
-                  type="button"
-                  className="text-button"
-                  onClick={() => void markNotificationRead(item.id)}
-                >
-                  已处理
-                </button>
-              </article>
-            ))}
-          </div>
-        </section>
-      )}
+      <NotificationsPanel
+        notifications={notifications}
+        onMarkRead={(id) => void markNotificationRead(id)}
+      />
 
       <div className="main-grid">
         <section className="panel controls-panel">
@@ -840,84 +613,15 @@ export default function HomePage() {
         </section>
 
         <aside className="side-column">
-          <section className="panel">
-            <div className="section-heading compact">
-              <div>
-                <p className="eyebrow">RISK LIMITS</p>
-                <h2>风险上限</h2>
-              </div>
-              <span className="version-label">服务端值</span>
-            </div>
-            <dl className="risk-list">
-              {(status?.riskLimits ??
-                RISK_LIMITS.map((item) => ({
-                  key: item.key,
-                  label: item.label,
-                  value: "等待 API",
-                }))).map((limit) => (
-                <div className="risk-row" key={limit.key}>
-                  <dt>{limit.label}</dt>
-                  <dd>{limit.value}</dd>
-                </div>
-              ))}
-            </dl>
-          </section>
+          <RiskLimitsPanel limits={riskLimits} />
 
-          <section className="panel">
-            <div className="section-heading compact">
-              <div>
-                <p className="eyebrow">LATEST JOB</p>
-                <h2>最近任务</h2>
-              </div>
-              {lastJob?.status && <span className="pill">{lastJob.status}</span>}
-            </div>
-            {lastJob ? (
-              <dl className="detail-list">
-                <div><dt>任务 ID</dt><dd title={lastJob.id}>{lastJob.id ?? "—"}</dd></div>
-                <div><dt>模式</dt><dd>{modeLabel(lastJob.mode)}</dd></div>
-                <div><dt>扫描市场</dt><dd>{lastJob.marketsScanned ?? "等待 worker"}</dd></div>
-                <div><dt>AI 预测</dt><dd>{lastJob.forecastsCreated ?? "等待 worker"}</dd></div>
-                <div><dt>候选机会</dt><dd>{lastJob.candidatesCreated ?? "等待 worker"}</dd></div>
-                <div><dt>执行订单</dt><dd>{lastJob.executions ?? "等待 worker"}</dd></div>
-                {lastJob.skipped && lastJob.skipped.length > 0 && (
-                  <div className="skip-reasons">
-                    <dt>主要未交易原因</dt>
-                    <dd>
-                      {lastJob.skipped.slice(0, 3).map((item) => (
-                        <span key={item.code}>
-                          {skipReasonLabel(item.code)} × {item.count}
-                        </span>
-                      ))}
-                    </dd>
-                  </div>
-                )}
-              </dl>
-            ) : (
-              <div className="empty-state">
-                <span aria-hidden="true">◎</span>
-                <p>暂无运行任务。</p>
-              </div>
-            )}
-          </section>
+          <LatestJobPanel job={lastJob} />
 
-          <section className="panel control-details">
-            <div className="section-heading compact">
-              <div>
-                <p className="eyebrow">RUNTIME CONTROL</p>
-                <h2>控制详情</h2>
-              </div>
-            </div>
-            <dl className="detail-list">
-              <div><dt>账户</dt><dd title={control?.accountId}>{control?.accountId ?? "来自 JWT"}</dd></div>
-              <div><dt>控制模式</dt><dd>{modeLabel(control?.mode)}</dd></div>
-              <div><dt>解锁到期</dt><dd>{formatDate(control?.armedUntil)}</dd></div>
-              <div><dt>接受新意图</dt><dd>{control?.acceptNewIntents === true ? "是" : "否或未知"}</dd></div>
-              <div><dt>控制版本</dt><dd>{control?.version ?? "—"}</dd></div>
-              <div><dt>更新时间</dt><dd>{formatDate(control?.updatedAt)}</dd></div>
-            </dl>
-          </section>
+          <ControlDetailsPanel control={control} />
         </aside>
       </div>
+
+      <ToastViewport toasts={toasts} onDismiss={dismissToast} />
     </main>
   );
 }

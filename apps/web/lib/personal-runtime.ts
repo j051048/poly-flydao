@@ -4,10 +4,15 @@ export interface PersonalRuntimeStatus {
   enabled: boolean;
   liveSupported: boolean;
   mode: PersonalTradingMode;
+  /** Durable dashboard request. Applied by the worker at a cycle boundary. */
+  desiredMode: PersonalTradingMode;
+  /** Operator-facing reason when the request had to be clamped. */
+  modeNote?: string;
   autoRunEnabled: boolean;
   workerReady: boolean;
   ready: boolean;
   cycleCount: number;
+  reconciliation: PersonalReconciliationStatus;
   lastCycle?: {
     id?: string;
     state?: string;
@@ -36,6 +41,25 @@ export interface PersonalRuntimeStatus {
     allowancesReady: boolean;
     readinessCheckedAt?: string;
   };
+}
+
+export interface PersonalQuarantineItem {
+  kind: string;
+  externalKey: string;
+  reason: string;
+  conditionId?: string;
+  tokenId?: string;
+  side?: string;
+  size?: string;
+  notionalUsd?: string;
+}
+
+export interface PersonalReconciliationStatus {
+  /** Everything traded before this instant is deliberately ignored. */
+  baselineAt?: string;
+  quarantinedCount: number;
+  quarantinedItems: PersonalQuarantineItem[];
+  reason?: string;
 }
 
 function record(value: unknown): Record<string, unknown> {
@@ -87,16 +111,42 @@ export function parsePersonalRuntimeStatus(
   const chainId = Number(wallet.chain_id);
   const lastCycle = record(source.last_cycle);
   const cycleCount = Number(source.cycle_count);
+  const reconciliation = record(source.reconciliation);
+  const mode = tradingMode(source.mode ?? profile.desired_mode);
 
   return {
     enabled: boolean(source.enabled, source.personal_mode) ?? false,
     liveSupported: boolean(source.live_supported) ?? false,
-    mode: tradingMode(source.mode ?? profile.desired_mode),
+    mode,
+    desiredMode: tradingMode(
+      source.desired_mode ?? profile.desired_mode ?? mode,
+    ),
+    modeNote: text(source.mode_note, profile.mode_note),
     autoRunEnabled:
       boolean(source.auto_run_enabled, profile.auto_run_enabled) ?? false,
     workerReady: boolean(source.worker_ready) ?? false,
     ready: boolean(source.ready) ?? false,
     cycleCount: Number.isFinite(cycleCount) ? cycleCount : 0,
+    reconciliation: {
+      baselineAt: text(reconciliation.baseline_at),
+      quarantinedCount: Number(reconciliation.quarantined_count) || 0,
+      quarantinedItems: Array.isArray(reconciliation.quarantined_items)
+        ? reconciliation.quarantined_items.map((raw) => {
+            const item = record(raw);
+            return {
+              kind: text(item.kind) ?? "trade",
+              externalKey: text(item.external_key) ?? "",
+              reason: text(item.reason) ?? "unknown",
+              conditionId: text(item.condition_id),
+              tokenId: text(item.token_id),
+              side: text(item.side),
+              size: text(item.size),
+              notionalUsd: text(item.notional_usd),
+            };
+          })
+        : [],
+      reason: text(reconciliation.reason),
+    },
     lastCycle: Object.keys(lastCycle).length
       ? {
           id: text(lastCycle.id),

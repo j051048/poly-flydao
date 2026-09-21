@@ -84,7 +84,11 @@ Canary/Live 必须同时显式设置 `POLYBOT_PERSONAL_LIVE_ENABLED=true` 和对
 4. 轮换可能泄漏的 AI Key、service-role key 和钱包；
 5. 保存 request ID 与脱敏日志，复盘后再恢复 Canary。
 
-仍需为真实资金配置外部存活监控、异常告警、数据库备份/恢复、密钥轮换和撤单演练。
+外部存活监控与异常告警已内置：worker 连续未就绪超过 `POLYBOT_READINESS_ALERT_SECONDS`
+会通过 `POLYBOT_NOTIFY_WEBHOOK_URL` 推送阻塞门控与修复建议（同一轮故障最多每 6 小时
+重复一次，恢复时再推送一条），周期失败与安全熔断仍照常推送；只增历史表
+（`ai_usage_ledger` / `equity_history` / `snapshots`）由迁移 0020 的有界裁剪按天清理。
+仍需为真实资金配置数据库备份/恢复、密钥轮换和撤单演练。
 
 ## 高级/旧多租户安全边界
 
