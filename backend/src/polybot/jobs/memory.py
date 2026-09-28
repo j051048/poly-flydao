@@ -15,6 +15,7 @@ from polybot.jobs.schemas import (
     CycleJob,
     CycleJobRequest,
     CycleJobStatus,
+    EquityScope,
     JobConflictError,
     PerformanceSnapshot,
     PortfolioSnapshot,
@@ -28,6 +29,7 @@ from polybot.jobs.schemas import (
     _decimal_text,
     _performance_snapshot,
     _ratio_text,
+    equity_sources,
 )
 from polybot.models import AIUsageRecord, EquityHistoryPoint, RuntimeControl, utc_now
 
@@ -391,11 +393,14 @@ class InMemoryJobRepository:
         return request_limit
 
     async def list_equity_history(
-        self, account_id: str, *, limit: int = 200
+        self, account_id: str, *, limit: int = 200, scope: EquityScope | None = None
     ) -> list[EquityHistoryPoint]:
         if limit < 1:
             raise ValueError("equity history limit must be positive")
-        return self._equity_history.get(account_id, [])[-limit:]
+        rows = self._equity_history.get(account_id, [])
+        if scope is not None:
+            rows = [row for row in rows if row.source in equity_sources(scope)]
+        return rows[-limit:]
 
     async def list_ai_usage(
         self, account_id: str, *, limit: int = 50

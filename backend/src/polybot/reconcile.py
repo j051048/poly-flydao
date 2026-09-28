@@ -112,8 +112,9 @@ class OrderReconciler:
         """Adopt a new ignore-before timestamp and replay the account history.
 
         Resetting the baseline is the operator's escape hatch for a wallet that
-        was used manually before the bot existed. It only ever *ignores* older
-        activity; anything after the new baseline is still strictly validated.
+        was used manually before the bot existed. Only external history may be
+        excluded; durable bot fills and overlapping activities remain subject
+        to complete cost-basis validation even before the new baseline.
         """
 
         if value is not None and (value.tzinfo is None or value.utcoffset() is None):
@@ -280,10 +281,11 @@ class OrderReconciler:
         # Only a 404 from get_order plus the complete trade repair above counts
         # as one absence confirmation. The store requires two confirmations
         # (or an explicit cancel_pending state) before terminal cancellation.
-        await self.store.confirm_orders_absent(
-            confirmed_absent_order_ids,
-            self.account_id,
-        )
+        if not await self.store.pending_trade_ids(self.account_id):
+            await self.store.confirm_orders_absent(
+                confirmed_absent_order_ids,
+                self.account_id,
+            )
         next_trade_after = str(max(0, latest_trade_epoch - 60))
 
         activity_count = 0
@@ -302,6 +304,16 @@ class OrderReconciler:
             if activity_count >= 4500:
                 raise RuntimeError("account activity reconciliation safety limit exceeded")
         next_activity_start = max(1, latest_activity_epoch - 60)
+
+        # Reclassify the complete durable activity history, including rows
+        # inserted by older releases that are outside the REST cursor now.
+        # Quarantine preserves the raw audit row while excluding only events
+        # proven disjoint from every durable bot condition.
+        await self.store.reconcile_activity_scope(
+            self.account_id,
+            baseline=self._baseline_utc,
+            quarantine_enabled=self.quarantine_enabled,
+        )
 
         raw_positions: list[tuple[Any, str, str, Decimal, Decimal, Decimal]] = []
         async for position in self.client.list_positions(size_threshold=0).iter_items():
@@ -456,7 +468,11 @@ class OrderReconciler:
             and update.matched_at.utcoffset() is not None
             and update.matched_at < self._baseline_utc
         ):
-            return
+            durable = await self.store.durable_order_ids(
+                set(update.candidate_order_ids), self.account_id
+            )
+            if not durable:
+                return
         await self.store.reconcile_trade(update, self.account_id)
         if self.fill_callback is None:
             return
@@ -554,13 +570,6 @@ class OrderReconciler:
         return taker_updates + maker_updates
 
     async def _account_trade_updates(self, value: Any) -> list[UserTradeUpdate]:
-        if self._baseline_utc is not None:
-            matched_at = getattr(value, "matched_at", None)
-            if matched_at is not None:
-                if matched_at.tzinfo is None or matched_at.utcoffset() is None:
-                    matched_at = matched_at.replace(tzinfo=UTC)
-                if matched_at < self._baseline_utc:
-                    return []
         updates = self._trade_updates(value)
         candidates = {
             order_id for update in updates for order_id in update.candidate_order_ids if order_id
@@ -581,6 +590,16 @@ class OrderReconciler:
                 )
         if account_updates:
             return account_updates
+        if self._baseline_utc is not None:
+            matched_at = getattr(value, "matched_at", None)
+            if matched_at is not None:
+                if matched_at.tzinfo is None or matched_at.utcoffset() is None:
+                    matched_at = matched_at.replace(tzinfo=UTC)
+                if matched_at < self._baseline_utc:
+                    # Even an old unattributable fill can corrupt bot cost
+                    # basis if it overlaps a token the bot has touched.
+                    if all([await self._is_foreign_token(u.token_id) for u in updates]):
+                        return []
         if self.quarantine_enabled and await self._quarantine_unmapped_trade(value, updates):
             return []
         raise IncompleteFillLedgerError(
@@ -603,8 +622,6 @@ class OrderReconciler:
         original fail-closed error.
         """
 
-        if token_id in self._quarantined_tokens:
-            return True
         return token_id not in await self._bot_tokens()
 
     async def _quarantine_unmapped_trade(

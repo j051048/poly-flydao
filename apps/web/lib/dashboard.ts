@@ -47,6 +47,9 @@ export interface RiskLimitView {
 
 export interface StatusView {
   configuredMode?: string;
+  desiredMode?: string;
+  modeApplied?: boolean;
+  riskApplied?: boolean;
   aiProvider?: string;
   forecastModel?: string;
   personalEnabled?: boolean;
@@ -74,6 +77,7 @@ export const RISK_LIMITS = [
   { key: "max_order_usd", label: "单笔订单上限", format: "usd" },
   { key: "max_trade_risk_pct", label: "单次交易风险", format: "percent" },
   { key: "max_event_exposure_pct", label: "单事件敞口", format: "percent" },
+  { key: "max_bucket_exposure_pct", label: "同类市场敞口", format: "percent" },
   { key: "max_gross_exposure_pct", label: "总敞口", format: "percent" },
   { key: "daily_loss_limit_pct", label: "单日亏损熔断", format: "percent" },
   { key: "max_drawdown_pct", label: "最大回撤熔断", format: "percent" },
@@ -90,8 +94,32 @@ export function asString(value: unknown): string | undefined {
 }
 
 export function asNumber(value: unknown): number | undefined {
+  if (typeof value !== "number" && typeof value !== "string") return undefined;
+  if (typeof value === "string" && value.trim() === "") return undefined;
   const parsed = typeof value === "number" ? value : Number(value);
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+export type TradingGateState = "unknown" | "stale" | "armed" | "locked";
+
+/** A browser timeout or expired local countdown cannot prove a worker stopped. */
+export function tradingGateState(
+  status: StatusView | null,
+  now: number,
+  readFailed = false,
+): TradingGateState {
+  if (!status || !now) return "unknown";
+  if (readFailed || now - status.fetchedAt > 30_000) return "stale";
+  const control = status.control;
+  if (control.armed === false && control.killSwitch === true && control.acceptNewIntents === false) {
+    return "locked";
+  }
+  if (
+    control.armed === true && control.killSwitch === false && control.acceptNewIntents === true &&
+    ["canary", "live"].includes(control.mode ?? "") &&
+    Date.parse(control.armedUntil ?? "") > now
+  ) return "armed";
+  return "unknown";
 }
 
 export function asBoolean(value: unknown): boolean | undefined {
@@ -185,6 +213,9 @@ export function parseStatus(payload: unknown): StatusView {
   const risk = asRecord(root.risk_limits ?? root.risk_policy);
   return {
     configuredMode: asString(personal.mode ?? root.mode),
+    desiredMode: asString(personal.desired_mode ?? root.desired_mode),
+    modeApplied: asBoolean(personal.mode_applied ?? asRecord(root.runtime_profile).mode_applied),
+    riskApplied: risk.applied === true && root.risk_policy_pending === false,
     aiProvider: asString(personalAi.provider ?? root.ai_provider),
     forecastModel: asString(personalAi.forecast_model ?? root.forecast_model),
     personalEnabled: asBoolean(personal.enabled ?? root.personal_mode),

@@ -20,6 +20,7 @@ from polybot.engine import LiveSafetyLatchError
 from polybot.models import utc_now
 from polybot.monitor import monitor_readiness
 from polybot.notify import NotificationMessage, build_notifier
+from polybot.personal_configuration import personal_configuration
 from polybot.personal_cycle import (
     _clear_personal_live_downgrade,
     _load_personal_paper_broker,
@@ -471,6 +472,7 @@ async def run_worker(
     install_signal_handlers: bool = True,
 ) -> None:
     settings = settings or get_settings()
+    configuration = personal_configuration(settings)
     READINESS.reset(
         role="worker",
         component=settings.component,
@@ -567,6 +569,10 @@ async def run_worker(
     stop = stop_event or asyncio.Event()
     lease_ok = asyncio.Event()
     runtime_control_ready = asyncio.Event()
+    runtime_control_lock = asyncio.Lock()
+    configuration_ok = asyncio.Event()
+    if personal_execution is None:
+        configuration_ok.set()
     lease_token: int | None = None
     paper_state_fencing_token: int | None = None
     loop = asyncio.get_running_loop()
@@ -589,6 +595,7 @@ async def run_worker(
         token = lease_token
         if (
             not lease_ok.is_set()
+            or not configuration_ok.is_set()
             or not runtime_control_ready.is_set()
             or not reconciliation_ok
             or stop.is_set()
@@ -682,7 +689,7 @@ async def run_worker(
     async def align_effective_mode() -> None:
         """Adopt the durable ``desired_mode`` at a cycle boundary.
 
-        The dashboard writes ``runtime_profiles.desired_mode``. A personal
+        The dashboard writes ``account_runtime_profiles.desired_mode``. A personal
         deployment has to act on that without a redeploy, otherwise the mode
         selector is a fake switch: the API reports success while nothing changes
         until someone edits Zeabur. Only the capability layer (may this
@@ -694,47 +701,79 @@ async def run_worker(
         if personal_execution is None or not settings.personal_mode:
             return
         try:
-            desired = await personal_execution.get_desired_mode()
+            profile, policy = await personal_execution.get_configuration()
+            configuration.checked_at = utc_now()
+            desired = profile.desired_mode if profile is not None else settings.mode
+            decision = resolve_effective_mode(
+                desired,
+                live_enabled=settings.personal_live_enabled,
+                signer_configured=runtime.live_broker is not None,
+            )
+            previous = settings.mode
+            target = decision.effective
+            # Validate first; do not mutate the live settings while cleanup awaits.
+            configuration.policy_values(settings, policy, mode=target)
+            next_policy_id = str(policy.id) if policy is not None else None
+            policy_changed = (
+                configuration.policy_loaded and configuration.policy_id != next_policy_id
+            )
+            async with runtime_control_lock:
+                if target is not previous or policy_changed:
+                    configuration_ok.clear()
+                    runtime_control_ready.clear()
+                    configuration.confirmed_mode = None
+                    refresh_worker_readiness()
+                    if previous in {TradingMode.CANARY, TradingMode.LIVE}:
+                        if target is not previous:
+                            # Retain the old real mode until every cleanup step
+                            # completes, so interruption still runs live shutdown.
+                            cleanup_mode = (
+                                target if target in {TradingMode.PAPER, TradingMode.SHADOW}
+                                else TradingMode.PAPER
+                            )
+                            if not (
+                                lease_ok.is_set() and lease_token is not None
+                                and await _clear_personal_live_downgrade(
+                                    settings=settings.model_copy(update={"mode": cleanup_mode}),
+                                    store=runtime.store, owner_id=owner_id,
+                                    fencing_token=lease_token, logger=logger,
+                                )
+                            ):
+                                raise RuntimeError("mode transition cleanup is not confirmed")
+                        elif not await cancel_all_or_alert("risk policy changed"):
+                            raise RuntimeError("risk policy cancellation is not confirmed")
+                # Publishing mode and limits is one await-free operation.
+                configuration.apply_policy(settings, policy, mode=target)
+                configuration.profile_version = profile.version if profile is not None else None
+                settings.mode = target
+                configuration.error = None
+                configuration_ok.set()
+                if target is not previous:
+                    READINESS.set_mode(target.value)
+                    paper_state_fencing_token = None
+            READINESS.clear_warning("configuration_unavailable")
         except Exception:
-            logger.warning("desired mode lookup failed; keeping the current mode")
+            configuration_ok.clear()
+            configuration.error = "configuration_unavailable"
+            READINESS.set_warning(
+                "configuration_unavailable", "模式或风控配置读取失败，已停止提交新订单。",
+            )
+            logger.warning(
+                "personal configuration unavailable; new execution blocked", exc_info=True,
+            )
+            if settings.mode in {TradingMode.CANARY, TradingMode.LIVE}:
+                await cancel_all_or_alert("personal configuration unavailable")
             return
-        if not isinstance(desired, TradingMode) or desired is settings.mode:
-            await bind_live_scope_if_needed()
-            return
-        decision = resolve_effective_mode(
-            desired,
-            live_enabled=settings.personal_live_enabled,
-            signer_configured=runtime.live_broker is not None,
-        )
-        previous = settings.mode
-        if decision.effective is previous:
-            # The request was clamped (for example canary without a live
-            # deployment). Surface the reason once and keep running safely.
-            if decision.note:
-                READINESS.set_warning("mode_downgraded", decision.note)
-            await bind_live_scope_if_needed()
-            return
-        settings.mode = decision.effective
-        READINESS.set_mode(decision.effective.value)
-        # The simulator must be reloaded under the new mode before it trades.
-        paper_state_fencing_token = None
-        if decision.effective in {TradingMode.CANARY, TradingMode.LIVE}:
-            if runtime.live_broker is None:
-                settings.mode = previous
-                READINESS.set_mode(previous.value)
-                logger.critical("refusing a live mode switch without a live broker")
-                return
         await bind_live_scope_if_needed()
         if decision.note:
             READINESS.set_warning("mode_downgraded", decision.note)
         else:
             READINESS.clear_warning("mode_downgraded")
-        logger.warning(
-            "effective trading mode changed %s -> %s (desired %s)",
-            previous.value,
-            decision.effective.value,
-            decision.desired.value,
-        )
+        if target is not previous:
+            logger.warning(
+                "effective trading mode changed %s -> %s (desired %s)",
+                previous.value, target.value, decision.desired.value,
+            )
 
     async def bind_live_scope_if_needed() -> None:
         """Bind (or re-bind) the durable live submission gate for the current mode.
@@ -912,7 +951,7 @@ async def run_worker(
         )
         READINESS.set_gate(
             GATE_RUNTIME_CONTROL,
-            not stopped and runtime_control_ready.is_set(),
+            not stopped and runtime_control_ready.is_set() and configuration_ok.is_set(),
             (
                 ReadinessBlocker(
                     code="runtime_control_blocked",
@@ -945,51 +984,58 @@ async def run_worker(
     async def watch_runtime_control() -> None:
         state = RuntimeControlWatchState()
         while not stop.is_set():
-            # Recomputed every tick: a dashboard switch out of a live mode has to
-            # arm the downgrade cleanup (cancel + disarm) without a restart.
-            downgrade_mode = bool(
-                settings.personal_mode
-                and settings.mode in {TradingMode.PAPER, TradingMode.SHADOW}
-            )
-            try:
-                token = lease_token
-                if downgrade_mode:
-                    cleanup_ready = bool(
-                        lease_ok.is_set()
-                        and token is not None
-                        and await _clear_personal_live_downgrade(
-                            settings=settings,
+            async with runtime_control_lock:
+                # Recomputed every tick: a dashboard switch out of a live mode has to
+                # arm the downgrade cleanup (cancel + disarm) without a restart.
+                downgrade_mode = bool(
+                    settings.personal_mode
+                    and settings.mode in {TradingMode.PAPER, TradingMode.SHADOW}
+                )
+                observed_mode = settings.mode
+                try:
+                    token = lease_token
+                    if downgrade_mode:
+                        cleanup_ready = bool(
+                            lease_ok.is_set()
+                            and token is not None
+                            and await _clear_personal_live_downgrade(
+                                settings=settings,
+                                store=runtime.store,
+                                owner_id=owner_id,
+                                fencing_token=token,
+                                logger=logger,
+                            )
+                        )
+                        if cleanup_ready and settings.mode is observed_mode:
+                            runtime_control_ready.set()
+                        else:
+                            runtime_control_ready.clear()
+                    else:
+                        await _enforce_runtime_control_once(
                             store=runtime.store,
-                            owner_id=owner_id,
-                            fencing_token=token,
+                            broker=runtime.broker,
+                            account_id=settings.account_id,
+                            mode=settings.mode,
+                            state=state,
                             logger=logger,
                         )
-                    )
-                    if cleanup_ready:
-                        runtime_control_ready.set()
-                    else:
-                        runtime_control_ready.clear()
-                else:
-                    await _enforce_runtime_control_once(
-                        store=runtime.store,
-                        broker=runtime.broker,
-                        account_id=settings.account_id,
-                        mode=settings.mode,
-                        state=state,
-                        logger=logger,
-                    )
-                    if state.cancellation_pending:
-                        runtime_control_ready.clear()
-                    else:
-                        runtime_control_ready.set()
-            except Exception:
-                runtime_control_ready.clear()
-                logger.exception("runtime-control watch failed")
-                if settings.mode in {TradingMode.CANARY, TradingMode.LIVE}:
-                    state.cancellation_pending = not await cancel_all_or_alert(
-                        "runtime-control watch failed"
-                    )
-            refresh_worker_readiness()
+                        if state.cancellation_pending or settings.mode is not observed_mode:
+                            runtime_control_ready.clear()
+                        else:
+                            runtime_control_ready.set()
+                except Exception:
+                    runtime_control_ready.clear()
+                    logger.exception("runtime-control watch failed")
+                    if settings.mode in {TradingMode.CANARY, TradingMode.LIVE}:
+                        state.cancellation_pending = not await cancel_all_or_alert(
+                            "runtime-control watch failed"
+                        )
+                refresh_worker_readiness()
+                if (
+                    configuration_ok.is_set()
+                    and runtime_control_ready.is_set() and lease_ok.is_set()
+                ):
+                    configuration.confirm(settings.mode)
             try:
                 await asyncio.wait_for(stop.wait(), timeout=2.0)
             except TimeoutError:
@@ -1068,6 +1114,8 @@ async def run_worker(
             try:
                 if not lease_ok.is_set():
                     logger.warning("execution skipped until worker lease is healthy")
+                elif not configuration_ok.is_set():
+                    logger.error("execution skipped until mode and risk policy are synchronized")
                 elif not runtime_control_ready.is_set():
                     logger.error(
                         "execution skipped until runtime control and cancellation state are healthy"
@@ -1144,6 +1192,7 @@ async def run_worker(
                         publish_cycle(
                             {
                                 "id": cycle_id,
+                                "mode": settings.mode.value,
                                 "state": "running",
                                 "started_at": started_at.isoformat(),
                                 "completed_at": None,
@@ -1171,6 +1220,7 @@ async def run_worker(
                             publish_cycle(
                                 {
                                     "id": cycle_id,
+                                    "mode": settings.mode.value,
                                     "state": "failed",
                                     "started_at": started_at.isoformat(),
                                     "completed_at": utc_now().isoformat(),
@@ -1182,6 +1232,7 @@ async def run_worker(
                         publish_cycle(
                             {
                                 "id": cycle_id,
+                                "mode": settings.mode.value,
                                 "state": "succeeded",
                                 "started_at": started_at.isoformat(),
                                 "completed_at": (report.completed_at or utc_now()).isoformat(),

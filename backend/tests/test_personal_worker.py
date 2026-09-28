@@ -7,10 +7,13 @@ from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
+
 import polybot.worker as worker_module
 from polybot.brokers.paper import PaperBroker
 from polybot.brokers.polymarket import PolymarketBroker
 from polybot.config import Settings, TradingMode
+from polybot.jobs import RuntimeProfile
 from polybot.models import EngineCycleResult, RuntimeControl, WorkerLease, utc_now
 from polybot.personal_execution import (
     PersonalPaperAccountState,
@@ -52,6 +55,12 @@ def _binding(*, paused: bool = False) -> PersonalRuntimeBinding:
 
 
 class _LiveRepository:
+    async def get_configuration(self):
+        return RuntimeProfile(
+            account_id=ACCOUNT, desired_mode=TradingMode.CANARY,
+            created_at=utc_now(), updated_at=utc_now(),
+        ), None
+
     def __init__(self, *, paused: bool = False, expired: bool = False) -> None:
         self.binding = _binding(paused=paused)
         self.events: list[str] = []
@@ -421,6 +430,9 @@ async def test_failed_personal_paper_cycle_reloads_last_committed_state(
             self.load_calls = 0
             self.save_calls = 0
 
+        async def get_configuration(self):
+            return None, None
+
         async def schema_ready(self) -> bool:
             return True
 
@@ -508,8 +520,9 @@ async def test_failed_personal_paper_cycle_reloads_last_committed_state(
     assert runtime.engine.observed_cash == [Decimal("1000"), Decimal("1000")]
 
 
+@pytest.mark.parametrize("transition", ["none", "cancelled", "unverified", "unavailable"])
 async def test_successful_personal_live_cycle_keeps_limit_orders_until_shutdown(
-    monkeypatch,
+    monkeypatch, transition,
 ) -> None:
     stop = asyncio.Event()
     trigger = asyncio.Event()
@@ -594,12 +607,18 @@ async def test_successful_personal_live_cycle_keeps_limit_orders_until_shutdown(
             return 0
 
     broker = Broker()
+    cycles = 0
 
     class Engine:
         execution_guard = None
 
         async def run_cycle(self) -> EngineCycleResult:
-            stop.set()
+            nonlocal cycles
+            cycles += 1
+            if transition == "none":
+                stop.set()
+            else:
+                trigger.set()
             return EngineCycleResult(
                 run_id="personal-live-success",
                 mode=TradingMode.CANARY,
@@ -621,6 +640,29 @@ async def test_successful_personal_live_cycle_keeps_limit_orders_until_shutdown(
     repository = _LiveRepository()
     repository.control = control
 
+    async def desired_configuration():
+        if cycles and transition == "unavailable":
+            stop.set()
+            raise RuntimeError("configuration database unavailable")
+        return RuntimeProfile(
+            account_id=ACCOUNT,
+            desired_mode=TradingMode.PAPER if cycles else TradingMode.CANARY,
+            version=2 if cycles else 1, created_at=utc_now(), updated_at=utc_now(),
+        ), None
+
+    async def interrupted_cleanup(**kwargs):
+        assert settings.mode is TradingMode.CANARY
+        assert kwargs["settings"].mode is TradingMode.PAPER
+        assert broker.guard is not None
+        assert not await broker.guard()
+        if transition == "cancelled":
+            raise asyncio.CancelledError
+        stop.set()
+        return False
+
+    repository.get_configuration = desired_configuration
+    monkeypatch.setattr(worker_module, "_clear_personal_live_downgrade", interrupted_cleanup)
+
     class RepositoryFactory:
         def __new__(cls, client, account_id):
             del client, account_id
@@ -638,14 +680,23 @@ async def test_successful_personal_live_cycle_keeps_limit_orders_until_shutdown(
         RepositoryFactory,
     )
 
-    await worker_module.run_worker(
+    work = worker_module.run_worker(
         settings=settings,
         stop_event=stop,
         cycle_trigger=trigger,
         install_signal_handlers=False,
     )
 
-    assert broker.cancel_reasons == ["worker shutdown"]
+    if transition == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await work
+    else:
+        await work
+    assert cycles == 1
+    assert settings.mode is TradingMode.CANARY
+    assert broker.cancel_reasons[-1] == "worker shutdown"
+    if transition == "none":
+        assert broker.cancel_reasons == ["worker shutdown"]
 
 
 async def test_desired_mode_is_clamped_and_reported_without_live_capability(
@@ -681,6 +732,12 @@ async def test_desired_mode_is_clamped_and_reported_without_live_capability(
     class Repository:
         async def schema_ready(self) -> bool:
             return True
+
+        async def get_configuration(self):
+            return RuntimeProfile(
+                account_id=ACCOUNT, desired_mode=TradingMode.CANARY,
+                created_at=utc_now(), updated_at=utc_now(),
+            ), None
 
         async def get_desired_mode(self) -> TradingMode:
             return TradingMode.CANARY

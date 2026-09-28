@@ -30,6 +30,33 @@ def quantize_down(value: Decimal, step: Decimal) -> Decimal:
     return (value // step) * step
 
 
+def maximum_buy_cost(
+    size: Decimal,
+    limit_price: Decimal,
+    *,
+    enabled: bool,
+    rate: Decimal,
+    exponent: Decimal,
+) -> Decimal:
+    """Bound the entire signed BUY, independent of the observed book's VWAP.
+
+    A BUY may execute anywhere below its limit. The fee curve peaks at 0.5,
+    so using the fee at a high limit alone can understate cheaper fills' fees.
+    Each matched fee is rounded half-up. Any positive rounded fee is at most
+    twice its unrounded amount (sub-half-unit fees round to zero). Reserving
+    twice the raw bound therefore also covers arbitrary partial-fill splits,
+    without assuming that fill sizes have the same precision as order sizes.
+    """
+
+    fee = estimated_fee_per_share(
+        min(limit_price, Decimal("0.5")),
+        enabled=enabled,
+        rate=rate,
+        exponent=exponent,
+    )
+    return size * (limit_price + Decimal("2") * fee)
+
+
 def matched_taker_fee_usd(
     *,
     size: Decimal,

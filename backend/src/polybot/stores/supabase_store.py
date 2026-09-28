@@ -1203,6 +1203,7 @@ class SupabaseStore(SupabaseReconcileMixin):
                 self.client.table("account_activities")
                 .select("activity_key,activity_type,condition_id,amount_pusd,occurred_at")
                 .eq("account_id", account_id)
+                .eq("ledger_scope", "bot")
                 .order("occurred_at")
                 .range(offset, offset + page_size - 1)
             )
@@ -1355,11 +1356,10 @@ class SupabaseStore(SupabaseReconcileMixin):
 
         self._require_account(account_id)
         tokens: set[str] = set()
-        for table, column in (("order_intents", "token_id"), ("orders", "outcome_token_id")):
-            response = await self._execute(
-                self.client.table(table)
-                .select(column)
-                .eq("account_id", account_id)
-                .limit(20_000)
-            )
-            tokens.update(str(row[column]) for row in response.data or [] if row.get(column))
+        for table, column in (
+            ("order_intents", "token_id"),
+            ("orders", "outcome_token_id"),
+            ("fills", "outcome_token_id"),
+        ):
+            tokens.update(await self._durable_account_values(account_id, table, column))
+        return tokens

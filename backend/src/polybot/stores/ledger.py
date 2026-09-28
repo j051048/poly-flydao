@@ -20,6 +20,31 @@ class FillLedgerSnapshot:
     redeemed_condition_ids: set[str]
 
 
+def activity_quarantine_reason(
+    row: Mapping[str, Any],
+    *,
+    bot_condition_ids: set[str],
+    baseline: datetime | None,
+    quarantine_enabled: bool,
+) -> str | None:
+    """Exclude only lifecycle events proven disjoint from the bot's footprint.
+
+    An old event touching a bot condition still needs a complete cost basis;
+    moving the baseline must never hide a real inventory discrepancy. Missing
+    condition IDs are likewise ambiguous and stay in the strict ledger.
+    """
+
+    condition_id = str(row.get("condition_id") or "").strip()
+    if not condition_id or condition_id in bot_condition_ids:
+        return None
+    occurred_at = _as_utc_datetime(row.get("occurred_at"), "occurred_at")
+    if baseline is not None and occurred_at < baseline:
+        return "prebaseline_external_activity"
+    if quarantine_enabled:
+        return "foreign_account_activity"
+    return None
+
+
 def realized_pnl_since(
     rows: Iterable[Mapping[str, Any]],
     *,

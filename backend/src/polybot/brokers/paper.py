@@ -84,10 +84,13 @@ class PaperBroker:
             broker.position_costs[token_id] = cost
             broker.token_market_ids[token_id] = market_id
             broker.token_outcomes[token_id] = outcome
-            condition_id = str(raw.get("condition_id") or market_id)
+            condition_id = str(raw.get("condition_id") or "")
             event_id = str(raw.get("event_id") or market_id)
             bucket = str(raw.get("bucket") or "other")
-            broker.token_condition_ids[token_id] = condition_id
+            # Older states incorrectly stored the Gamma id as a condition id.
+            # Preserve the separate market identity for an exact recovery lookup.
+            if condition_id and condition_id != market_id:
+                broker.token_condition_ids[token_id] = condition_id
             broker.token_events[token_id] = event_id
             broker.token_buckets[token_id] = bucket
             broker.event_exposure[event_id] = (
@@ -154,6 +157,7 @@ class PaperBroker:
             bucket_exposure_usd=dict(self.bucket_exposure),
             token_positions=dict(self.positions),
             token_condition_ids=dict(self.token_condition_ids),
+            token_market_ids=dict(self.token_market_ids),
             token_event_ids=dict(self.token_events),
             realized_pnl_today_usd=self.realized_pnl,
             peak_equity_usd=self.peak_equity,
@@ -226,10 +230,8 @@ class PaperBroker:
             )
             self.token_events[intent.token_id] = event_key
             self.token_buckets[intent.token_id] = intent.bucket
-            # TradeIntent carries the Gamma market id rather than condition id.
-            # Static/offline market sources accept either identifier, while the
-            # live broker supplies the actual condition id from Position.
-            self.token_condition_ids[intent.token_id] = intent.market_id
+            if intent.condition_id:
+                self.token_condition_ids[intent.token_id] = intent.condition_id
             self.token_market_ids[intent.token_id] = intent.market_id
             self.token_outcomes[intent.token_id] = intent.outcome.value
             self.event_exposure[event_key] = (

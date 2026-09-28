@@ -11,7 +11,9 @@ from typing import Any
 import attrs
 
 from polybot.config import Settings, TradingMode
+from polybot.fees import maximum_buy_cost
 from polybot.geoblock import GeoblockChecker
+from polybot.market import PolymarketMarketData, _get
 from polybot.models import (
     UNCLASSIFIED_EVENT_KEY,
     ExecutionResult,
@@ -268,7 +270,11 @@ class PolymarketBroker:
         eligibility = await self.geoblock.check()
         if not eligibility.allowed:
             return self._rejected(intent, eligibility.reason)
-        if intent.notional_usd > self.settings.max_order_usd:
+        try:
+            commitment = await self._submission_commitment(intent)
+        except Exception as exc:
+            return self._rejected(intent, f"cannot verify signed commitment: {exc}")
+        if commitment > self._order_cap_usd:
             return self._rejected(intent, "executor order cap exceeded")
         if intent.post_only:
             maker_error = self._validate_post_only_submission(intent, book)
@@ -287,7 +293,7 @@ class PolymarketBroker:
             asset_type=asset_type,
             token_id=token_id,
         )
-        required = (intent.notional_usd if intent.side is Side.BUY else intent.size) * Decimal(
+        required = (commitment if intent.side is Side.BUY else intent.size) * Decimal(
             "1000000"
         )
         if Decimal(balance.balance) < required:
@@ -442,21 +448,23 @@ class PolymarketBroker:
                 pass
             result = ExecutionResult(
                 intent_hash=intent.intent_hash,
-                status=(
-                    ExecutionStatus.CANCELLED
-                    if cancellation_verified
-                    else ExecutionStatus.ERROR
-                ),
+                # An empty open-order set also describes a fully filled order.
+                # Only order/trade reconciliation may release this durable gate.
+                status=ExecutionStatus.ERROR,
                 order_id=order_id,
                 message=(
-                    "runtime control changed during broadcast; accepted order was "
+                    "runtime control changed during broadcast; "
                     + (
-                        "cancelled and zero open orders verified"
+                        "zero open orders verified but fill outcome remains unknown; reconcile"
                         if cancellation_verified
-                        else "not safely cancellable; manual reconciliation required"
+                        else "cancellation unverified; reconciliation required"
                     )
                 ),
-                raw=response_trace,
+                raw={
+                    **response_trace,
+                    "reconciliation_required": True,
+                    "cancellation_open_orders_verified": cancellation_verified,
+                },
             )
         elif not response_ok:
             result = ExecutionResult(
@@ -554,22 +562,26 @@ class PolymarketBroker:
         if not eligibility.allowed:
             return self._batch_rejected(items, eligibility.reason)
 
-        for intent in intents:
-            if intent.notional_usd > self.settings.max_order_usd:
+        try:
+            commitments = [await self._submission_commitment(intent) for intent in intents]
+        except Exception as exc:
+            return self._batch_rejected(items, f"cannot verify signed commitment: {exc}")
+        for commitment in commitments:
+            if commitment > self._order_cap_usd:
                 return self._batch_rejected(items, "executor order cap exceeded")
         if (
-            sum((intent.notional_usd for intent in intents), Decimal("0"))
-            > self.settings.max_order_usd
+            sum(commitments, Decimal("0"))
+            > self._order_cap_usd
         ):
             return self._batch_rejected(items, "aggregate batch order cap exceeded")
         required_by_asset: dict[tuple[str, str | None], Decimal] = {}
-        for intent in intents:
+        for intent, commitment in zip(intents, commitments, strict=True):
             asset = (
                 ("COLLATERAL", None)
                 if intent.side is Side.BUY
                 else ("CONDITIONAL", intent.token_id)
             )
-            amount = intent.notional_usd if intent.side is Side.BUY else intent.size
+            amount = commitment if intent.side is Side.BUY else intent.size
             required_by_asset[asset] = required_by_asset.get(asset, Decimal("0")) + amount
         for (asset_type, token_id), amount in required_by_asset.items():
             balance = await asyncio.to_thread(
@@ -865,6 +877,46 @@ class PolymarketBroker:
             status=ExecutionStatus.REJECTED,
             message=message,
         )
+
+    async def _submission_commitment(self, intent: TradeIntent) -> Decimal:
+        """Recompute from signed price/size and current fees, never claimed VWAP.
+
+        A worsening fee schedule invalidates the previously approved exposure
+        budget; the next cycle must size and risk-check a fresh candidate.
+        """
+
+        if not (0 < intent.price < 1) or intent.size <= 0:
+            raise ValueError("invalid price or size")
+        if intent.side is not Side.BUY:
+            return max(intent.notional_usd, intent.size * intent.price)
+        raw_market = await asyncio.to_thread(self.client.get_market, id=intent.market_id)
+        if not isinstance(_get(raw_market, "trading", "fees_enabled"), bool):
+            raise ValueError("current fee schedule is unavailable")
+        market = PolymarketMarketData._map_market(raw_market)
+        if market.id != intent.market_id or intent.token_id not in {
+            market.yes_token_id, market.no_token_id,
+        }:
+            raise ValueError("current market identity mismatch")
+        if intent.condition_id and market.condition_id != intent.condition_id:
+            raise ValueError("current condition identity mismatch")
+        commitment = maximum_buy_cost(
+            intent.size,
+            intent.price,
+            enabled=market.fees_enabled and not (intent.post_only and market.fee_taker_only),
+            rate=market.fee_rate,
+            exponent=market.fee_exponent,
+        )
+        if intent.max_commitment_usd is not None and commitment > intent.max_commitment_usd:
+            raise ValueError("current fees exceed the risk-approved commitment")
+        return commitment
+
+    @property
+    def _order_cap_usd(self) -> Decimal:
+        # Mode can change after Settings initialization. Canary's absolute
+        # ceiling must also be enforced at the final signing boundary.
+        if self.settings.mode is TradingMode.CANARY:
+            return min(self.settings.max_order_usd, Decimal("5"))
+        return self.settings.max_order_usd
 
     @staticmethod
     def _response_trace(response: Any) -> dict[str, Any]:

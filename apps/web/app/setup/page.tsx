@@ -1,9 +1,10 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ApiError, apiRequest, readableApiError } from "../../lib/api";
+import { asRecord, asString, jobCompletionText, parseJob } from "../../lib/dashboard";
 import { parsePersonalRuntimeStatus } from "../../lib/personal-runtime";
 import {
   buildSetupSteps,
@@ -25,6 +26,9 @@ const STATE_LABELS: Record<SetupStep["state"], string> = {
 };
 
 export default function SetupPage() {
+  const pendingRequest = useRef<string | null>(null);
+  const requestKey = useRef<string | null>(null);
+  const mounted = useRef(true);
   const [snapshot, setSnapshot] = useState<Snapshot>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -71,7 +75,9 @@ export default function SetupPage() {
   }, []);
 
   useEffect(() => {
+    mounted.current = true;
     void refresh();
+    return () => { mounted.current = false; };
   }, [refresh]);
 
   const steps = useMemo(() => buildSetupSteps(snapshot), [snapshot]);
@@ -85,56 +91,47 @@ export default function SetupPage() {
   );
 
   async function runFirstPaperCycle() {
-    const cycleCountBefore = parsePersonalRuntimeStatus(
-      snapshot.personal,
-    ).cycleCount;
     setFirstRunBusy(true);
     setFirstRunMessage("正在创建首次 Paper 模拟任务…");
     setError(null);
     try {
-      const queued = await apiRequest<unknown>("/v1/personal/cycles/run", {
-        method: "POST",
-        body: { mode: "paper" },
-        idempotencyKey: `setup-paper:${crypto.randomUUID()}`,
-      });
-      const payload = queued.data as Record<string, unknown>;
-      const jobId = String(payload.id ?? payload.job_id ?? "");
-      if (!jobId) {
-        for (let attempt = 0; attempt < 45; attempt += 1) {
-          await new Promise((resolve) => window.setTimeout(resolve, 2000));
-          const response = await apiRequest<unknown>("/v1/personal/status");
-          const current = parsePersonalRuntimeStatus(response.data);
-          setSnapshot((previous) => ({ ...previous, personal: response.data }));
-          if (
-            current.cycleCount > cycleCountBefore &&
-            current.lastCycle?.state === "succeeded"
-          ) {
-            setFirstRunMessage("首次 Paper 周期完成，可以进入控制台查看结果。");
-            await refresh();
-            return;
-          }
-          if (
-            current.cycleCount > cycleCountBefore &&
-            current.lastCycle?.state === "failed"
-          ) {
-            throw new Error(current.lastCycle.message ?? "首次 Paper 周期失败。");
-          }
-        }
-        setFirstRunMessage("周期仍在运行，稍后点“重新检查”即可，不必停留在本页。");
-        return;
+      if (!pendingRequest.current) {
+        requestKey.current ??= `setup-paper:${crypto.randomUUID()}`;
+        const queued = await apiRequest<unknown>("/v1/personal/cycles/run", {
+          method: "POST", body: { mode: "paper" }, idempotencyKey: requestKey.current,
+        });
+        const payload = asRecord(queued.data);
+        pendingRequest.current = asString(payload.request_id ?? payload.id) ?? null;
+        if (!pendingRequest.current) throw new Error("周期已提交，但未返回请求编号；请在控制台核对，勿重复提交。");
+        requestKey.current = null;
       }
-
+      const requestId = pendingRequest.current;
+      setFirstRunMessage("首次 Paper 请求已受理，正在等待 Worker…");
       for (let attempt = 0; attempt < 60; attempt += 1) {
         await new Promise((resolve) => window.setTimeout(resolve, 2000));
-        const response = await apiRequest<unknown>(`/v1/jobs/${jobId}`);
-        const job = response.data as Record<string, unknown>;
+        if (!mounted.current) return;
+        let job;
+        try {
+          const response = await apiRequest<unknown>(`/v1/personal/cycles/${encodeURIComponent(requestId)}`);
+          if (!mounted.current) return;
+          job = parseJob(response.data);
+        } catch (caught) {
+          setFirstRunMessage("请求已受理，状态查询暂时失败；正在重试，勿重复提交。");
+          if (caught instanceof ApiError && caught.status === 404) {
+            setFirstRunMessage("服务重启或请求记录过期，无法确认结果。请在控制台核对最近周期，勿直接重复提交。");
+            return;
+          }
+          continue;
+        }
         if (job.status === "succeeded") {
-          setFirstRunMessage("首次 Paper 周期完成，可以进入控制台查看结果。");
+          pendingRequest.current = null;
+          setFirstRunMessage(`首次 Paper 周期完成。${jobCompletionText(job)}`);
           await refresh();
           return;
         }
-        if (job.status === "failed") {
-          throw new Error(`首次任务失败：${String(job.error_code || "unknown")}`);
+        if (["failed", "cancelled"].includes(job.status ?? "")) {
+          pendingRequest.current = null;
+          throw new Error(job.message ?? "首次 Paper 周期失败。");
         }
       }
       setFirstRunMessage("任务仍在运行，稍后可在控制台查看，不必停留在本页。");

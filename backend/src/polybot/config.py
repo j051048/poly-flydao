@@ -8,12 +8,12 @@ from decimal import Decimal
 from enum import StrEnum
 from functools import lru_cache
 from hashlib import sha256
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import SplitResult, urlsplit
 from uuid import UUID
 
 import idna
-from pydantic import AliasChoices, Field, SecretStr, model_validator
+from pydantic import AliasChoices, Field, PrivateAttr, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from polybot.ai_endpoint import UnsafeAIBaseURLError, normalize_ai_base_url
@@ -91,6 +91,9 @@ def _is_local_endpoint(endpoint: SplitResult) -> bool:
 
 class Settings(BaseSettings):
     """Runtime settings with capital-preserving defaults."""
+
+    # Process-local acknowledgement shared by the personal API and its worker.
+    _runtime_configuration: Any = PrivateAttr(default=None)
 
     model_config = SettingsConfigDict(
         env_file=".env",

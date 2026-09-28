@@ -3,27 +3,8 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { apiRequest, readableApiError } from "../../lib/api";
-
-interface CalibrationBin {
-  lower: number;
-  upper: number;
-  samples: number;
-  mean_forecast?: number | null;
-  observed_frequency?: number | null;
-}
-
-interface PerformanceSnapshot {
-  sample_size: number;
-  resolved_markets: number;
-  brier_score?: number | null;
-  log_loss?: number | null;
-  calibration: CalibrationBin[];
-  ai_usage_used: number;
-  ai_usage_limit: number;
-  strategy_validation: string;
-  research_only: boolean;
-  warning: string;
-}
+import { asNumber } from "../../lib/dashboard";
+import { parsePerformance, validationLabel, type PerformanceSnapshot } from "../../lib/performance";
 
 interface AIUsageRow {
   provider: string;
@@ -60,8 +41,8 @@ export default function PerformancePage() {
     setLoading(true);
     setError(null);
     try {
-      const result = await apiRequest<PerformanceSnapshot>("/v1/me/performance");
-      setSnapshot(result.data);
+      const result = await apiRequest<unknown>("/v1/me/performance");
+      setSnapshot(parsePerformance(result.data));
       const usageResult = await apiRequest<unknown>("/v1/me/ai-usage?limit=10");
       const rows = (usageResult.data as { items?: unknown[] })?.items ?? [];
       setUsageRows(
@@ -73,13 +54,13 @@ export default function PerformancePage() {
               provider: String(row.provider ?? ""),
               model: String(row.model ?? ""),
               marketId: row.market_id ? String(row.market_id) : undefined,
-              inputTokens: Number(row.input_tokens ?? 0),
-              outputTokens: Number(row.output_tokens ?? 0),
-              totalTokens: Number(row.total_tokens ?? 0),
+              inputTokens: asNumber(row.input_tokens) ?? 0,
+              outputTokens: asNumber(row.output_tokens) ?? 0,
+              totalTokens: asNumber(row.total_tokens) ?? 0,
               latencyMs: row.latency_ms === null || row.latency_ms === undefined
                 ? null
-                : Number(row.latency_ms),
-              costUsd: cost === null || cost === undefined ? null : Number(cost),
+                : asNumber(row.latency_ms) ?? null,
+              costUsd: cost === null || cost === undefined ? null : asNumber(cost) ?? null,
               createdAt: String(row.created_at ?? ""),
             };
           })
@@ -159,8 +140,8 @@ export default function PerformancePage() {
             <p className="eyebrow">RELIABILITY</p>
             <h2>概率校准分桶</h2>
           </div>
-          <span className={`pill ${snapshot?.research_only ? "degraded" : "online"}`}>
-            {snapshot?.research_only ? "RESEARCH ONLY" : "VALIDATED"}
+          <span className={`pill ${validationLabel(snapshot) === "VALIDATED" ? "online" : "degraded"}`}>
+            {validationLabel(snapshot)}
           </span>
         </div>
         {!snapshot?.calibration?.some((item) => item.samples > 0) ? (

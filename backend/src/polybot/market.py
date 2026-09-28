@@ -15,6 +15,8 @@ class MarketData(Protocol):
 
     async def get_market_by_condition(self, condition_id: str) -> MarketSpec: ...
 
+    async def get_market_by_id(self, market_id: str) -> MarketSpec: ...
+
     async def get_order_book(self, market_id: str, token_id: str) -> OrderBookSnapshot: ...
 
 
@@ -104,6 +106,13 @@ class PolymarketMarketData:
 
     async def get_market_by_condition(self, condition_id: str) -> MarketSpec:
         return await asyncio.to_thread(self._get_market_by_condition_sync, condition_id)
+
+    async def get_market_by_id(self, market_id: str) -> MarketSpec:
+        raw = await asyncio.to_thread(self.client.get_market, id=market_id)
+        market = self._map_market(raw)
+        if market.id != market_id:
+            raise ValueError("market lookup returned a different market")
+        return market
 
     def _list_markets_sync(self, limit: int) -> list[MarketSpec]:
         paginator = self.client.list_markets(
@@ -267,6 +276,12 @@ class StaticMarketData:
             if market.condition_id == condition_id or market.id == condition_id:
                 return market
         raise LookupError(f"no static market found for condition {condition_id}")
+
+    async def get_market_by_id(self, market_id: str) -> MarketSpec:
+        for market in self.markets:
+            if market.id == market_id:
+                return market
+        raise LookupError(f"no static market found for id {market_id}")
 
     async def get_order_book(self, market_id: str, token_id: str) -> OrderBookSnapshot:
         return self.books[token_id].model_copy(update={"market_id": market_id})

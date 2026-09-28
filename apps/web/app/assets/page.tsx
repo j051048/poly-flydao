@@ -108,7 +108,7 @@ function parsePortfolio(payload: unknown): Portfolio {
         ),
         currentPrice: numberValue(item.current_price, item.mark_price),
         valueUsd: numberValue(item.value_pusd, item.value_usd, item.current_value),
-        pnlUsd: numberValue(item.pnl_usd, item.unrealized_pnl_usd),
+        pnlUsd: numberValue(item.unrealized_pnl_pusd, item.pnl_usd, item.unrealized_pnl_usd),
       };
     }),
   };

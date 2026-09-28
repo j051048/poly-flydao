@@ -25,7 +25,7 @@ POLYBOT_SIGNED_PAYLOAD_KEY
 
 ## Supabase
 
-按文件名顺序应用 `supabase/migrations/` 中全部迁移，包括个人模式的最新 `0016` 迁移。个人模式仍依赖 Supabase 保存订单、运行控制、风险快照、租约、Paper 状态与审计记录；缺少数据库或最新迁移时会 fail closed。
+按文件名顺序应用 `supabase/migrations/` 中全部迁移，目前要求 schema 版本 **22**。已有 0020 的部署需依次应用 `0021_reconcile_activity_scope.sql` 和 `0022_order_intent_commitment.sql`。前者将外部账户活动与机器人账本分开并保留审计原文；后者保存订单允许的最大支出与真实市场标识。缺少最新迁移时 Worker 会停止执行。
 
 Supabase Auth 只保留一个 owner。先在 Supabase Dashboard 创建/确认该用户，复制 User UUID 到 `POLYBOT_ACCOUNT_ID`，再关闭公开注册。后端会拒绝其他有效用户访问个人运行时。
 
@@ -39,6 +39,10 @@ Zeabur 平台 Health Check Path 推荐 `/livez`，避免 Supabase 短暂故障�
 
 从 Canary/Live 降级到 Paper/Shadow 时先保留原钱包私钥。新 Worker 会在有效租约下原子停机、撤销交易所挂单并验证零开放单；清场失败时 `/worker-health` 保持 503，模拟周期不会在不确定状态下启动。
 
+模式和风控档位保存在数据库，由 Worker 在周期边界读取。界面分别显示已请求和实际生效的配置；撤单和版本确认完成前仍显示待生效。风控金额和比例取数据库请求与启动时部署上限的较小值，最小净优势取较大值；Canary 另有不可放宽的 5 美元上限。修改风控需要在设置页完成 TOTP 验证（AAL2）。配置读取失败时阻止新下单。
+
+个人部署同时运行市场结算扫描器，为绩效与预测校准补充结果。手动周期使用 `POST /v1/personal/cycles/run` 返回的 request ID 查询 `GET /v1/personal/cycles/{request_id}`；该跟踪记录属于当前进程，重启后需重新读取实际运行和订单状态。权益历史按 `scope=paper|shadow|real` 分开，真实范围合并 Canary 与 Live。
+
 ## 本地验证
 
 ```powershell
@@ -48,6 +52,15 @@ uv run --frozen --extra dev ruff check .
 uv run --frozen --extra dev python -m pytest
 uv run --frozen polybot pair-replay --input examples/pair_replay_sample.json
 ```
+
+无需连接 Supabase 的迁移验证（在仓库根目录执行）：
+
+```powershell
+npm install --prefix .audit-migrations --ignore-scripts @electric-sql/pglite@0.5.8
+node backend/scripts/verify_migrations.mjs .audit-migrations
+```
+
+脚本执行完整迁移链，并检查升级、金额约束和 RLS；使用最小 Supabase Auth 夹具，不能替代部署环境中的迁移与 PostgREST 验证。
 
 ## 高级：旧多租户部署
 

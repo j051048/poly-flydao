@@ -42,6 +42,7 @@ from polybot.jobs import (
     SupabaseJobRepository,
 )
 from polybot.models import utc_now
+from polybot.personal_configuration import personal_configuration
 from polybot.personal_execution import (
     PersonalRuntimeBinding,
 )
@@ -79,6 +80,7 @@ def _personal_status(
     last_cycle: dict[str, object] | None = None,
     reconciliation: PersonalReconciliationStatus | None = None,
     desired_mode: TradingMode | None = None,
+    desired_profile_version: int | None = None,
 ) -> PersonalStatusResponse:
     provider = settings.ai_provider.lower()
     ai_configured = provider != "mock" and settings.effective_ai_api_key is not None
@@ -89,8 +91,19 @@ def _personal_status(
         live_enabled=settings.personal_live_enabled,
         signer_configured=wallet_configured,
     )
+    configuration = personal_configuration(settings)
+    mode_applied = bool(
+        configuration.confirmed_mode is settings.mode
+        and settings.mode is decision.effective
+        and configuration.error is None
+        and (
+            desired_profile_version is None
+            or configuration.profile_version == desired_profile_version
+        )
+        and is_worker_ready()
+    )
     worker_ready = settings.personal_mode and is_worker_ready()
-    real_money = decision.effective in {TradingMode.CANARY, TradingMode.LIVE}
+    real_money = settings.mode in {TradingMode.CANARY, TradingMode.LIVE}
     readiness_fresh = bool(
         binding is not None
         and binding.readiness_checked_at is not None
@@ -110,9 +123,14 @@ def _personal_status(
     return PersonalStatusResponse(
         enabled=settings.personal_mode,
         live_supported=settings.personal_live_enabled,
-        mode=decision.effective,
+        mode=settings.mode,
         desired_mode=decision.desired,
-        mode_note=decision.note,
+        mode_note=decision.note or (None if mode_applied else "等待 Worker 确认配置与撤单状态"),
+        mode_applied=mode_applied,
+        configuration_error=configuration.error,
+        configuration_checked_at=configuration.checked_at,
+        risk_policy_id=configuration.policy_id,
+        risk_policy_version=configuration.policy_version,
         auto_run_enabled=settings.personal_mode
         and settings.personal_auto_run,
         worker_execution_model=settings.worker_execution_model,
@@ -174,6 +192,7 @@ def _record_personal_cycle(
     application: FastAPI,
     snapshot: dict[str, object],
 ) -> None:
+    application.state.personal_cycle_requests.observe_cycle(snapshot)
     previous = application.state.personal_last_cycle
     state = snapshot.get("state")
     if state in {"succeeded", "failed"} and (
@@ -286,6 +305,16 @@ async def current_principal(
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             "this personal deployment is bound to a different Supabase account",
+        )
+    limiter = request.app.state.rate_limiter
+    # Stop requests have their own quota and cannot be starved by normal actions.
+    bucket = "stop" if request.url.path == "/v1/control/disarm" else "account"
+    allowed, retry_after = limiter.allow(f"{bucket}:{principal.account_id}", limit=240)
+    if not allowed:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "account request rate limit exceeded",
+            headers={"Retry-After": str(retry_after)},
         )
     return principal
 

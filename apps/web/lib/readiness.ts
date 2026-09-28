@@ -67,22 +67,27 @@ export function buildSetupSteps(input: ReadinessInput): SetupStep[] {
   const status = record(input.status);
   const personal = parsePersonalRuntimeStatus(input.personal ?? status);
   const latestJob = record(status.latest_job);
-  const jobState = text(personal.lastCycle?.state, latestJob.status);
-  const jobMode = text(latestJob.mode);
+  // State and mode must come from the same run. Older personal snapshots
+  // without a mode cannot borrow one from an unrelated tenant job.
+  const jobState = personal.lastCycle
+    ? personal.lastCycle.state
+    : text(latestJob.status);
+  const jobMode = personal.lastCycle
+    ? personal.lastCycle.mode
+    : text(latestJob.mode);
   const realMoneyMode = ["canary", "live"].includes(personal.mode);
   const environmentReady =
     personal.enabled &&
     personal.ai.configured &&
     (!realMoneyMode || personal.wallet.configured);
   const mode = personal.mode;
-  const validation = VALIDATION_COPY[mode];
+  const validation = mode === "unknown" ? { title: "等待确认实际模式", description: "先恢复状态读取，再运行验证周期。", action: "查看运行状态" } : VALIDATION_COPY[mode];
   // A cycle only validates the mode it actually ran in; a stale paper cycle
   // must not mark a canary deployment as verified.
-  const validated =
-    jobState === "succeeded" && (jobMode === undefined || jobMode === mode);
+  const matchesActualMode = mode !== "unknown" && jobMode === mode;
+  const validated = matchesActualMode && jobState === "succeeded";
   const validating =
-    ["queued", "claimed", "running"].includes(jobState ?? "") &&
-    (jobMode === undefined || jobMode === mode);
+    matchesActualMode && ["queued", "claimed", "running"].includes(jobState ?? "");
   const modeNote =
     personal.desiredMode !== mode && personal.modeNote
       ? `${personal.modeNote}（当前实际运行：${personalModeLabel(mode)}）`

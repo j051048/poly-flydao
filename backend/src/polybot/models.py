@@ -165,6 +165,7 @@ class PortfolioState(BaseModel):
     # discovery is keyed by condition. Keep the relationship explicit so a
     # risk exit does not depend on the market appearing in a top-N scan.
     token_condition_ids: dict[str, str] = Field(default_factory=dict)
+    token_market_ids: dict[str, str] = Field(default_factory=dict)
     token_event_ids: dict[str, str] = Field(default_factory=dict)
     realized_pnl_today_usd: Decimal = Decimal("0")
     peak_equity_usd: Decimal | None = None
@@ -208,6 +209,7 @@ class PortfolioState(BaseModel):
 
 class TradeCandidate(BaseModel):
     market_id: str
+    condition_id: str | None = None
     event_id: str | None
     bucket: str
     token_id: str
@@ -218,6 +220,8 @@ class TradeCandidate(BaseModel):
     limit_price: Decimal = Field(gt=0, lt=1)
     size: Decimal = Field(gt=0)
     notional_usd: Decimal = Field(gt=0)
+    # Expected fill cost remains separate from the maximum signed commitment.
+    max_commitment_usd: Decimal | None = Field(default=None, gt=0)
     fee_estimate_usd: Decimal = Field(ge=0)
     edge_after_costs: Decimal
     strategy: str = "ai_value_v1"
@@ -233,6 +237,7 @@ class TradeIntent(BaseModel):
     run_id: str
     mode: TradingMode
     market_id: str
+    condition_id: str | None = None
     event_id: str | None
     bucket: str
     token_id: str
@@ -241,6 +246,7 @@ class TradeIntent(BaseModel):
     price: Decimal
     size: Decimal
     notional_usd: Decimal
+    max_commitment_usd: Decimal | None = Field(default=None, gt=0)
     edge_after_costs: Decimal
     forecast_id: str | None
     decision_key: str | None = None
@@ -280,6 +286,7 @@ class TradeIntent(BaseModel):
             run_id=run_id,
             mode=mode,
             market_id=candidate.market_id,
+            condition_id=candidate.condition_id,
             event_id=candidate.event_id,
             bucket=candidate.bucket,
             token_id=candidate.token_id,
@@ -288,6 +295,7 @@ class TradeIntent(BaseModel):
             price=candidate.limit_price,
             size=candidate.size,
             notional_usd=candidate.notional_usd,
+            max_commitment_usd=candidate.max_commitment_usd,
             edge_after_costs=candidate.edge_after_costs,
             forecast_id=candidate.forecast_id,
             decision_key=candidate.decision_key,
@@ -693,6 +701,7 @@ class AccountPositionUpdate(BaseModel):
 class QuarantineKind(StrEnum):
     TRADE = "trade"
     POSITION = "position"
+    ACTIVITY = "activity"
 
 
 class QuarantineRecord(BaseModel):

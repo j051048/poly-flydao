@@ -4,6 +4,8 @@ import type { Session } from "@supabase/supabase-js";
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 
+import MfaPanel from "../../components/MfaPanel";
+import RiskPolicyStatus from "../../components/RiskPolicyStatus";
 import { ApiError, apiRequest, readableApiError } from "../../lib/api";
 import {
   EnvironmentGroup,
@@ -79,16 +81,18 @@ export default function SettingsPage() {
   const [accountCopied, setAccountCopied] = useState(false);
   const [profileVersion, setProfileVersion] = useState<number | null>(null);
   const [presetBusy, setPresetBusy] = useState<RiskPreset | null>(null);
+  const [mfaVerified, setMfaVerified] = useState(false);
+  const [riskStatus, setRiskStatus] = useState<unknown>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
-    setNotice(null);
 
     const supabase = getSupabaseBrowserClient();
-    const [healthResult, statusResult, sessionResult] = await Promise.allSettled([
+    const [healthResult, statusResult, sessionResult, riskResult] = await Promise.allSettled([
       apiRequest<unknown>("/health", { authenticated: false }),
       fetchPersonalStatus(),
       supabase ? supabase.auth.getSession() : Promise.resolve(null),
+      apiRequest<unknown>("/v1/status"),
     ]);
     const meResult = await Promise.allSettled([apiRequest<unknown>("/v1/me")]);
 
@@ -122,11 +126,14 @@ export default function SettingsPage() {
       setProfileVersion(null);
     }
 
+    setRiskStatus(riskResult.status === "fulfilled" ? riskResult.value.data : null);
     setLoading(false);
   }, []);
 
   useEffect(() => {
     void refresh();
+    const timer = globalThis.setInterval(() => void refresh(), 10_000);
+    return () => globalThis.clearInterval(timer);
   }, [refresh]);
 
   const realMoneyMode =
@@ -139,10 +146,8 @@ export default function SettingsPage() {
       hasLiveBalance &&
       status.wallet.allowancesReady,
   );
-  const walletStepReady = realMoneyMode
-    ? liveWalletReady
-    : true;
-  const walletStatusText = !realMoneyMode
+  const walletStepReady = realMoneyMode ? liveWalletReady : Boolean(status && status.mode !== "unknown");
+  const walletStatusText = !status || status.mode === "unknown" ? "实际模式未确认" : !realMoneyMode
     ? status?.wallet.configured
       ? `已预填（${maskWalletAddress(status.wallet.address)}）`
       : "Paper / Shadow 暂不需要"
@@ -168,6 +173,7 @@ export default function SettingsPage() {
   ].filter(Boolean).length;
 
   async function applyRiskPreset(preset: RiskPreset) {
+    if (!mfaVerified) { setNotice({ tone: "info", text: "请先在双因素验证区域完成本次会话验证。" }); return; }
     if (!profileVersion) {
       setNotice({ tone: "error", text: "无法读取当前风控版本，请先确认 API 可用。" });
       return;
@@ -184,8 +190,8 @@ export default function SettingsPage() {
       });
       await refresh();
       setNotice({
-        tone: "success",
-        text: `已应用「${RISK_PRESETS.find((item) => item.value === preset)?.name ?? preset}」风控档位。`,
+        tone: "info",
+        text: `已保存「${RISK_PRESETS.find((item) => item.value === preset)?.name ?? preset}」风控档位，等待 Worker 确认；实际值以表格为准。`,
       });
     } catch (error) {
       setNotice({ tone: "error", text: readableApiError(error) });
@@ -399,8 +405,10 @@ export default function SettingsPage() {
           </div>
           <p className="field-help">
             一键应用完整风控参数组合。切换到实盘模式前，请先用保守档位完成 Paper / Shadow
-            验证；应用档位会立即更新后端风控策略。
+            验证；保存后由 Worker 在周期边界确认生效。
           </p>
+          <RiskPolicyStatus payload={riskStatus} />
+          {!mfaVerified && <p className="notice info">操作前请先 <a href="#mfa">完成双因素验证</a>。</p>}
           <div className="risk-preset-grid">
             {RISK_PRESETS.map((preset) => (
               <article
@@ -415,10 +423,10 @@ export default function SettingsPage() {
                 <button
                   className="secondary-button"
                   type="button"
-                  disabled={presetBusy !== null || !profileVersion}
+                  disabled={presetBusy !== null || !profileVersion || !mfaVerified}
                   onClick={() => void applyRiskPreset(preset.value)}
                 >
-                  {presetBusy === preset.value ? "应用中…" : "应用此档位"}
+                  {presetBusy === preset.value ? "保存中…" : "保存此档位"}
                 </button>
               </article>
             ))}
@@ -457,6 +465,7 @@ export default function SettingsPage() {
             ))}
           </div>
 
+          {status && <p className="notice info">目标模式：{personalModeLabel(status.desiredMode)} · {status.modeApplied === true ? "Worker 已确认" : "等待 Worker 确认"}{status.modeNote ? `。${status.modeNote}` : ""}</p>}
           <dl className="detail-list personal-runtime-details">
             <div>
               <dt>自动周期</dt>
@@ -516,6 +525,8 @@ export default function SettingsPage() {
             并通过后端启动检查后，Canary / Live 才会开放。自动执行不能保证盈利。
           </p>
         </section>
+
+        <MfaPanel onAssuranceChange={setMfaVerified} />
 
         <section className="panel" id="session">
           <div className="section-heading">

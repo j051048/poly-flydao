@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Area,
   AreaChart,
@@ -13,10 +13,7 @@ import {
 
 import { apiRequest, readableApiError } from "../lib/api";
 
-interface ChartPoint {
-  label: string;
-  equityUsd: number;
-}
+import { EQUITY_SCOPE_LABELS, equityScopeForMode, parseEquityHistory, type ChartPoint, type EquityScope } from "../lib/equity";
 
 function formatUsd(value: number): string {
   return new Intl.NumberFormat("en-US", {
@@ -26,50 +23,39 @@ function formatUsd(value: number): string {
   }).format(value);
 }
 
-function toChartPoint(row: unknown): ChartPoint | null {
-  if (typeof row !== "object" || row === null) return null;
-  const record = row as Record<string, unknown>;
-  const equityUsd = Number(record.equity_usd ?? record.equityUsd);
-  const recordedAt = String(record.recorded_at ?? record.recordedAt ?? "");
-  if (!Number.isFinite(equityUsd) || !recordedAt) return null;
-  const when = new Date(recordedAt);
-  if (Number.isNaN(when.getTime())) return null;
-  return {
-    label: when.toLocaleString("zh-CN", {
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-    }),
-    equityUsd,
-  };
-}
-
-export default function EquityChart() {
+export default function EquityChart({ mode }: { mode?: string }) {
   const [points, setPoints] = useState<ChartPoint[]>([]);
+  const [selection, setSelection] = useState<EquityScope | "current">("current");
+  const [confirmedScope, setConfirmedScope] = useState<EquityScope | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const generation = useRef(0);
+  const scope = selection === "current" ? equityScopeForMode(mode) : selection;
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (generationId: number) => {
     try {
-      const result = await apiRequest<unknown>("/v1/me/equity-history?limit=200");
-      const rows = (result.data as { items?: unknown[] })?.items ?? [];
-      const mapped = rows
-        .map(toChartPoint)
-        .filter((point): point is ChartPoint => point !== null);
-      setPoints(mapped);
+      const result = await apiRequest<unknown>(`/v1/me/equity-history?limit=200${scope ? `&scope=${scope}` : ""}`);
+      if (generationId !== generation.current) return;
+      const parsed = parseEquityHistory(result.data, scope);
+      setPoints(parsed.points);
+      setConfirmedScope(parsed.scope);
       setError(null);
     } catch (caught) {
+      if (generationId !== generation.current) return;
       setError(readableApiError(caught));
     } finally {
-      setLoading(false);
+      if (generationId === generation.current) setLoading(false);
     }
-  }, []);
+  }, [scope]);
 
   useEffect(() => {
-    void refresh();
-    const timer = globalThis.setInterval(() => void refresh(), 20_000);
-    return () => globalThis.clearInterval(timer);
+    const generationId = ++generation.current;
+    setPoints([]);
+    setConfirmedScope(null);
+    setLoading(true);
+    void refresh(generationId);
+    const timer = globalThis.setInterval(() => void refresh(generationId), 20_000);
+    return () => { generation.current += 1; globalThis.clearInterval(timer); };
   }, [refresh]);
 
   const latest = points.at(-1)?.equityUsd;
@@ -79,12 +65,22 @@ export default function EquityChart() {
       <div className="section-heading">
         <div>
           <p className="eyebrow">EQUITY CURVE</p>
-          <h2>账户净值曲线</h2>
+          <h2>{confirmedScope ? EQUITY_SCOPE_LABELS[confirmedScope] : "账户净值曲线"}</h2>
         </div>
-        {latest !== undefined && (
+        {!loading && !error && latest !== undefined && (
           <span className="pill online">{formatUsd(latest)}</span>
         )}
       </div>
+      <label className="form-field"><span className="field-label">权益账本</span>
+        <select aria-label="权益账本" value={selection} onChange={(event) => {
+          setPoints([]); setConfirmedScope(null); setLoading(true);
+          setSelection(event.target.value as EquityScope | "current");
+        }}>
+          <option value="current">当前实际模式</option>
+          {Object.entries(EQUITY_SCOPE_LABELS).map(([value, label]) => <option value={value} key={value}>{label}</option>)}
+        </select>
+      </label>
+      <p className="muted">模拟与实盘分别记账；权益变动也包含入金、出金，并不等同交易收益。</p>
       {loading ? (
         <div className="empty-state">
           <span>…</span>

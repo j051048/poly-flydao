@@ -58,7 +58,8 @@ def _reconciler(
 async def test_baseline_ignores_old_trade_in_account_updates() -> None:
     baseline = datetime.now(UTC) - timedelta(minutes=5)
     reconciler = _reconciler(baseline)
-    old_trade = SimpleNamespace(matched_at=datetime.now(UTC) - timedelta(days=30))
+    old_trade = _recent_trade()
+    old_trade.matched_at = datetime.now(UTC) - timedelta(days=30)
 
     assert await reconciler._account_trade_updates(old_trade) == []
 
@@ -92,6 +93,25 @@ async def test_trade_touching_bot_inventory_still_fails_closed() -> None:
     with pytest.raises(IncompleteFillLedgerError):
         await reconciler._account_trade_updates(_recent_trade())
     assert store.quarantined == []
+
+
+async def test_prebaseline_trade_touching_bot_inventory_still_fails_closed() -> None:
+    store = TraceStore(bot_tokens={"token"})
+    reconciler = _reconciler(datetime.now(UTC), store=store)
+    trade = _recent_trade()
+    trade.matched_at = datetime.now(UTC) - timedelta(days=30)
+
+    with pytest.raises(IncompleteFillLedgerError):
+        await reconciler._account_trade_updates(trade)
+
+
+async def test_cached_quarantine_does_not_override_new_bot_footprint() -> None:
+    store = TraceStore(bot_tokens={"token"})
+    reconciler = _reconciler(None, store=store)
+    reconciler._quarantined_tokens.add("token")
+
+    with pytest.raises(IncompleteFillLedgerError):
+        await reconciler._account_trade_updates(_recent_trade())
 
 
 def _recent_trade() -> SimpleNamespace:

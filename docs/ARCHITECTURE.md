@@ -26,8 +26,8 @@ flowchart TB
 - AI：`POLYBOT_AI_API_KEY`、`POLYBOT_AI_BASE_URL`、`POLYBOT_AI_MODEL`；
 - 钱包：`POLYMARKET_PRIVATE_KEY`，可选 `POLYMARKET_DEPOSIT_WALLET`；
 - owner：`POLYBOT_ACCOUNT_ID`；
-- 模式：`POLYBOT_MODE`、`POLYBOT_PERSONAL_LIVE_ENABLED`；
-- 风险与资金：`POLYBOT_BANKROLL_USD`、单笔/敞口/亏损/回撤参数。
+- 模式：`POLYBOT_MODE` 是启动值，`account_runtime_profiles.desired_mode` 是后续请求；`POLYBOT_PERSONAL_LIVE_ENABLED` 保留部署级真实资金开关；
+- 风险与资金：`POLYBOT_BANKROLL_USD` 与启动时的单笔/敞口/亏损/回撤参数构成部署边界，数据库风险策略只能收紧；最小净优势采用更高的门槛。
 
 前端只读取脱敏状态，例如 provider、model、钱包地址和“已配置/未配置”；不会返回 Key 或私钥。删除/轮换秘密必须在 Zeabur 完成并重新部署。
 
@@ -37,9 +37,11 @@ Supabase Auth 仍是控制台门锁，但产品不再开放多租户注册。Fas
 
 因为秘密从不经过前端，个人模式不要求 TOTP/AAL2 来“保存 Key”，也不需要 RSA-OAEP credential envelope、credential fingerprint 或独立 worker keyring。这是易用性改造，不代表取消登录或公开 API 的 owner 校验。
 
+风险策略修改及重置对账基准仍要求 AAL2，设置页提供 TOTP 绑定和验证。模式和风险策略均由 Worker 确认后才报告生效。切离真实资金模式前先停用、撤单和核实未决订单，再发布新模式；中断切换时仍按旧实盘模式执行关机清理。
+
 ## 自动周期与持久状态
 
-FastAPI lifespan 启动内嵌 Worker。自动周期按配置间隔执行，前端也可以触发一次即时周期。Supabase 保存：
+FastAPI lifespan 启动内嵌交易 Worker 和市场结算扫描器。自动周期按配置间隔执行，前端也可以触发一次即时周期。个人请求使用专用跟踪端点，进程退出、超时或模式改变会结束相关跟踪，不会冒充租户任务 ID。Supabase 保存：
 
 - 运行控制、模式与配置绑定版本；
 - Worker 租约和 fencing token；

@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -21,6 +21,16 @@ from polybot.config import TradingMode
 from polybot.credentials import AIProvider
 from polybot.models import AIUsageRecord, EquityHistoryPoint, RuntimeControl, utc_now
 from polybot.performance import PerformanceSnapshot, performance_snapshot_from_rows
+
+EquityScope = Literal["paper", "shadow", "real"]
+
+
+def equity_sources(scope: EquityScope) -> tuple[str, ...]:
+    return {
+        "paper": ("paper_cycle",),
+        "shadow": ("shadow_cycle",),
+        "real": ("canary_cycle", "live_cycle"),
+    }[scope]
 
 
 class JobConflictError(RuntimeError):
@@ -292,7 +302,7 @@ class JobRepository(Protocol):
     async def set_ai_budget_limit(self, *, account_id: str, request_limit: int) -> int: ...
 
     async def list_equity_history(
-        self, account_id: str, *, limit: int = 200
+        self, account_id: str, *, limit: int = 200, scope: EquityScope | None = None
     ) -> list[EquityHistoryPoint]: ...
 
     async def list_ai_usage(

@@ -3,16 +3,20 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any
 
+import pytest
+
 from polybot.ai.evidence import NoopEvidenceCollector
 from polybot.ai.graph import ForecastGraph
 from polybot.ai.mock import StaticForecastProvider
 from polybot.brokers.paper import PaperBroker
+from polybot.config import TradingMode
 from polybot.engine import TradingEngine
 from polybot.market import PolymarketMarketData
 from polybot.models import (
     ExecutionStatus,
     MarketSpec,
     OrderBookSnapshot,
+    TradeIntent,
 )
 from polybot.risk import RiskEngine
 from polybot.stores.memory import MemoryStore
@@ -88,6 +92,7 @@ class _HeldMarketSource:
         self.listed = listed or []
         self.lookup_error = lookup_error
         self.lookups: list[str] = []
+        self.id_lookups: list[str] = []
         self.book_requests: list[tuple[str, str]] = []
 
     async def list_markets(self, limit: int) -> list[MarketSpec]:
@@ -97,6 +102,14 @@ class _HeldMarketSource:
         self.lookups.append(condition_id)
         if self.lookup_error is not None:
             raise self.lookup_error
+        if condition_id != self.held_market.condition_id:
+            raise LookupError("no market for condition")
+        return self.held_market
+
+    async def get_market_by_id(self, market_id: str) -> MarketSpec:
+        self.id_lookups.append(market_id)
+        if market_id != self.held_market.id:
+            raise LookupError("no market for id")
         return self.held_market
 
     async def get_order_book(self, market_id: str, token_id: str) -> OrderBookSnapshot:
@@ -243,3 +256,34 @@ async def test_hard_risk_stops_cycle_when_cancel_cannot_be_verified(
     assert report.markets_scanned == 0
     assert not report.executions
     assert report.skipped["hard_risk_cancel_unverified"] == 1
+
+
+@pytest.mark.parametrize("legacy_state", [False, True])
+async def test_actual_paper_buy_recovers_held_market_after_restart_and_scan_omission(
+    settings, market, forecast, yes_book, no_book, legacy_state,
+) -> None:
+    broker = PaperBroker(Decimal("1000"))
+    candidate = ValueStrategy(settings).choose(
+        market, forecast, yes_book, no_book, await broker.portfolio_state(),
+    )
+    assert candidate is not None
+    intent = TradeIntent.from_candidate(
+        candidate, account_id=settings.account_id, run_id="buy", mode=TradingMode.PAPER,
+    )
+    bought = await broker.submit(intent, yes_book)
+    assert bought.status is ExecutionStatus.PAPER_FILLED
+    assert (await broker.portfolio_state()).token_condition_ids[market.yes_token_id] == "c1"
+    saved = broker.export_state()
+    if legacy_state:
+        saved["positions"][0]["condition_id"] = "m1"
+    restored = PaperBroker.from_state(Decimal("1000"), saved)
+    restored.realized_pnl = Decimal("-30")
+    source = _HeldMarketSource(
+        market, {market.yes_token_id: yes_book, market.no_token_id: no_book}, listed=[],
+    )
+    report = await _engine(settings, forecast, source, restored).run_cycle()
+    assert source.lookups == ([] if legacy_state else ["c1"])
+    assert source.id_lookups == (["m1"] if legacy_state else [])
+    assert report.executions[0].status is ExecutionStatus.PAPER_FILLED
+    assert restored.positions[market.yes_token_id] == 0
+    assert "held_market_lookup_error:LookupError" not in report.skipped

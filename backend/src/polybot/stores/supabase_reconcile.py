@@ -10,6 +10,7 @@ place so the audit-trail invariants stay reviewable together.
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
@@ -18,12 +19,13 @@ from polybot.models import (
     AccountActivityUpdate,
     AccountPositionUpdate,
     OrderReconcileTarget,
+    QuarantineKind,
     QuarantineRecord,
     UserOrderUpdate,
     UserTradeUpdate,
     utc_now,
 )
-from polybot.stores.ledger import IncompleteFillLedgerError
+from polybot.stores.ledger import IncompleteFillLedgerError, activity_quarantine_reason
 from polybot.stores.payloads import (
     _ORDER_SETTLEMENT_RANK,
     _aggregate_order_fill_payload,
@@ -34,6 +36,111 @@ from polybot.stores.supabase_rows import _quarantine_from_row, _text_or_none
 
 
 class SupabaseReconcileMixin:
+    async def _durable_account_values(
+        self, account_id: str, table: str, column: str
+    ) -> set[str]:
+        """Read the entire footprint; silently truncated history is unsafe."""
+
+        self._require_account(account_id)
+        values: set[str] = set()
+        for offset in range(0, 100_000, 1000):
+            response = await self._execute(
+                self.client.table(table)
+                .select(column)
+                .eq("account_id", account_id)
+                .order("id")
+                .range(offset, offset + 999)
+            )
+            rows = response.data or []
+            values.update(str(row[column]) for row in rows if row.get(column))
+            if len(rows) < 1000:
+                return values
+        raise IncompleteFillLedgerError("bot footprint exceeded the bounded replay limit")
+
+    async def _durable_condition_ids(self, account_id: str) -> set[str]:
+        # Every order references a durable intent, so intents plus fills also
+        # cover cancelled/rejected orders and historical inventory.
+        market_ids: set[str] = set()
+        for table in ("order_intents", "fills"):
+            market_ids.update(await self._durable_account_values(account_id, table, "market_id"))
+        conditions: set[str] = set()
+        ordered = sorted(market_ids)
+        for start in range(0, len(ordered), 100):
+            chunk = ordered[start : start + 100]
+            response = await self._execute(
+                self.client.table("markets").select("id,condition_id").in_("id", chunk)
+            )
+            mapped = {
+                str(row["id"]): str(row["condition_id"])
+                for row in response.data or []
+                if row.get("condition_id")
+            }
+            if set(chunk).difference(mapped):
+                raise IncompleteFillLedgerError("bot footprint has no durable market definition")
+            conditions.update(mapped.values())
+        return conditions
+
+    async def reconcile_activity_scope(
+        self,
+        account_id: str,
+        *,
+        baseline: datetime | None,
+        quarantine_enabled: bool,
+    ) -> None:
+        """Migrate external legacy rows out of cost basis, preserving audit data."""
+
+        self._require_account(account_id)
+        conditions = await self._durable_condition_ids(account_id)
+        self._fill_ledger_cache = None
+        for offset in range(0, 100_000, 1000):
+            response = await self._execute(
+                self.client.table("account_activities")
+                .select("*")
+                .eq("account_id", account_id)
+                .order("id")
+                .range(offset, offset + 999)
+            )
+            rows = response.data or []
+            for row in rows:
+                reason = activity_quarantine_reason(
+                    row,
+                    bot_condition_ids=conditions,
+                    baseline=baseline,
+                    quarantine_enabled=quarantine_enabled,
+                )
+                scope = "quarantine" if reason else "bot"
+                if row.get("ledger_scope", "bot") == scope and row.get("scope_reason") == reason:
+                    continue
+                if reason:
+                    # Audit first: a failure leaves the row in the strict
+                    # ledger, never silently excluded without evidence.
+                    await self.record_quarantine(
+                        account_id,
+                        QuarantineRecord(
+                            kind=QuarantineKind.ACTIVITY,
+                            external_key=str(row["activity_key"]),
+                            reason=reason,
+                            condition_id=str(row["condition_id"]),
+                            notional_usd=row["amount_pusd"],
+                            occurred_at=row["occurred_at"],
+                            detail={
+                                "activity_type": row["activity_type"],
+                                "transaction_hash": row.get("transaction_hash"),
+                                "raw_payload": row.get("raw_payload") or {},
+                                "baseline_at": baseline.isoformat() if baseline else None,
+                            },
+                        ),
+                    )
+                await self._execute(
+                    self.client.table("account_activities")
+                    .update({"ledger_scope": scope, "scope_reason": reason})
+                    .eq("account_id", account_id)
+                    .eq("activity_key", row["activity_key"])
+                )
+            if len(rows) < 1000:
+                return
+        raise IncompleteFillLedgerError("account activity ledger exceeded the bounded replay limit")
+
     async def record_quarantine(self, account_id: str, record: QuarantineRecord) -> None:
         self._require_account(account_id)
         payload = {
@@ -180,7 +287,10 @@ class SupabaseReconcileMixin:
             return
         response = await self._execute(
             self.client.table("orders")
-            .select("id,clob_order_id,status,open_snapshot_miss_count,open_snapshot_missing_since")
+            .select(
+                "id,clob_order_id,status,open_snapshot_miss_count,"
+                "open_snapshot_missing_since,response_payload"
+            )
             .eq("account_id", account_id)
             .in_("clob_order_id", sorted(clob_order_ids))
             .in_(
@@ -190,6 +300,11 @@ class SupabaseReconcileMixin:
         )
         for row in response.data or []:
             order_id = str(row["clob_order_id"])
+            if (row.get("response_payload") or {}).get("reconciliation_required"):
+                # A control change while POST was in flight can race a fill.
+                # Absence, even repeated, cannot establish its economic result.
+                # Keep unresolved until an explicit order/trade update arrives.
+                continue
             previous_status = str(row["status"])
             misses = int(row.get("open_snapshot_miss_count") or 0) + 1
             terminal = previous_status == "cancel_pending" or misses >= 2

@@ -19,6 +19,7 @@ describe("parsePersonalRuntimeStatus", () => {
       last_cycle: {
         id: "cycle-2",
         state: "succeeded",
+        mode: "shadow",
         started_at: "2026-08-04T01:00:00Z",
         completed_at: "2026-08-04T01:00:12Z",
         message: "cycle completed",
@@ -53,6 +54,9 @@ describe("parsePersonalRuntimeStatus", () => {
       liveSupported: false,
       mode: "shadow",
       desiredMode: "shadow",
+      modeApplied: undefined,
+      configurationError: undefined,
+      configurationCheckedAt: undefined,
       modeNote: undefined,
       autoRunEnabled: true,
       workerReady: true,
@@ -67,6 +71,7 @@ describe("parsePersonalRuntimeStatus", () => {
       lastCycle: {
         id: "cycle-2",
         state: "succeeded",
+        mode: "shadow",
         startedAt: "2026-08-04T01:00:00Z",
         completedAt: "2026-08-04T01:00:12Z",
         message: "cycle completed",
@@ -114,12 +119,25 @@ describe("parsePersonalRuntimeStatus", () => {
     expect(parsed.wallet.configured).toBe(false);
   });
 
+  it("does not infer the mode of an older cycle from the current deployment", () => {
+    const parsed = parsePersonalRuntimeStatus({
+      mode: "canary",
+      last_cycle: { id: "old-cycle", state: "succeeded" },
+    });
+
+    expect(parsed.lastCycle?.state).toBe("succeeded");
+    expect(parsed.lastCycle?.mode).toBeUndefined();
+  });
+
   it("uses conservative defaults for an unavailable personal endpoint", () => {
     expect(parsePersonalRuntimeStatus({})).toEqual({
       enabled: false,
       liveSupported: false,
-      mode: "paper",
-      desiredMode: "paper",
+      mode: "unknown",
+      desiredMode: "unknown",
+      modeApplied: undefined,
+      configurationError: undefined,
+      configurationCheckedAt: undefined,
       modeNote: undefined,
       autoRunEnabled: false,
       workerReady: false,

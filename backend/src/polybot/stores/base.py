@@ -197,6 +197,14 @@ class StateStore(Protocol):
 
     async def durable_token_ids(self, account_id: str) -> set[str]: ...
 
+    async def reconcile_activity_scope(
+        self,
+        account_id: str,
+        *,
+        baseline: datetime | None,
+        quarantine_enabled: bool,
+    ) -> None: ...
+
     async def record_quarantine(self, account_id: str, record: QuarantineRecord) -> None: ...
 
     async def list_quarantine(

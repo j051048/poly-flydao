@@ -4,7 +4,7 @@ import dynamic from "next/dynamic";
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { API_BASE_URL, apiRequest, readableApiError } from "../lib/api";
+import { API_BASE_URL, ApiError, apiRequest, readableApiError } from "../lib/api";
 import ControlDetailsPanel from "../components/ControlDetailsPanel";
 import LatestJobPanel from "../components/LatestJobPanel";
 import NotificationsPanel from "../components/NotificationsPanel";
@@ -29,6 +29,7 @@ import {
   parseJob,
   parseNotifications,
   parseStatus,
+  tradingGateState,
 } from "../lib/dashboard";
 
 const EquityChart = dynamic(() => import("../components/EquityChart"), {
@@ -40,6 +41,7 @@ export default function HomePage() {
   const [status, setStatus] = useState<StatusView | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
   const [busy, setBusy] = useState<BusyAction>(null);
+  const [stopping, setStopping] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [lastJob, setLastJob] = useState<JobView | null>(null);
   const [riskConfirmed, setRiskConfirmed] = useState(false);
@@ -48,9 +50,15 @@ export default function HomePage() {
   const [notifications, setNotifications] = useState<NotificationView[]>([]);
   const { toasts, push: pushToast, dismiss: dismissToast } = useToasts();
   const cycleIdempotencyKey = useRef<string | null>(null);
-  const personalCycleBaseline = useRef<number | null>(null);
+  const personalRequestId = useRef<string | null>(null);
+  const cycleEpoch = useRef(0);
+  const actionEpoch = useRef(0);
+  const refreshSequence = useRef(0);
+  const stopInFlight = useRef<Promise<void> | null>(null);
 
   const refresh = useCallback(async () => {
+    const sequence = ++refreshSequence.current;
+    const epoch = actionEpoch.current;
     setRefreshing(true);
     const healthPromise = apiRequest<unknown>("/health", { authenticated: false })
       .then(({ data }) => {
@@ -66,19 +74,15 @@ export default function HomePage() {
 
     const statusPromise = apiRequest<unknown>("/v1/status")
       .then(({ data }) => {
+        if (sequence !== refreshSequence.current || epoch !== actionEpoch.current) return;
         const parsed = parseStatus(data);
         setStatus(parsed);
-        if (
-          parsed.latestJob &&
-          (personalCycleBaseline.current === null ||
-            (parsed.personalCycleCount ?? 0) > personalCycleBaseline.current ||
-            parsed.latestJob.status?.toLowerCase() === "running")
-        ) {
-          setLastJob(parsed.latestJob);
-        }
+        if (parsed.latestJob && personalRequestId.current === null) setLastJob(parsed.latestJob);
         setStatusError(null);
       })
-      .catch((error) => setStatusError(readableApiError(error)));
+      .catch((error) => {
+        if (sequence === refreshSequence.current && epoch === actionEpoch.current) setStatusError(readableApiError(error));
+      });
 
     const notificationsPromise = apiRequest<unknown>("/v1/me/notifications?limit=8")
       .then(({ data }) => setNotifications(parseNotifications(data)))
@@ -100,98 +104,41 @@ export default function HomePage() {
   }, [refresh]);
 
   useEffect(() => {
-    const jobId = lastJob?.id;
-    const jobStatus = lastJob?.status?.toLowerCase();
-    if (
-      !jobId ||
-      (jobStatus &&
-        !["queued", "pending", "claimed", "running", "retry"].includes(jobStatus))
-    ) {
-      return;
-    }
-
+    const requestId = personalRequestId.current;
+    if (!requestId || !["queued", "pending", "running", "claimed"].includes(lastJob?.status ?? "")) return;
     let cancelled = false;
-    const announce = (next: Notice) => {
-      setNotice(next);
-      pushToast(next.text, next.tone);
-    };
+    let polling = false;
     const poll = async () => {
+      if (polling) return;
+      polling = true;
       try {
-        if (status?.personalEnabled) {
-          const result = await apiRequest<unknown>("/v1/status");
-          if (cancelled) return;
-          const updatedStatus = parseStatus(result.data);
-          setStatus(updatedStatus);
-          const completedRequestedCycle =
-            personalCycleBaseline.current === null ||
-            (updatedStatus.personalCycleCount ?? 0) >
-              personalCycleBaseline.current;
-          if (
-            updatedStatus.latestJob &&
-            (completedRequestedCycle ||
-              updatedStatus.latestJob.status?.toLowerCase() === "running")
-          ) {
-            setLastJob(updatedStatus.latestJob);
-            const updatedState = updatedStatus.latestJob.status?.toLowerCase();
-            if (
-              completedRequestedCycle &&
-              updatedState &&
-              ["completed", "succeeded"].includes(updatedState)
-            ) {
-              personalCycleBaseline.current = null;
-              announce({
-                tone: "success",
-                text: jobCompletionText(updatedStatus.latestJob),
-              });
-            } else if (
-              completedRequestedCycle &&
-              updatedState &&
-              ["failed", "cancelled", "dead"].includes(updatedState)
-            ) {
-              personalCycleBaseline.current = null;
-              announce({
-                tone: "error",
-                text:
-                  updatedStatus.latestJob.message ??
-                  `周期以 ${updatedState} 状态结束。`,
-              });
-            }
+        const result = await apiRequest<unknown>(`/v1/personal/cycles/${encodeURIComponent(requestId)}`);
+        if (cancelled || personalRequestId.current !== requestId) return;
+        const job = parseJob(result.data);
+        setLastJob(job);
+        if (["succeeded", "failed", "cancelled"].includes(job.status ?? "")) {
+          personalRequestId.current = null;
+          if (cycleEpoch.current === actionEpoch.current) {
+            const completed: Notice = job.status === "succeeded"
+              ? { tone: "success", text: jobCompletionText(job) }
+              : { tone: "error", text: job.message ?? "周期执行失败。" };
+            setNotice(completed);
+            pushToast(completed.text, completed.tone);
           }
-          return;
+          await refresh();
         }
-        const result = await apiRequest<unknown>(
-          `/v1/jobs/${encodeURIComponent(jobId)}`,
-        );
-        if (cancelled) return;
-        const updated = parseJob(result.data);
-        setLastJob(updated);
-        if (
-          updated.status &&
-          ["completed", "succeeded"].includes(updated.status)
-        ) {
-          announce({ tone: "success", text: jobCompletionText(updated) });
-        } else if (
-          updated.status &&
-          ["failed", "cancelled", "dead"].includes(updated.status)
-        ) {
-          announce({
-            tone: "error",
-            text: updated.message ?? `任务以 ${updated.status} 状态结束。`,
-          });
+      } catch (error) {
+        // A queued request keeps its identity through transient polling failures.
+        if (!cancelled && error instanceof ApiError && error.status === 404) {
+          personalRequestId.current = null;
+          setLastJob((previous) => previous ? { ...previous, status: "unknown", message: "服务重启或请求记录过期，无法确认此请求结果；请核对最近周期。" } : previous);
         }
-      } catch {
-        // The regular 20-second status refresh remains available. A transient
-        // polling failure must not convert a successfully queued job to failed.
-      }
+      } finally { polling = false; }
     };
-
     const timer = globalThis.setInterval(() => void poll(), 3_000);
     void poll();
-    return () => {
-      cancelled = true;
-      globalThis.clearInterval(timer);
-    };
-  }, [lastJob?.id, lastJob?.status, status?.personalEnabled, pushToast]);
+    return () => { cancelled = true; globalThis.clearInterval(timer); };
+  }, [lastJob?.id, lastJob?.status, pushToast, refresh]);
 
   async function markNotificationRead(notificationId: number) {
     try {
@@ -210,7 +157,7 @@ export default function HomePage() {
     }
   }
 
-  const configuredMode = status?.configuredMode ?? health.mode;
+  const configuredMode = status?.configuredMode;
   const armableMode: LiveMode | null =
     configuredMode === "canary" || configuredMode === "live"
       ? configuredMode
@@ -218,15 +165,13 @@ export default function HomePage() {
   const control = status?.control;
   const personalRealMode = Boolean(status?.personalEnabled && armableMode);
   const personalPaused = status?.personalPaused === true;
-  const armedUntilMs = control?.armedUntil
-    ? new Date(control.armedUntil).getTime()
-    : 0;
-  const effectivelyArmed = Boolean(
-    control?.armed &&
-      !control.killSwitch &&
-      armedUntilMs > now &&
-      (control.mode === "canary" || control.mode === "live"),
-  );
+  const gate = tradingGateState(status, now, Boolean(statusError));
+  const stateFresh = gate !== "unknown" && gate !== "stale";
+  const effectivelyArmed = gate === "armed";
+  const gateLabel = { armed: "授权有效", locked: "已确认锁定", stale: "状态已过期", unknown: "状态未确认" }[gate];
+  const gateText = gate === "armed" ? countdownLabel(control?.armedUntil, now)
+    : gate === "locked" ? "已禁止新的实盘意图"
+    : "无法确认后台是否仍在交易";
   const apiUsesSafeTransport = useMemo(
     () =>
       API_BASE_URL.startsWith("https://") ||
@@ -252,15 +197,15 @@ export default function HomePage() {
     ) {
       return;
     }
+    if (!status || !stateFresh || status.modeApplied === false || stopping) return;
+    const epoch = actionEpoch.current;
+    cycleEpoch.current = epoch;
     setBusy("cycle");
     const startingNotice: Notice = { tone: "info", text: "正在启动个人运行周期…" };
     setNotice(startingNotice);
     pushToast(startingNotice.text, startingNotice.tone);
     try {
       cycleIdempotencyKey.current ??= crypto.randomUUID();
-      if (status?.personalEnabled) {
-        personalCycleBaseline.current = status.personalCycleCount ?? 0;
-      }
       const result = await apiRequest<unknown>("/v1/personal/cycles/run", {
         method: "POST",
         body: { mode: configuredMode ?? "paper" },
@@ -274,7 +219,9 @@ export default function HomePage() {
         status: asString(parsedResponse.state) ?? "queued",
         mode: asString(parsedResponse.mode) ?? configuredMode,
       };
+      personalRequestId.current = job.id ?? null;
       setLastJob(job);
+      if (epoch !== actionEpoch.current) return;
       const settledNotice: Notice = {
         tone: "success",
         text:
@@ -286,6 +233,7 @@ export default function HomePage() {
       pushToast(settledNotice.text, settledNotice.tone);
       await refresh();
     } catch (error) {
+      if (epoch !== actionEpoch.current) return;
       const failure: Notice = { tone: "error", text: readableApiError(error) };
       setNotice(failure);
       pushToast(failure.text, failure.tone);
@@ -295,7 +243,7 @@ export default function HomePage() {
   }
 
   async function armTrading() {
-    if (!armableMode || !riskConfirmed || !control?.version) return;
+    if (!armableMode || !riskConfirmed || !control?.version || !stateFresh || stopping || status?.modeApplied === false) return;
     if (
       !window.confirm(
         `确认恢复${modeLabel(armableMode)}自动运行？它会持续运行，直到你点击“立即停用”或关闭 Zeabur 实盘开关。`,
@@ -303,6 +251,7 @@ export default function HomePage() {
     ) {
       return;
     }
+    const epoch = actionEpoch.current;
     setBusy("arm");
     try {
       await apiRequest("/v1/control/arm", {
@@ -314,6 +263,13 @@ export default function HomePage() {
         },
         idempotencyKey: crypto.randomUUID(),
       });
+      if (epoch !== actionEpoch.current) {
+        // A stop was requested while resume was outstanding. Reassert it after
+        // the late response, even if the first stop has already completed.
+        await stopInFlight.current;
+        await disarmTrading();
+        return;
+      }
       setRiskConfirmed(false);
       const armed: Notice = {
         tone: "success",
@@ -323,6 +279,7 @@ export default function HomePage() {
       pushToast(armed.text, armed.tone);
       await refresh();
     } catch (error) {
+      if (epoch !== actionEpoch.current) { await stopInFlight.current; await disarmTrading(); return; }
       const failure: Notice = { tone: "error", text: readableApiError(error) };
       setNotice(failure);
       pushToast(failure.text, failure.tone);
@@ -331,40 +288,38 @@ export default function HomePage() {
     }
   }
 
-  async function disarmTrading() {
-    setBusy("disarm");
-    const startingNotice: Notice = {
-      tone: "info",
-      text: "正在打开 kill switch 并请求撤销挂单…",
-    };
-    setNotice(startingNotice);
-    pushToast(startingNotice.text, startingNotice.tone);
-    try {
-      const result = await apiRequest<unknown>("/v1/control/disarm", {
-        method: "POST",
-        body: {},
-        idempotencyKey: crypto.randomUUID(),
-      });
-      setRiskConfirmed(false);
-      const response = asRecord(result.data);
-      const pending =
-        result.status === 202 || response.cancellation_pending === true;
-      const stopped: Notice = {
-        tone: pending ? "info" : "success",
-        text: pending
-          ? "交易已停用，撤单任务正在 worker 中处理。请等待开放订单归零。"
-          : "交易已停用，kill switch 已打开且挂单已撤销。",
-      };
-      setNotice(stopped);
-      pushToast(stopped.text, stopped.tone);
-      await refresh();
-    } catch (error) {
-      const failure: Notice = { tone: "error", text: readableApiError(error) };
-      setNotice(failure);
-      pushToast(failure.text, failure.tone);
-    } finally {
-      setBusy(null);
-    }
+  async function disarmTrading(): Promise<void> {
+    if (stopInFlight.current) return stopInFlight.current;
+    actionEpoch.current += 1;
+    setStopping(true);
+    setRiskConfirmed(false);
+    const operation = (async () => {
+      const pending: Notice = { tone: "info", text: "停用请求正在发送；等待后端确认禁止新单及撤单结果…" };
+      setNotice(pending);
+      pushToast(pending.text, pending.tone);
+      try {
+        const result = await apiRequest<unknown>("/v1/control/disarm", {
+          method: "POST", body: {}, idempotencyKey: crypto.randomUUID(),
+        });
+        const response = asRecord(result.data);
+        const cancellationPending = result.status === 202 || response.cancellation_pending !== false || response.cancellation_verified !== true;
+        const stopped: Notice = {
+          tone: cancellationPending ? "info" : "success",
+          text: cancellationPending
+            ? "停用已受理，正在核实撤单与未决成交；请等待后台确认。停用不会平掉已有仓位。"
+            : "后端已确认停用及撤单。已有持仓仍需单独管理。",
+        };
+        setNotice(stopped);
+        pushToast(stopped.text, stopped.tone);
+        await refresh();
+      } catch (error) {
+        const failure: Notice = { tone: "error", text: `无法确认停用成功：${readableApiError(error)}` };
+        setNotice(failure);
+        pushToast(failure.text, failure.tone);
+      }
+    })();
+    stopInFlight.current = operation;
+    try { await operation; } finally { stopInFlight.current = null; setStopping(false); }
   }
 
   const healthText = {
@@ -436,26 +391,25 @@ export default function HomePage() {
               {(configuredMode ?? "UNKNOWN").toUpperCase()}
             </span>
           </div>
-          <div className="primary-value">{modeLabel(configuredMode)}</div>
+          <div className="primary-value">{modeLabel(configuredMode)}{!stateFresh ? "（待确认）" : ""}</div>
+          {status?.desiredMode && (status.modeApplied === false || status.desiredMode !== configuredMode) && <p className="muted">目标：{modeLabel(status.desiredMode)} · 等待 Worker 确认</p>}
           <p className="muted">
             {status?.aiProvider ?? "AI 未配置"} / {status?.forecastModel ?? "模型未返回"}
           </p>
         </article>
 
-        <article className={`summary-card ${effectivelyArmed ? "danger" : "safe"}`}>
+        <article className={`summary-card ${gate === "armed" ? "danger" : gate === "locked" ? "safe" : ""}`}>
           <div className="card-heading">
             <span>交易闸门</span>
-            <span className={`pill ${effectivelyArmed ? "armed" : "disarmed"}`}>
-              {effectivelyArmed ? "已解锁" : "已锁定"}
+            <span className={`pill ${gate === "armed" ? "armed" : gate === "locked" ? "disarmed" : "degraded"}`}>
+              {gateLabel}
             </span>
           </div>
           <div className="primary-value">
-            {effectivelyArmed
-              ? countdownLabel(control?.armedUntil, now)
-              : "不会提交新实盘订单"}
+            {gateText}
           </div>
           <p className="muted">
-            Kill switch：{control?.killSwitch === false ? "关闭" : "开启或未知"}
+            最后确认 {formatDate(status?.fetchedAt)}；Kill switch：{stateFresh ? control?.killSwitch === true ? "开启" : "关闭" : "未知"}
           </p>
         </article>
 
@@ -478,7 +432,7 @@ export default function HomePage() {
         </article>
       </section>
 
-      <EquityChart />
+      <EquityChart mode={configuredMode} />
 
       <NotificationsPanel
         notifications={notifications}
@@ -505,13 +459,15 @@ export default function HomePage() {
                 className="primary-button"
                 type="button"
                 onClick={() => void runCycle()}
-                disabled={busy !== null || !apiUsesSafeTransport}
+                disabled={busy !== null || stopping || !stateFresh || status?.modeApplied === false || !apiUsesSafeTransport}
               >
                 {busy === "cycle" ? "创建中…" : "运行周期"}
               </button>
             </article>
 
-            {status?.personalEnabled && !status.liveSupported ? (
+            {!stateFresh || status?.modeApplied === false ? (
+              <article className="action-card"><div><h3>等待确认运行状态</h3><p>实际模式与交易授权确认后才可恢复交易。紧急停用始终可用。</p></div></article>
+            ) : status?.personalEnabled && !status.liveSupported ? (
               <article className="action-card arm-action">
                 <div className="action-copy">
                   <h3>真钱模式默认关闭</h3>
@@ -525,7 +481,7 @@ export default function HomePage() {
               <article className="action-card arm-action">
                 <div className="action-copy">
                   <h3>当前保持安全模式</h3>
-                  <p>后端现在是 Paper / Shadow，不需要交易授权；切换模式只能在 Zeabur 完成。</p>
+                  <p>后端已确认 Paper / Shadow；模式变更以 Worker 实际确认结果为准。</p>
                 </div>
                 <Link className="secondary-button" href="/settings#runtime">
                   查看模式说明
@@ -542,7 +498,7 @@ export default function HomePage() {
                     type="checkbox"
                     checked={riskConfirmed}
                     onChange={(event) => setRiskConfirmed(event.target.checked)}
-                    disabled={!armableMode || busy !== null}
+                    disabled={!armableMode || busy !== null || stopping || !stateFresh}
                   />
                   <span>我确认这可能提交真实资金订单，并已核对风险上限。</span>
                 </label>
@@ -554,7 +510,7 @@ export default function HomePage() {
                     !armableMode ||
                     !riskConfirmed ||
                     !control?.version ||
-                    busy !== null ||
+                    busy !== null || stopping || !stateFresh ||
                     !apiUsesSafeTransport
                   }
                 >
@@ -581,29 +537,13 @@ export default function HomePage() {
                 <p>
                   {personalRealMode
                     ? "立即打开 kill switch，并让个人 Worker 停止新交易、撤销挂单。"
-                    : "Paper / Shadow 不会发送真实订单；停止自动周期请修改 Zeabur 环境变量。"}
+                    : "向后端请求禁止新实盘订单并核实撤单；即使当前状态未知也可以操作。"}
                 </p>
               </div>
-              {personalRealMode ? (
-                <button
-                  className="danger-button"
-                  type="button"
-                  onClick={() => void disarmTrading()}
-                  disabled={
-                    personalPaused || busy !== null || !apiUsesSafeTransport
-                  }
-                >
-                  {personalPaused
-                    ? "已停用"
-                    : busy === "disarm"
-                      ? "停用中…"
-                      : "停用并撤单"}
-                </button>
-              ) : (
-                <Link className="secondary-button" href="/settings#runtime">
-                  查看自动运行变量
-                </Link>
-              )}
+              <button
+                className="danger-button" type="button" onClick={() => void disarmTrading()}
+                disabled={stopping || !apiUsesSafeTransport}
+              >{stopping ? "停用中…" : "停用并撤单"}</button>
             </article>
           </div>
 
@@ -613,7 +553,7 @@ export default function HomePage() {
         </section>
 
         <aside className="side-column">
-          <RiskLimitsPanel limits={riskLimits} />
+          <RiskLimitsPanel limits={riskLimits} confirmed={stateFresh && status?.riskApplied === true} />
 
           <LatestJobPanel job={lastJob} />
 

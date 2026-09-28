@@ -3,8 +3,11 @@ from __future__ import annotations
 from datetime import timedelta
 from decimal import Decimal
 
+import pytest
+
 from polybot.config import TradingMode
-from polybot.models import PortfolioState, Side, TradeIntent, utc_now
+from polybot.fees import estimated_fee_per_share, maximum_buy_cost
+from polybot.models import BookLevel, PortfolioState, Side, TradeIntent, utc_now
 from polybot.risk import RiskEngine
 from polybot.strategy import ValueStrategy
 
@@ -19,7 +22,8 @@ def test_strategy_uses_conservative_interval_and_real_depth(
     assert candidate.conservative_probability == forecast.probability_low
     assert candidate.limit_price == Decimal("0.41")
     assert candidate.expected_price > Decimal("0.40")
-    assert candidate.notional_usd <= settings.max_order_usd * Decimal("1.02")
+    assert candidate.size * candidate.limit_price <= settings.max_order_usd
+    assert candidate.max_commitment_usd <= settings.max_order_usd
     assert candidate.edge_after_costs > settings.min_edge
 
 
@@ -216,3 +220,61 @@ def test_risk_rejects_market_gates_and_empty_book(
     )
     decision = RiskEngine(settings).evaluate_candidate(candidate, market, yes_book, daily_loss)
     assert "daily_loss_kill_switch" in decision.codes
+
+
+@pytest.mark.parametrize("rate", [Decimal("0"), Decimal("0.07"), Decimal("0.25")])
+def test_multilevel_buy_sizes_for_full_limit_commitment(
+    settings, market, forecast, yes_book, no_book, rate,
+) -> None:
+    market = market.model_copy(update={"fees_enabled": rate > 0, "fee_rate": rate})
+    book = yes_book.model_copy(update={"asks": [
+        BookLevel(price=Decimal("0.10"), size=Decimal("40")),
+        BookLevel(price=Decimal("0.50"), size=Decimal("100")),
+    ]})
+    portfolio = PortfolioState(bankroll_usd=Decimal("1000"), cash_usd=Decimal("1000"))
+    candidate = ValueStrategy(settings).choose(market, forecast, book, no_book, portfolio)
+    assert candidate is not None
+    assert candidate.limit_price == Decimal("0.10")
+    assert 0 < candidate.size <= 40
+    assert candidate.condition_id == market.condition_id
+    assert candidate.notional_usd <= candidate.max_commitment_usd <= settings.max_order_usd
+    # Every possible fill price at/below this order's signed limit fits the cap.
+    for price in (Decimal("0.01"), Decimal("0.05"), candidate.limit_price):
+        fee = estimated_fee_per_share(
+            price, enabled=market.fees_enabled, rate=rate, exponent=market.fee_exponent,
+        )
+        assert candidate.size * (price + fee) <= settings.max_order_usd
+
+
+def test_risk_does_not_trust_expected_cost_or_claimed_commitment(
+    settings, market, forecast, yes_book, no_book,
+) -> None:
+    portfolio = PortfolioState(bankroll_usd=Decimal("1000"), cash_usd=Decimal("1000"))
+    candidate = ValueStrategy(settings).choose(market, forecast, yes_book, no_book, portfolio)
+    assert candidate is not None
+    forged = candidate.model_copy(update={
+        "size": Decimal("42"), "limit_price": Decimal("0.50"),
+        "notional_usd": Decimal("5"), "max_commitment_usd": Decimal("5"),
+    })
+    settings = settings.model_copy(update={
+        "max_event_exposure_pct": Decimal("0.01"),
+        "max_bucket_exposure_pct": Decimal("0.01"),
+        "max_gross_exposure_pct": Decimal("0.01"),
+    })
+    portfolio.cash_usd = Decimal("10")
+    decision = RiskEngine(settings).evaluate_candidate(forged, market, yes_book, portfolio)
+    assert not decision.approved
+    assert set(decision.codes) >= {
+        "order_cap_exceeded", "insufficient_cash", "trade_risk_cap_exceeded",
+        "event_exposure_cap_exceeded", "correlated_bucket_cap_exceeded",
+        "gross_exposure_cap_exceeded",
+    }
+    assert Decimal(decision.details["max_commitment_usd"]) == Decimal("21")
+
+
+def test_fee_bound_covers_better_prices_above_midpoint() -> None:
+    commitment = maximum_buy_cost(
+        Decimal("10"), Decimal("0.9"),
+        enabled=True, rate=Decimal("0.07"), exponent=Decimal("1"),
+    )
+    assert commitment >= Decimal("9") + Decimal("10") * Decimal("0.07") * Decimal("0.25")

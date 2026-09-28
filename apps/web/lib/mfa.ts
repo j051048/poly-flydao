@@ -73,5 +73,5 @@ export function readableMfaError(error: unknown): string {
   if (code === "mfa_factor_not_found") {
     return "原双因素记录已失效，请刷新状态后重新绑定。";
   }
-  return message || "双因素验证暂时失败，请稍后重试。";
+  return "双因素验证暂时失败，请检查登录状态后重试。";
 }

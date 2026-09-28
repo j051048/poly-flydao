@@ -31,6 +31,7 @@ def test_official_sdk_version_and_public_contract() -> None:
 
 
 def test_official_sdk_secure_contract_used_by_executor() -> None:
+    assert {"id"} <= _keyword_names(SecureClient, "get_market")
     assert {"token_id", "price", "size", "side", "post_only", "expiration"} <= _keyword_names(
         SecureClient, "create_limit_order"
     )

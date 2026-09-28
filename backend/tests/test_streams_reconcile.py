@@ -572,3 +572,33 @@ async def test_position_missing_current_value_fails_closed() -> None:
 
     assert reconciler._trade_after == "0"
     await reconciler.close()
+
+
+@pytest.mark.parametrize("trade_ids", [[], ["not-yet-visible-trade"]])
+async def test_control_race_unknown_order_survives_repeated_absence_repairs(trade_ids) -> None:
+    store = MemoryStore()
+    await store.save_execution(
+        ExecutionResult(
+            intent_hash="race-intent",
+            status=ExecutionStatus.ERROR,
+            order_id="missing-order",
+            raw={"reconciliation_required": True, "trade_ids": trade_ids},
+        ),
+        "account",
+    )
+
+    class RaceClient(MissingOrderClient):
+        def list_account_trades(self, **kwargs):
+            # Neither complete history nor the accepted trade ID is visible
+            # yet. Eventual consistency is not evidence of cancellation.
+            return AsyncItems([])
+
+    repair = OrderReconciler(
+        private_key="unused", wallet=None, account_id="account", store=store, client=RaceClient()
+    )
+    for _ in range(3):
+        await repair.reconcile_rest()
+
+    assert store.durable_orders["missing-order"] == "unknown"
+    assert await store.has_unresolved_live_orders("account")
+    await repair.close()

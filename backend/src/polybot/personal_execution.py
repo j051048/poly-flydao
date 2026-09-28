@@ -10,6 +10,7 @@ from typing import Any
 from uuid import UUID
 
 from polybot.config import TradingMode
+from polybot.jobs import RiskPolicySnapshot, RuntimeProfile
 from polybot.models import QuarantineRecord, RuntimeControl
 from polybot.schema import EXPECTED_SCHEMA_VERSION
 from supabase import Client
@@ -105,6 +106,27 @@ class PersonalExecutionRepository:
         binding = await self.get_binding()
         return binding.reconcile_baseline_at if binding is not None else None
 
+    async def get_configuration(self) -> tuple[RuntimeProfile | None, RiskPolicySnapshot | None]:
+        response = await self._execute(
+            self._client.table("account_runtime_profiles")
+            .select("*").eq("account_id", self.account_id).limit(1)
+        )
+        row = self._first(response)
+        if row is None:
+            return None, None
+        profile = RuntimeProfile.model_validate(row)
+        if profile.risk_policy_id is None:
+            return profile, None
+        response = await self._execute(
+            self._client.table("risk_policies").select("*")
+            .eq("account_id", self.account_id)
+            .eq("id", str(profile.risk_policy_id)).eq("status", "active").limit(1)
+        )
+        row = self._first(response)
+        if row is None:
+            raise RuntimeError("requested risk policy is unavailable")
+        return profile, RiskPolicySnapshot.model_validate(row)
+
     async def get_desired_mode(self) -> TradingMode | None:
         """Read the durable mode request written by the dashboard.
 
@@ -113,7 +135,7 @@ class PersonalExecutionRepository:
         """
 
         response = await self._execute(
-            self._client.table("runtime_profiles")
+            self._client.table("account_runtime_profiles")
             .select("desired_mode")
             .eq("account_id", self.account_id)
             .limit(1)

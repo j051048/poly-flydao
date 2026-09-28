@@ -283,5 +283,7 @@ def test_personal_mode_switch_is_durable_when_live_is_enabled() -> None:
         status = client.get("/v1/status", headers={"Authorization": "Bearer owner"})
     assert status.status_code == 200
     payload = status.json()
-    assert payload["mode"] == "canary"
+    assert payload["mode"] == "paper"
+    assert payload["runtime_profile"]["effective_mode"] == "paper"
+    assert payload["runtime_profile"]["mode_applied"] is False
     assert payload["runtime_profile"]["desired_mode"] == "canary"

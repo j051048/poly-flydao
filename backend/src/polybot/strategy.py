@@ -3,7 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from polybot.config import Settings
-from polybot.fees import estimated_fee_per_share, quantize_down
+from polybot.fees import estimated_fee_per_share, maximum_buy_cost, quantize_down
 from polybot.models import (
     UNCLASSIFIED_EVENT_KEY,
     Forecast,
@@ -154,6 +154,7 @@ class ValueStrategy:
             return None
         return TradeCandidate(
             market_id=market.id,
+            condition_id=market.condition_id,
             event_id=market.event_id,
             bucket=market.category or "other",
             token_id=book.token_id,
@@ -231,16 +232,20 @@ class ValueStrategy:
         if shares < minimum_size or shares <= 0 or base_cost <= 0 or limit_price is None:
             return None
 
-        # Using VWAP from the larger pre-quantized sweep slightly overstates cost, intentionally.
         vwap = base_cost / max(shares, Decimal("0.00000001"))
         fee_per_share = fee_cost / max(shares, Decimal("0.00000001"))
         edge = conservative_probability - vwap - fee_per_share - self.settings.uncertainty_reserve
         total_cost = base_cost + fee_cost
-        if edge <= 0 or total_cost > budget * Decimal("1.02"):
+        commitment = maximum_buy_cost(
+            shares, limit_price,
+            enabled=market.fees_enabled, rate=market.fee_rate, exponent=market.fee_exponent,
+        )
+        if edge <= 0 or commitment > budget:
             return None
 
         return TradeCandidate(
             market_id=market.id,
+            condition_id=market.condition_id,
             event_id=market.event_id,
             bucket=bucket,
             token_id=book.token_id,
@@ -250,6 +255,7 @@ class ValueStrategy:
             limit_price=limit_price,
             size=shares,
             notional_usd=total_cost,
+            max_commitment_usd=commitment,
             fee_estimate_usd=fee_cost,
             edge_after_costs=edge,
             forecast_id=forecast.id,
@@ -314,6 +320,7 @@ class ValueStrategy:
             return None
         return TradeCandidate(
             market_id=market.id,
+            condition_id=market.condition_id,
             event_id=market.event_id,
             bucket=market.category or "other",
             token_id=book.token_id,
@@ -337,7 +344,6 @@ class ValueStrategy:
         budget: Decimal,
         market: MarketSpec,
     ) -> tuple[Decimal, Decimal, Decimal, Decimal | None]:
-        remaining = budget
         shares = Decimal("0")
         base_cost = Decimal("0")
         fee_cost = Decimal("0")
@@ -349,8 +355,15 @@ class ValueStrategy:
                 rate=market.fee_rate,
                 exponent=market.fee_exponent,
             )
-            all_in_per_share = level.price + per_share_fee
-            take = min(level.size, remaining / all_in_per_share)
+            # Raising the limit reprices the maximum commitment for ALL shares,
+            # including those expected to fill at cheaper levels. Do not cross
+            # a new level if that would invalidate the already-sized quantity.
+            commitment_per_share = maximum_buy_cost(
+                Decimal("1"), level.price,
+                enabled=market.fees_enabled, rate=market.fee_rate, exponent=market.fee_exponent,
+            )
+            maximum_shares = quantize_down(budget / commitment_per_share, Decimal("0.01"))
+            take = quantize_down(min(level.size, maximum_shares - shares), Decimal("0.01"))
             if take <= 0:
                 break
             level_cost = take * level.price
@@ -358,8 +371,7 @@ class ValueStrategy:
             shares += take
             base_cost += level_cost
             fee_cost += level_fee
-            remaining -= level_cost + level_fee
             last_price = level.price
-            if remaining <= Decimal("0.000001"):
+            if shares >= maximum_shares:
                 break
         return shares, base_cost, fee_cost, last_price

@@ -179,7 +179,12 @@ def test_personal_status_is_owner_scoped_and_never_returns_secrets() -> None:
         "live_supported": False,
         "mode": "paper",
         "desired_mode": "paper",
-        "mode_note": None,
+        "mode_note": "等待 Worker 确认配置与撤单状态",
+        "mode_applied": False,
+        "configuration_error": None,
+        "configuration_checked_at": None,
+        "risk_policy_id": None,
+        "risk_policy_version": None,
         "auto_run_enabled": False,
         "worker_execution_model": "single_account",
         "worker_ready": False,
@@ -256,7 +261,7 @@ def test_equity_history_and_ai_usage_endpoints_require_auth() -> None:
     assert denied_equity.status_code == 401
     assert denied_usage.status_code == 401
     assert equity.status_code == 200
-    assert equity.json() == {"items": []}
+    assert equity.json() == {"scope": "paper", "items": []}
     assert usage.status_code == 200
     assert usage.json() == {"items": []}
 

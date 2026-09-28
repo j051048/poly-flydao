@@ -31,13 +31,13 @@
     "eslint-config-next": "15.5.21",
     "jsdom": "^26.1.0",
     "typescript": "^5.9.2",
-    "vitest": "^3.2.4"
+    "vitest": "4.1.11"
   },
   "overrides": {
-    "postcss": "8.5.21",
+    "postcss": "8.5.23",
     "sharp": "0.35.4"
   },
   "engines": {
-    "node": "22.x"
+    "node": ">=22.12.0 <23"
   }
 }

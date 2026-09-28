@@ -7,7 +7,7 @@ import re
 import time
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, timedelta
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
 from fastapi import (
@@ -42,6 +42,7 @@ from polybot.api_models import (
     AIKeyPutRequest,
     ArmRequest,
     MeResponse,
+    PersonalCycleCapacityExceeded,
     PersonalCycleIdempotencyConflict,
     PersonalCycleRequest,
     PersonalCycleRequestRegistry,
@@ -88,9 +89,11 @@ from polybot.jobs import (
 )
 from polybot.metrics import Metrics
 from polybot.models import utc_now
+from polybot.personal_configuration import personal_configuration
 from polybot.personal_execution import (
     PersonalExecutionRepository,
 )
+from polybot.resolution_worker import MarketResolutionWorker
 from polybot.runtime_mode import resolve_effective_mode
 from polybot.security_logging import configure_secure_logging, safe_json
 from polybot.stores.supabase_client import create_supabase_client
@@ -119,6 +122,7 @@ def create_app(
     personal_execution: PersonalExecutionRepository | None = None,
 ) -> FastAPI:
     api_settings = settings or get_settings()
+    configuration = personal_configuration(api_settings)
     default_jobs: JobRepository
     default_credentials: CredentialRepository
     if jobs is None or credentials is None:
@@ -158,6 +162,7 @@ def create_app(
         personal_cycle_trigger = asyncio.Event()
         personal_worker_task: asyncio.Task[None] | None = None
         archive_task: asyncio.Task[None] | None = None
+        resolution_task: asyncio.Task[None] | None = None
         application.state.personal_worker_task = None
         application.state.archive_task = None
         application.state.personal_cycle_trigger = personal_cycle_trigger
@@ -214,6 +219,11 @@ def create_app(
             )
 
             def observe_personal_worker(task: asyncio.Task[None]) -> None:
+                if task is personal_worker_task:
+                    application.state.personal_cycle_requests.fail_active(
+                        "worker_stopped",
+                        "Worker 已停止，无法继续跟踪本次请求；请检查最新运行状态和成交记录。",
+                    )
                 if task.cancelled():
                     return
                 error = task.exception()
@@ -225,6 +235,16 @@ def create_app(
 
             personal_worker_task.add_done_callback(observe_personal_worker)
             application.state.personal_worker_task = personal_worker_task
+            resolution_worker = MarketResolutionWorker(
+                repository=selected_jobs,
+                poll_interval_seconds=api_settings.resolution_poll_seconds,
+            )
+            resolution_task = asyncio.create_task(
+                resolution_worker.serve(personal_worker_stop),
+                name="polybot-personal-resolution",
+            )
+            resolution_task.add_done_callback(observe_personal_worker)
+            application.state.resolution_task = resolution_task
         if api_settings.personal_mode and api_settings.archive_enabled:
             try:
                 from polybot.archive import build_archive_worker
@@ -258,6 +278,11 @@ def create_app(
         finally:
             personal_worker_stop.set()
             archive_stop.set()
+            if resolution_task is not None:
+                resolution_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await resolution_task
+            application.state.resolution_task = None
             if personal_worker_task is not None:
                 # A worker parked on the manual-trigger event must still observe
                 # shutdown, and a stuck task must never hang the whole app.
@@ -315,6 +340,7 @@ def create_app(
     application.state.personal_cycle_requests = PersonalCycleRequestRegistry()
     application.state.personal_cycle_count = 0
     application.state.personal_last_cycle = None
+    application.state.resolution_task = None
 
     @application.middleware("http")
     async def reject_legacy_secret_transport(
@@ -335,10 +361,15 @@ def create_app(
                     "/v1/personal",
                 )
             )
+            bucket = "sensitive" if sensitive else "general"
             limit = 30 if sensitive else 240 if request.url.path.startswith("/v1/") else 120
+            if request.url.path == "/health":
+                bucket, limit = "health", 30
+            elif request.url.path == "/v1/control/disarm":
+                bucket, limit = "stop", 30
             identity = _rate_limit_identity(request)
             allowed, retry_after = application.state.rate_limiter.allow(
-                f"{identity}:{'sensitive' if sensitive else 'general'}",
+                f"{identity}:{bucket}",
                 limit=limit,
             )
             if not allowed:
@@ -561,6 +592,7 @@ def create_app(
         include_in_schema=False,
     )
     async def personal_status(principal: PrincipalDep) -> PersonalStatusResponse:
+        profile = await personal_profile(principal.account_id)
         binding = (
             await selected_personal_execution.get_binding()
             if selected_personal_execution is not None
@@ -572,22 +604,20 @@ def create_app(
             cycle_count=application.state.personal_cycle_count,
             last_cycle=application.state.personal_last_cycle,
             reconciliation=await personal_reconciliation_status(),
-            desired_mode=await personal_desired_mode(principal.account_id),
+            desired_mode=profile.desired_mode,
+            desired_profile_version=profile.version,
         )
 
-    async def personal_desired_mode(account_id: str) -> TradingMode | None:
-        """Read the durable mode request; a missing profile is not an error."""
-
+    async def personal_profile(account_id: str) -> RuntimeProfile:
         repository: Any = application.state.job_repository
-        getter = getattr(repository, "get_or_create_profile", None)
-        if getter is None:
-            return None
         try:
-            profile = await getter(account_id)
-        except Exception:
+            return await repository.get_or_create_profile(account_id)
+        except Exception as exc:
             LOGGER.warning("personal runtime profile is unavailable")
-            return None
-        return profile.desired_mode
+            raise HTTPException(503, "运行配置暂时不可用，请稍后重试") from exc
+
+    async def personal_desired_mode(account_id: str) -> TradingMode:
+        return (await personal_profile(account_id)).desired_mode
 
     async def personal_reconciliation_status() -> PersonalReconciliationStatus:
         """Summarise what reconciliation is ignoring, and why.
@@ -747,6 +777,12 @@ def create_app(
                 )
         current = await repo.get_or_create_profile(principal.account_id)
         fields = body.model_fields_set
+        if (
+            "risk_policy_id" in fields
+            and body.risk_policy_id != current.risk_policy_id
+            and not principal.is_aal2
+        ):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "AAL2 is required to change risk policy")
         effective = body.model_copy(
             update={
                 "risk_policy_id": (
@@ -768,7 +804,15 @@ def create_app(
                 ),
             }
         )
-        return await repo.update_profile(principal.account_id, effective)
+        saved = await repo.update_profile(principal.account_id, effective)
+        if api_settings.personal_mode:
+            application.state.personal_cycle_requests.supersede_queued(
+                principal.account_id, saved.desired_mode,
+            )
+        trigger = application.state.personal_cycle_trigger
+        if api_settings.personal_mode and trigger is not None:
+            trigger.set()
+        return saved
 
     @application.get("/v1/me/credentials/status", response_model=PublicCredentialStatus)
     async def credentials_status(
@@ -946,11 +990,15 @@ def create_app(
         principal: AAL2PrincipalDep,
         repo: JobRepositoryDep,
     ) -> RiskPolicySnapshot:
-        return await repo.create_risk_policy_preset(
+        saved = await repo.create_risk_policy_preset(
             account_id=principal.account_id,
             expected_profile_version=body.expected_profile_version,
             preset=body.preset,
         )
+        trigger = application.state.personal_cycle_trigger
+        if api_settings.personal_mode and trigger is not None:
+            trigger.set()
+        return saved
 
     @application.get("/v1/worker/status", response_model=WorkerStatusSnapshot)
     async def worker_status(
@@ -985,11 +1033,18 @@ def create_app(
         principal: PrincipalDep,
         repo: JobRepositoryDep,
         limit: Annotated[int, Query(ge=2, le=1000)] = 200,
+        scope: Literal["paper", "shadow", "real"] | None = None,
     ) -> dict[str, object]:
+        selected_scope = scope or (
+            "real" if api_settings.mode in {TradingMode.LIVE, TradingMode.CANARY}
+            else api_settings.mode.value
+        )
         return {
+            "scope": selected_scope,
             "items": await repo.list_equity_history(
                 principal.account_id,
                 limit=limit,
+                scope=selected_scope,
             )
         }
 
@@ -1074,7 +1129,7 @@ def create_app(
             live_enabled=api_settings.personal_live_enabled,
             signer_configured=api_settings.polymarket_private_key is not None,
         )
-        if body.mode is not decision.effective:
+        if body.mode is not decision.effective or body.mode is not api_settings.mode:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
                 "requested cycle mode does not match the effective mode; "
@@ -1099,6 +1154,9 @@ def create_app(
                 )
         if not is_worker_ready():
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "personal worker is not ready")
+        worker_task = application.state.personal_worker_task
+        if worker_task is not None and worker_task.done():
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "personal worker has stopped")
         cycle_trigger: asyncio.Event | None = application.state.personal_cycle_trigger
         if cycle_trigger is None:
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "personal worker is starting")
@@ -1111,6 +1169,10 @@ def create_app(
             )
         except PersonalCycleIdempotencyConflict as exc:
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        except PersonalCycleCapacityExceeded as exc:
+            raise HTTPException(
+                status.HTTP_429_TOO_MANY_REQUESTS, str(exc), headers={"Retry-After": "30"},
+            ) from exc
         if is_new:
             cycle_trigger.set()
         return {
@@ -1121,6 +1183,22 @@ def create_app(
             "worker_ready": True,
             "coalesced": not is_new,
         }
+
+    @application.get("/v1/personal/cycles/{request_id}")
+    async def personal_cycle_request(
+        request_id: UUID, principal: PrincipalDep,
+    ) -> dict[str, object]:
+        if not api_settings.personal_mode:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "personal mode is not enabled")
+        result = application.state.personal_cycle_requests.get(
+            principal.account_id, str(request_id),
+        )
+        if result is None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                "personal request not found or service restarted; check the latest cycle",
+            )
+        return result
 
     @application.get("/v1/jobs/{job_id}", response_model=CycleJob)
     async def get_cycle_job(
@@ -1140,11 +1218,7 @@ def create_app(
     ) -> dict[str, object]:
         control = await repo.get_runtime_control(principal.account_id)
         profile = await repo.get_or_create_profile(principal.account_id)
-        risk = (
-            None
-            if api_settings.personal_mode
-            else await repo.get_active_risk_policy(principal.account_id)
-        )
+        risk = await repo.get_active_risk_policy(principal.account_id)
         latest_job_getter = getattr(repo, "get_latest_job", None)
         latest_job = (
             await latest_job_getter(account_id=principal.account_id)
@@ -1162,20 +1236,13 @@ def create_app(
                 cycle_count=application.state.personal_cycle_count,
                 last_cycle=application.state.personal_last_cycle,
                 reconciliation=await personal_reconciliation_status(),
+                desired_mode=profile.desired_mode,
+                desired_profile_version=profile.version,
             )
             if api_settings.personal_mode
             else None
         )
         profile_payload = profile.model_dump(mode="json")
-        personal_decision = (
-            resolve_effective_mode(
-                profile.desired_mode,
-                live_enabled=api_settings.personal_live_enabled,
-                signer_configured=api_settings.polymarket_private_key is not None,
-            )
-            if api_settings.personal_mode
-            else None
-        )
         if api_settings.personal_mode:
             profile_payload.update(
                 {
@@ -1184,13 +1251,10 @@ def create_app(
                     "forecast_model": api_settings.forecast_model,
                     "desired_mode": profile.desired_mode.value,
                     "effective_mode": (
-                        personal_decision.effective.value
-                        if personal_decision is not None
-                        else api_settings.mode.value
+                        api_settings.mode.value
                     ),
-                    "mode_note": (
-                        personal_decision.note if personal_decision is not None else None
-                    ),
+                    "mode_applied": personal_snapshot.mode_applied,
+                    "mode_note": personal_snapshot.mode_note,
                     "auto_run_enabled": api_settings.personal_auto_run,
                     "cycle_interval_seconds": api_settings.scan_interval_seconds,
                 }
@@ -1198,9 +1262,19 @@ def create_app(
         return {
             "account_id": principal.account_id,
             "mode": (
-                personal_decision.effective.value
-                if personal_decision is not None
+                api_settings.mode.value
+                if api_settings.personal_mode
                 else profile.desired_mode.value
+            ),
+            "desired_risk_policy": risk.model_dump(mode="json") if risk else None,
+            "risk_policy_pending": bool(api_settings.personal_mode and (
+                not configuration.policy_loaded or configuration.error is not None
+                or configuration.policy_id != (str(risk.id) if risk else None)
+                or configuration.policy_version != (risk.version if risk else None)
+            )),
+            "deployment_risk_limits": (
+                {key: str(value) for key, value in configuration.ceilings.items()}
+                if api_settings.personal_mode else None
             ),
             "ai_provider": (
                 api_settings.ai_provider
@@ -1216,7 +1290,9 @@ def create_app(
             "runtime_profile": profile_payload,
             "risk_limits": (
                 {
-                    "version": None,
+                    "policy_id": configuration.policy_id,
+                    "version": configuration.policy_version,
+                    "applied": configuration.policy_loaded and configuration.error is None,
                     "min_edge": str(api_settings.min_edge),
                     "max_order_usd": str(api_settings.max_order_usd),
                     "max_trade_risk_pct": str(api_settings.max_trade_risk_pct),

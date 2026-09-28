@@ -18,14 +18,17 @@ from polybot.config import (
 )
 from polybot.geoblock import GeoblockChecker, GeoblockResult
 from polybot.models import (
+    BookLevel,
     ExecutionStatus,
     Outcome,
+    PortfolioState,
     RuntimeControl,
     Side,
     TradeIntent,
     utc_now,
 )
 from polybot.stores.memory import MemoryStore
+from polybot.strategy import ValueStrategy
 from polybot.tenant_crypto import EncryptionContext
 
 
@@ -109,6 +112,15 @@ class FakeSecureClient:
 
     def get_balance_allowance(self, **kwargs):
         return SimpleNamespace(balance=10_000_000, allowances={"exchange": 10_000_000})
+
+    def get_market(self, *, id):
+        return {
+            "id": id,
+            "condition_id": "c1",
+            "question": "Synthetic market",
+            "outcomes": {"yes": {"token_id": "yes-1"}, "no": {"token_id": "no-1"}},
+            "trading": {"fees_enabled": False},
+        }
 
     def list_open_orders(self):
         return SyncItems([])
@@ -795,7 +807,11 @@ async def test_ambiguous_post_remains_durably_blocking(yes_book) -> None:
     assert await store.has_unresolved_live_orders(settings.account_id)
 
 
-async def test_control_change_during_post_forces_verified_cancellation(yes_book) -> None:
+@pytest.mark.parametrize("response_status", ["live", "matched", "partially_filled"])
+@pytest.mark.parametrize("cancel_fails", [False, True])
+async def test_control_change_during_post_remains_unknown_until_reconciled(
+    yes_book, response_status, cancel_fails,
+) -> None:
     class ChangingControlStore(MemoryStore):
         def __init__(self) -> None:
             super().__init__()
@@ -817,7 +833,17 @@ async def test_control_change_during_post_forces_verified_cancellation(yes_book)
 
     settings = live_settings()
     store = ChangingControlStore()
-    client = FakeSecureClient()
+    class RacingClient(FakeSecureClient):
+        def post_order(self, signed_order):
+            response = super().post_order(signed_order)
+            response.status = response_status
+            return response
+
+        def cancel_all(self):
+            if cancel_fails:
+                raise TimeoutError("cancellation response lost")
+
+    client = RacingClient()
     broker = PolymarketBroker(settings, store, client=client, geoblock=AllowedChecker())
     await store.set_runtime_control(
         RuntimeControl(
@@ -859,6 +885,139 @@ async def test_control_change_during_post_forces_verified_cancellation(yes_book)
 
     result = await broker.submit(intent, yes_book)
 
-    assert result.status is ExecutionStatus.CANCELLED
+    assert result.status is ExecutionStatus.ERROR
+    assert result.raw["status"] == response_status
+    assert result.raw["trade_ids"] == ["trade-1"]
+    assert result.raw["reconciliation_required"] is True
+    assert result.raw["cancellation_open_orders_verified"] is not cancel_fails
+    assert result.filled_size == 0  # Outcome is unknown, never inferred from absence.
     assert client.calls == 1
-    assert not await store.has_unresolved_live_orders(settings.account_id)
+    assert await store.has_unresolved_live_orders(settings.account_id)
+
+
+async def _armed_test_broker(client, settings=None):
+    settings = settings or live_settings()
+    store = MemoryStore()
+    await store.set_runtime_control(RuntimeControl(
+        account_id=settings.account_id, mode=TradingMode.CANARY,
+        armed=True, accept_new_intents=True, kill_switch=False,
+        armed_until=utc_now() + timedelta(minutes=5),
+    ))
+    lease = await store.claim_worker_lease(
+        settings.account_id, "commitment-worker", timedelta(seconds=30),
+    )
+    assert lease is not None
+    broker = PolymarketBroker(settings, store, client=client, geoblock=AllowedChecker())
+
+    async def guard():
+        return lease.fencing_token
+
+    broker.set_execution_guard(guard)
+    return broker
+
+
+@pytest.mark.parametrize("low_level_disappears", [False, True])
+async def test_multilevel_buy_never_signs_more_than_order_cap(
+    settings, market, forecast, yes_book, no_book, low_level_disappears,
+) -> None:
+    book = yes_book.model_copy(update={"asks": [
+        BookLevel(price=Decimal("0.10"), size=Decimal("40")),
+        BookLevel(price=Decimal("0.50"), size=Decimal("100")),
+    ]})
+    candidate = ValueStrategy(settings).choose(
+        market, forecast, book, no_book,
+        PortfolioState(bankroll_usd=Decimal("1000"), cash_usd=Decimal("1000")),
+    )
+    assert candidate is not None
+    client = FakeSecureClient()
+    broker = await _armed_test_broker(client)
+    intent = TradeIntent.from_candidate(
+        candidate, account_id=broker.settings.account_id, run_id="depth", mode=TradingMode.CANARY,
+    )
+    if low_level_disappears:
+        book = book.model_copy(update={"asks": book.asks[1:]})
+    result = await broker.submit(intent, book)
+    if low_level_disappears:
+        assert result.status is ExecutionStatus.REJECTED
+        assert not client.order_kwargs
+        assert client.calls == 0
+    else:
+        assert result.status is ExecutionStatus.ACCEPTED
+        assert len(client.order_kwargs) == 1
+        signed_args = client.order_kwargs[0]
+        assert signed_args["price"] * signed_args["size"] <= broker.settings.max_order_usd
+
+
+@pytest.mark.parametrize("scenario", ["understated_cap", "understated_balance", "fees_changed"])
+async def test_executor_independently_checks_limit_cost_and_fee_changes(yes_book, scenario):
+    class CurrentFeeClient(FakeSecureClient):
+        def get_balance_allowance(self, **kwargs):
+            amount = 3_000_000 if scenario == "understated_balance" else 100_000_000
+            return SimpleNamespace(balance=amount, allowances={"exchange": amount})
+
+        def get_market(self, *, id):
+            raw = super().get_market(id=id)
+            if scenario == "fees_changed":
+                raw["trading"] = {
+                    "fees_enabled": True,
+                    "fee_schedule": {"rate": "0.07", "exponent": "1"},
+                }
+            return raw
+
+    client = CurrentFeeClient()
+    broker = await _armed_test_broker(client)
+    size = Decimal("42") if scenario == "understated_cap" else Decimal("8")
+    intent = post_only_intent(
+        broker.settings, intent_hash="commitment", token_id="yes-1",
+        outcome=Outcome.YES, price=Decimal("0.5"),
+    ).model_copy(update={
+        "size": size, "notional_usd": Decimal("1"), "post_only": False,
+        "max_commitment_usd": Decimal("4") if scenario == "fees_changed" else None,
+    })
+    result = await broker.submit(intent, yes_book)
+    assert result.status is ExecutionStatus.REJECTED
+    expected = {
+        "understated_cap": "executor order cap exceeded",
+        "understated_balance": "insufficient exchange balance",
+        "fees_changed": "fees exceed the risk-approved commitment",
+    }[scenario]
+    assert expected in result.message
+    assert not client.order_kwargs
+    assert client.calls == 0
+
+
+@pytest.mark.parametrize("submission", ["single", "batch_leg", "batch_aggregate"])
+async def test_hot_canary_switch_enforces_absolute_five_dollar_cap(
+    yes_book, no_book, submission,
+):
+    # A hot mode switch does not rerun Settings' construction-time validator.
+    settings = live_settings().model_copy(update={
+        "mode": TradingMode.PAPER, "max_order_usd": Decimal("17"),
+    })
+    settings.mode = TradingMode.CANARY
+    client = FakeSecureClient()
+    broker = await _armed_test_broker(client, settings)
+    first = post_only_intent(
+        settings, intent_hash="hot-canary-first", token_id="yes-1",
+        outcome=Outcome.YES, price=Decimal("0.39"),
+    )
+    if submission == "single":
+        first = first.model_copy(update={
+            "post_only": False, "price": Decimal("0.5"), "size": Decimal("12"),
+            "notional_usd": Decimal("6"),
+        })
+        results = [await broker.submit(first, yes_book)]
+    else:
+        first = first.model_copy(update={
+            "size": Decimal("16") if submission == "batch_leg" else Decimal("8"),
+        })
+        second = post_only_intent(
+            settings, intent_hash="hot-canary-second", token_id="no-1",
+            outcome=Outcome.NO, price=Decimal("0.58"),
+        ).model_copy(update={"size": Decimal("8")})
+        results = await broker.submit_batch([(first, yes_book), (second, no_book)])
+    assert all(result.status is ExecutionStatus.REJECTED for result in results)
+    assert all("order cap exceeded" in result.message for result in results)
+    assert not client.order_kwargs
+    assert client.calls == 0
+    assert client.batch_calls == 0

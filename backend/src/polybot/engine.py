@@ -371,13 +371,14 @@ class TradingEngine:
         listed_conditions = {
             market.condition_id for market in result if market.condition_id is not None
         }
-        attempted_conditions: set[str] = set()
+        attempted_identifiers: set[tuple[str, str]] = set()
 
         for token_id, size in portfolio.token_positions.items():
             if size <= 0 or token_id in listed_tokens:
                 continue
             condition_id = portfolio.token_condition_ids.get(token_id)
-            if not condition_id:
+            market_id = portfolio.token_market_ids.get(token_id)
+            if not condition_id and not market_id:
                 report.skip("held_market_identifier_missing")
                 continue
             if condition_id in listed_conditions:
@@ -385,17 +386,26 @@ class TradingEngine:
                 # contain the held asset. Trading against it would be unsafe.
                 report.skip("held_market_token_mismatch")
                 continue
-            if condition_id in attempted_conditions:
+            identifier = ("condition", condition_id) if condition_id else ("market", market_id)
+            if identifier in attempted_identifiers:
                 continue
-            attempted_conditions.add(condition_id)
+            attempted_identifiers.add(identifier)
 
             try:
-                market = await self.market_data.get_market_by_condition(condition_id)
+                if condition_id:
+                    market = await self.market_data.get_market_by_condition(condition_id)
+                else:
+                    # Restored legacy paper holdings may have no valid condition
+                    # id; their separately persisted Gamma market id is exact.
+                    market = await self.market_data.get_market_by_id(market_id)
             except Exception as exc:
                 report.skip(f"held_market_lookup_error:{type(exc).__name__}")
                 continue
-            if market.condition_id not in {None, condition_id} and market.id != condition_id:
+            if condition_id and market.condition_id != condition_id:
                 report.skip("held_market_condition_mismatch")
+                continue
+            if market_id and market.id != market_id:
+                report.skip("held_market_id_mismatch")
                 continue
 
             expected_event_id = portfolio.token_event_ids.get(token_id)

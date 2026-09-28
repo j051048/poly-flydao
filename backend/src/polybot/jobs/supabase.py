@@ -18,6 +18,7 @@ from polybot.jobs.schemas import (
     CycleJob,
     CycleJobRequest,
     CycleJobStatus,
+    EquityScope,
     JobConflictError,
     PerformanceSnapshot,
     PortfolioSnapshot,
@@ -35,6 +36,7 @@ from polybot.jobs.schemas import (
     _performance_snapshot,
     _profile_from_row,
     _ratio_text,
+    equity_sources,
 )
 from polybot.models import AIUsageRecord, EquityHistoryPoint, RuntimeControl, utc_now
 from polybot.schema import EXPECTED_SCHEMA_VERSION
@@ -981,17 +983,18 @@ class SupabaseJobRepository:
         return int(data)
 
     async def list_equity_history(
-        self, account_id: str, *, limit: int = 200
+        self, account_id: str, *, limit: int = 200, scope: EquityScope | None = None
     ) -> list[EquityHistoryPoint]:
         if not 1 <= limit <= 1000:
             raise ValueError("equity history limit out of range")
-        response = await self._execute(
+        query = (
             self._client.table("equity_history")
             .select("recorded_at,equity_usd,source")
             .eq("account_id", account_id)
-            .order("recorded_at", desc=True)
-            .limit(limit)
         )
+        if scope is not None:
+            query = query.in_("source", equity_sources(scope))
+        response = await self._execute(query.order("recorded_at", desc=True).limit(limit))
         rows = [row for row in (getattr(response, "data", None) or []) if isinstance(row, dict)]
         return [
             EquityHistoryPoint(

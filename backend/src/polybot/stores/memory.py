@@ -34,7 +34,12 @@ from polybot.performance import (
     PerformanceSnapshot,
     performance_snapshot_from_rows,
 )
-from polybot.stores.ledger import FillLedgerSnapshot, replay_fill_ledger
+from polybot.stores.ledger import (
+    FillLedgerSnapshot,
+    IncompleteFillLedgerError,
+    activity_quarantine_reason,
+    replay_fill_ledger,
+)
 
 
 class MemoryStore:
@@ -51,6 +56,7 @@ class MemoryStore:
         self.order_updates: list[UserOrderUpdate] = []
         self.trade_updates: list[UserTradeUpdate] = []
         self.account_activity_updates: dict[str, AccountActivityUpdate] = {}
+        self.quarantined_activity_keys: set[str] = set()
         self.position_updates: dict[str, AccountPositionUpdate] = {}
         self.signed_orders: dict[str, tuple[str, bytes, int, str, int]] = {}
         self.unresolved_live_orders: set[str] = set()
@@ -597,6 +603,7 @@ class MemoryStore:
                 "occurred_at": update.occurred_at,
             }
             for update in self.account_activity_updates.values()
+            if update.activity_key not in self.quarantined_activity_keys
         ]
         return replay_fill_ledger(rows, since=since, activities=activities)
 
@@ -630,15 +637,60 @@ class MemoryStore:
         tokens.update(update.token_id for update in self.trade_updates if update.token_id)
         return tokens
 
+    async def reconcile_activity_scope(
+        self,
+        account_id: str,
+        *,
+        baseline: datetime | None,
+        quarantine_enabled: bool,
+    ) -> None:
+        conditions = {update.condition_id for update in self.trade_updates}
+        conditions.update(
+            update.condition_id
+            for update in self.order_updates
+            if update.clob_order_id in self.durable_orders
+        )
+        for intent in self.intents.values():
+            market = self.markets.get(intent.market_id)
+            if market is None:
+                raise IncompleteFillLedgerError("bot intent has no durable market definition")
+            conditions.add(str(market.condition_id or market.id))
+        for update in self.account_activity_updates.values():
+            reason = activity_quarantine_reason(
+                update.model_dump(),
+                bot_condition_ids=conditions,
+                baseline=baseline,
+                quarantine_enabled=quarantine_enabled,
+            )
+            if reason is None:
+                self.quarantined_activity_keys.discard(update.activity_key)
+                continue
+            await self.record_quarantine(
+                account_id,
+                QuarantineRecord(
+                    kind=QuarantineKind.ACTIVITY,
+                    external_key=update.activity_key,
+                    reason=reason,
+                    condition_id=update.condition_id,
+                    notional_usd=update.amount_usd,
+                    occurred_at=update.occurred_at,
+                    detail={
+                        "activity_type": update.activity_type,
+                        "transaction_hash": update.transaction_hash,
+                        "raw_payload": update.raw,
+                        "baseline_at": baseline.isoformat() if baseline else None,
+                    },
+                ),
+            )
+            self.quarantined_activity_keys.add(update.activity_key)
+
     async def record_quarantine(self, account_id: str, record: QuarantineRecord) -> None:
         self.quarantine[(record.kind, record.external_key)] = record
 
     async def list_quarantine(
         self, account_id: str, limit: int = 200
     ) -> list[QuarantineRecord]:
-        records = [
-            record for (kind, _), record in self.quarantine.items() if kind is QuarantineKind.TRADE
-        ]
+        records = list(self.quarantine.values())
         return records[: max(0, limit)]
 
     async def pending_trade_ids(self, account_id: str) -> set[str]:
@@ -711,6 +763,12 @@ class MemoryStore:
         for order_id in clob_order_ids:
             status = self.durable_orders.get(order_id)
             if status not in unresolved:
+                continue
+            if any(
+                execution.order_id == order_id
+                and execution.raw.get("reconciliation_required")
+                for execution in self.executions
+            ):
                 continue
             misses = self.order_missing_confirmations.get(order_id, 0) + 1
             self.order_missing_confirmations[order_id] = misses

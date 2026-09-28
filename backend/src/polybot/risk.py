@@ -4,6 +4,7 @@ from datetime import timedelta
 from decimal import Decimal
 
 from polybot.config import Settings
+from polybot.fees import maximum_buy_cost
 from polybot.models import (
     UNCLASSIFIED_EVENT_KEY,
     MarketSpec,
@@ -50,7 +51,15 @@ class RiskEngine:
             codes.append("too_close_to_resolution")
         if not risk_exit and candidate.edge_after_costs < self.settings.min_edge:
             codes.append("edge_below_threshold")
-        if candidate.notional_usd > self.settings.max_order_usd:
+        commitment = candidate.notional_usd
+        if candidate.side is Side.BUY:
+            commitment = maximum_buy_cost(
+                candidate.size, candidate.limit_price,
+                enabled=market.fees_enabled,
+                rate=market.fee_rate,
+                exponent=market.fee_exponent,
+            )
+        if commitment > self.settings.max_order_usd:
             codes.append("order_cap_exceeded")
         if candidate.limit_price % book.tick_size != 0:
             codes.append("invalid_tick_price")
@@ -58,9 +67,9 @@ class RiskEngine:
             codes.append("below_minimum_order_size")
         bankroll = portfolio.bankroll_usd
         if candidate.side is Side.BUY:
-            if candidate.notional_usd > portfolio.cash_usd:
+            if commitment > portfolio.cash_usd:
                 codes.append("insufficient_cash")
-            if candidate.notional_usd > bankroll * self.settings.max_trade_risk_pct:
+            if commitment > bankroll * self.settings.max_trade_risk_pct:
                 codes.append("trade_risk_cap_exceeded")
 
             event_key = candidate.event_id or candidate.market_id
@@ -68,17 +77,17 @@ class RiskEngine:
             event_after += portfolio.event_exposure_usd.get(
                 UNCLASSIFIED_EVENT_KEY, Decimal("0")
             )
-            event_after += candidate.notional_usd
+            event_after += commitment
             if event_after > bankroll * self.settings.max_event_exposure_pct:
                 codes.append("event_exposure_cap_exceeded")
 
             bucket_after = portfolio.bucket_exposure_usd.get(candidate.bucket, Decimal("0"))
             bucket_after += portfolio.bucket_exposure_usd.get("__unclassified__", Decimal("0"))
-            bucket_after += candidate.notional_usd
+            bucket_after += commitment
             if bucket_after > bankroll * self.settings.max_bucket_exposure_pct:
                 codes.append("correlated_bucket_cap_exceeded")
             if (
-                portfolio.gross_exposure_usd + candidate.notional_usd
+                portfolio.gross_exposure_usd + commitment
                 > bankroll * self.settings.max_gross_exposure_pct
             ):
                 codes.append("gross_exposure_cap_exceeded")
@@ -102,6 +111,7 @@ class RiskEngine:
 
         details["edge_after_costs"] = str(candidate.edge_after_costs)
         details["notional_usd"] = str(candidate.notional_usd)
+        details["max_commitment_usd"] = str(commitment)
         details["drawdown_pct"] = str(portfolio.drawdown_pct)
         details["realized_pnl_today_usd"] = str(portfolio.realized_pnl_today_usd)
         details["daily_equity_pnl_usd"] = str(portfolio.daily_equity_pnl_usd)

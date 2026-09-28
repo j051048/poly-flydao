@@ -3,9 +3,12 @@ export type PersonalTradingMode = "paper" | "shadow" | "canary" | "live";
 export interface PersonalRuntimeStatus {
   enabled: boolean;
   liveSupported: boolean;
-  mode: PersonalTradingMode;
+  mode: PersonalTradingMode | "unknown";
   /** Durable dashboard request. Applied by the worker at a cycle boundary. */
-  desiredMode: PersonalTradingMode;
+  desiredMode: PersonalTradingMode | "unknown";
+  modeApplied?: boolean;
+  configurationError?: string;
+  configurationCheckedAt?: string;
   /** Operator-facing reason when the request had to be clamped. */
   modeNote?: string;
   autoRunEnabled: boolean;
@@ -16,6 +19,7 @@ export interface PersonalRuntimeStatus {
   lastCycle?: {
     id?: string;
     state?: string;
+    mode?: PersonalTradingMode;
     startedAt?: string;
     completedAt?: string;
     message?: string;
@@ -78,10 +82,10 @@ function boolean(...values: unknown[]): boolean | undefined {
   return values.find((value): value is boolean => typeof value === "boolean");
 }
 
-function tradingMode(value: unknown): PersonalTradingMode {
+function tradingMode(value: unknown): PersonalTradingMode | "unknown" {
   return ["paper", "shadow", "canary", "live"].includes(String(value))
     ? (value as PersonalTradingMode)
-    : "paper";
+    : "unknown";
 }
 
 /**
@@ -110,9 +114,10 @@ export function parsePersonalRuntimeStatus(
   );
   const chainId = Number(wallet.chain_id);
   const lastCycle = record(source.last_cycle);
+  const lastCycleMode = tradingMode(lastCycle.mode);
   const cycleCount = Number(source.cycle_count);
   const reconciliation = record(source.reconciliation);
-  const mode = tradingMode(source.mode ?? profile.desired_mode);
+  const mode = tradingMode(source.mode);
 
   return {
     enabled: boolean(source.enabled, source.personal_mode) ?? false,
@@ -121,6 +126,9 @@ export function parsePersonalRuntimeStatus(
     desiredMode: tradingMode(
       source.desired_mode ?? profile.desired_mode ?? mode,
     ),
+    modeApplied: boolean(source.mode_applied, profile.mode_applied),
+    configurationError: text(source.configuration_error),
+    configurationCheckedAt: text(source.configuration_checked_at),
     modeNote: text(source.mode_note, profile.mode_note),
     autoRunEnabled:
       boolean(source.auto_run_enabled, profile.auto_run_enabled) ?? false,
@@ -151,6 +159,7 @@ export function parsePersonalRuntimeStatus(
       ? {
           id: text(lastCycle.id),
           state: text(lastCycle.state, lastCycle.status),
+          mode: lastCycleMode === "unknown" ? undefined : lastCycleMode,
           startedAt: text(lastCycle.started_at),
           completedAt: text(lastCycle.completed_at),
           message: text(lastCycle.message),
@@ -193,12 +202,13 @@ export function parsePersonalRuntimeStatus(
   };
 }
 
-export function personalModeLabel(mode: PersonalTradingMode): string {
+export function personalModeLabel(mode: PersonalTradingMode | "unknown"): string {
   return {
     paper: "Paper 模拟",
     shadow: "Shadow 影子",
     canary: "Canary 小额实盘",
     live: "Live 实盘",
+    unknown: "实际模式未确认",
   }[mode];
 }
 
