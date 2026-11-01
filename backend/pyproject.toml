@@ -17,7 +17,7 @@ dependencies = [
   "httpx>=0.28,<1",
   "idna>=3.10,<4",
   "langgraph==1.2.9",
-  "litellm==1.93.0",
+  "litellm==1.100.4",
   "openai==2.46.0",
   "polymarket-client==0.2.0",
   "prefect==3.7.8",
