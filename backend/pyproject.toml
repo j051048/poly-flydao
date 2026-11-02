@@ -12,29 +12,29 @@ license = { text = "MIT" }
 authors = [{ name = "Polybot contributors" }]
 dependencies = [
   "attrs>=25,<27",
-  "cryptography>=50,<51",
-  "fastapi>=0.135,<0.140",
+  "cryptography>=50.0.2,<51",
+  "fastapi>=0.162.0,<0.163",
   "httpx>=0.28,<1",
-  "idna>=3.10,<4",
-  "langgraph==1.2.9",
-  "litellm==1.93.0",
+  "idna>=3.20,<4",
+  "langgraph==1.2.18",
+  "litellm==1.106.6",
   "openai==2.46.0",
-  "polymarket-client==0.2.0",
+  "polymarket-client==0.15.0",
   "prefect==3.7.8",
-  "pydantic>=2.12,<3",
-  "pydantic-settings>=2.10,<3",
-  "supabase==2.31.0",
-  "tldextract>=5.3,<6",
+  "pydantic>=2.14.2,<3",
+  "pydantic-settings>=2.16.2,<3",
+  "supabase==2.33.0",
+  "tldextract>=5.4.0,<6",
   "uvicorn[standard]>=0.35,<1",
 ]
 
 [project.optional-dependencies]
 dev = [
   "pip-audit>=2.9,<3",
-  "pytest>=8.3,<10",
-  "pytest-asyncio>=0.25,<2",
+  "pytest>=9.2.0,<10",
+  "pytest-asyncio>=1.4.1,<2",
   "pytest-cov>=6,<8",
-  "ruff>=0.11,<1",
+  "ruff>=0.17.3,<1",
 ]
 # Kept out of the live image: this LGPL component is an isolated research/replay tool.
 research = ["nautilus_trader>=1.220,<2"]
